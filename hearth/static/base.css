@@ -1,0 +1,89 @@
+/* Hearth base styles. Moved out of an inline <style> in base.html so the app can
+   ship a strict Content-Security-Policy (style-src 'self') without inline styles. */
+:root { color-scheme: light dark; }
+body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+.prose-msg pre { white-space: pre-wrap; word-break: break-word; }
+::selection { background: #38bdf8; }
+
+/* Touch usability (mobile-first, harmless on desktop):
+   - 16px form text stops iOS Safari from zooming the whole page when an input
+     is focused. Tailwind's text-base utility wins where it is applied. */
+@media (max-width: 767px) {
+  textarea, input[type="text"], input[type="search"], select { font-size: 16px; }
+}
+/* Kill the 300ms tap delay and the gray tap flash on touch UI chrome. */
+button, [role="button"], a { touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+
+/* Long-press on conversation rows should open our ⋮ menu, not the OS text
+   selection UI (see chat.js long-press handler). */
+#convList { -webkit-touch-callout: none; user-select: none; }
+
+/* The mobile sidebar drawer slides via transform (toggled by chat.js adding
+   .open on #sidebar); md: utilities in the template reset it on desktop. */
+#sidebar.open { transform: translateX(0); }
+
+/* Sidebar panels (#panelHost > section): chat.js toggles `hidden` per panel.
+   A plain flex display rule would beat Tailwind's `.hidden` (both are 0-1-0,
+   later wins), so the visible state is scoped to `:not(.hidden)` and hiding
+   always wins. */
+#panelHost > section:not(.hidden) { display: flex; }
+/* The icon rail marks the active panel with .on (chat.js). */
+#rail button.on { background: #1e293b; color: #fff; }
+
+/* Momentum scrolling inside panes on iOS. */
+#messages, #convList, #artifactList, #debugPanel { -webkit-overflow-scrolling: touch; }
+
+/* Chat transcript: cap line length for comfortable reading on wide screens and
+   center the column (full width stays on phones). */
+@media (min-width: 1280px) {
+  #messages > * { max-width: 56rem; margin-left: auto; margin-right: auto; }
+}
+
+/* Respect users who prefer less motion (drawer slide, pulses). */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; }
+}
+
+/* Async-button affordance (admin.js → beginOp/setBusy). A disabled button alone is
+   nearly invisible on a dark theme and users double-press it, so every in-flight
+   action also gets an explicit spinner + dimmed label. The spin lives here rather
+   than as Tailwind's animate-spin because the vendored JIT build may not ship it,
+   and a raw Unicode glyph would be misaligned against button text. */
+.spinner {
+  display: inline-block;
+  width: .85em;
+  height: .85em;
+  flex: none;
+  border: 2px solid currentColor;
+  border-right-color: transparent;   /* the gap that reads as "spinning" */
+  border-radius: 9999px;
+  animation: hearth-spin .7s linear infinite;
+}
+@keyframes hearth-spin { to { transform: rotate(360deg); } }
+
+/* Disabled buttons: dim + no pointer, so a pressed control is unmistakable and a
+   second click cannot queue a second launch. */
+button:disabled, [role="button"]:disabled { opacity: .5; cursor: not-allowed; }
+
+/* Status-tile captions in the admin Model panel: small caps + wide tracking gives
+   the label a clearly different shape from its value, so tiles read as
+   label/value pairs instead of one grey run of text. */
+.stat-k {
+  font-size: 10px;
+  line-height: 1.2;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: #94a3b8;
+}
+
+
+
+/* Web-tool source links under a tool chip (chat.js → webSourcesHtml).
+   line-clamp is applied by hand: the vendored Tailwind build may not ship the
+   utility, and a snippet running unbounded would push the transcript around. */
+.web-src-snippet {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}

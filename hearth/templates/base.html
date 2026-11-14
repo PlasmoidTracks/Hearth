@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en" class="h-full">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/>
+  <title>{% block title %}Hearth{% endblock %}</title>
+  <!-- Tailwind vendored locally (see hearth/static/vendor/README.md). No CDN, so the
+       UI loads with zero third-party requests and a strict CSP can be enforced. -->
+  <script src="/static/vendor/tailwind.js"></script>
+  <link rel="stylesheet" href="/static/base.css"/>
+</head>
+<!-- The root layout is pinned to --app-h (window.innerHeight, kept fresh by
+     chat.js) so the mobile URL bar can never push the composer off-screen;
+     100dvh is the fallback before JS runs / on desktop. On pages without
+     chat.js the var is unset and dvh applies. -->
+<body class="h-full bg-slate-950 text-slate-100 antialiased" style="height: var(--app-h, 100dvh)">
+  {% block body %}{% endblock %}
+  <script src="/static/app.js"></script>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

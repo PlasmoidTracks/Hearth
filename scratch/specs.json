@@ -1,0 +1,162 @@
+[
+ {
+  "key": "model.backend",
+  "group": "model"
+ },
+ {
+  "key": "model.n_ctx",
+  "group": "model"
+ },
+ {
+  "key": "model.rope_scaling",
+  "group": "model"
+ },
+ {
+  "key": "model.rope_freq_base",
+  "group": "model"
+ },
+ {
+  "key": "model.rope_freq_scale",
+  "group": "model"
+ },
+ {
+  "key": "model.n_gpu_layers",
+  "group": "model"
+ },
+ {
+  "key": "model.flash_attn",
+  "group": "model"
+ },
+ {
+  "key": "model.n_parallel",
+  "group": "model"
+ },
+ {
+  "key": "model.include_usage",
+  "group": "model"
+ },
+ {
+  "key": "model.server_bin",
+  "group": "model"
+ },
+ {
+  "key": "model.model_path",
+  "group": "model"
+ },
+ {
+  "key": "model.mmproj_path",
+  "group": "model"
+ },
+ {
+  "key": "model.threads",
+  "group": "model"
+ },
+ {
+  "key": "model.batch_size",
+  "group": "model"
+ },
+ {
+  "key": "model.ubatch_size",
+  "group": "model"
+ },
+ {
+  "key": "model.kv_cache_type",
+  "group": "model"
+ },
+ {
+  "key": "model.device",
+  "group": "model"
+ },
+ {
+  "key": "model.load_mode",
+  "group": "model"
+ },
+ {
+  "key": "model.reasoning",
+  "group": "model"
+ },
+ {
+  "key": "model.temperature",
+  "group": "generation"
+ },
+ {
+  "key": "model.top_p",
+  "group": "generation"
+ },
+ {
+  "key": "model.max_tokens",
+  "group": "generation"
+ },
+ {
+  "key": "model.repetition_penalty",
+  "group": "generation"
+ },
+ {
+  "key": "agent.max_tool_steps",
+  "group": "agent"
+ },
+ {
+  "key": "agent.require_device_grant",
+  "group": "agent"
+ },
+ {
+  "key": "f",
+  "group": null
+ },
+ {
+  "key": "f",
+  "group": null
+ },
+ {
+  "key": "web.mode",
+  "group": "tools-web"
+ },
+ {
+  "key": "tools.web_search.engine",
+  "group": "tools-web"
+ },
+ {
+  "key": "web.headless",
+  "group": "tools-web"
+ },
+ {
+  "key": "web.tor_socks_host",
+  "group": "tools-web"
+ },
+ {
+  "key": "web.tor_socks_port",
+  "group": "tools-web"
+ },
+ {
+  "key": "web.allow_domains",
+  "group": "tools-web"
+ },
+ {
+  "key": "web.http_allow_private",
+  "group": "tools-web"
+ },
+ {
+  "key": "web.block_domains",
+  "group": "tools-web"
+ },
+ {
+  "key": "web.max_text_chars",
+  "group": "tools-web"
+ },
+ {
+  "key": "web.max_links",
+  "group": "tools-web"
+ },
+ {
+  "key": "exec.timeout_s",
+  "group": "tools-sys"
+ },
+ {
+  "key": "device.helper_url",
+  "group": "tools-device"
+ },
+ {
+  "key": "sandbox.backend",
+  "group": "tools-sys"
+ }
+]

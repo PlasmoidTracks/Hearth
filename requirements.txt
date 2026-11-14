@@ -1,0 +1,19 @@
+# Hearth — runtime dependencies (kept minimal; see DEC-003)
+# Core web + templating
+fastapi>=0.110,<1.0
+uvicorn[standard]>=0.27,<1.0
+jinja2>=3.1,<4.0
+python-multipart>=0.0.9
+
+# Data / validation
+pydantic>=2.6,<3.0
+pydantic-settings>=2.2,<3.0
+SQLAlchemy>=2.0,<2.1
+
+# HTTP client (llama-server + web search)
+httpx>=0.27,<1.0
+
+# Optional upgrades:
+#   argon2-cffi  -> stronger password hashing than stdlib scrypt
+#   qrcode       -> render TOTP provisioning QR codes in the UI
+#   cryptography -> REQUIRED if you enable HEARTH_WORKSPACE_ENCRYPTION (at-rest files)

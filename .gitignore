@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Hearth runtime state (do NOT commit personal data / DB)
+data/
+.env
+backup/
+
+# OS/editor
+.DS_Store

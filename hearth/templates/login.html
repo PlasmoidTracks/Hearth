@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block title %}Sign in · Hearth{% endblock %}
+{% block body %}
+<main class="min-h-full flex items-center justify-center p-4">
+  <div class="w-full max-w-sm bg-slate-900/70 border border-slate-800 rounded-2xl p-6 shadow-xl">
+    <h1 class="text-2xl font-semibold mb-1" data-i18n="login.heading">Hearth</h1>
+    <p class="text-sm text-slate-400 mb-6" data-i18n="login.subtitle">Private family LLM. Sign in.</p>
+
+    <form id="loginForm" class="space-y-3" autocomplete="on">
+      <div>
+        <label class="block text-xs text-slate-400 mb-1" for="username" data-i18n="login.username">Username</label>
+        <input id="username" name="username" required autofocus autocapitalize="none" autocomplete="username"
+               class="w-full rounded-lg bg-slate-800 border border-slate-700 px-3 py-2.5 md:py-2 outline-none focus:border-sky-500"/>
+      </div>
+      <div>
+        <label class="block text-xs text-slate-400 mb-1" for="password" data-i18n="login.password">Password</label>
+        <input id="password" name="password" type="password" required autocomplete="current-password"
+               class="w-full rounded-lg bg-slate-800 border border-slate-700 px-3 py-2.5 md:py-2 outline-none focus:border-sky-500"/>
+      </div>
+      <div id="totpRow" class="hidden">
+        <label class="block text-xs text-slate-400 mb-1" for="totp" data-i18n="login.totp">2FA code</label>
+        <input id="totp" name="totp" inputmode="numeric" autocomplete="one-time-code"
+               class="w-full rounded-lg bg-slate-800 border border-slate-700 px-3 py-2.5 md:py-2 outline-none focus:border-sky-500"/>
+      </div>
+      <button class="w-full rounded-lg bg-sky-600 hover:bg-sky-500 py-2.5 md:py-2 font-medium" data-i18n="login.button">Sign in</button>
+      <p id="err" class="text-sm text-red-400 hidden"></p>
+    </form>
+    <p class="text-[11px] text-slate-500 mt-6 leading-relaxed" data-i18n="login.note">
+      Access is restricted to invited accounts. If you reached this page by accident, please close it.
+    </p>
+    <div class="mt-4 flex items-center gap-2 text-xs text-slate-400">
+      <span data-i18n="common.language">Language</span>
+      <select id="loginLang" class="bg-slate-800 border border-slate-700 rounded px-2 py-1">
+        <option value="en">English</option><option value="de">Deutsch</option>
+      </select>
+    </div>
+  </div>
+</main>
+{% endblock %}
+{% block scripts %}<script src="/static/i18n.js"></script><script src="/static/login.js"></script>{% endblock %}
