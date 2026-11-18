@@ -26,7 +26,9 @@ DB writes use short sessions (session_scope) so long streams never hold one open
 """
 from __future__ import annotations
 import asyncio
+import contextlib
 import json
+import re
 import time
 from typing import AsyncIterator
 
@@ -38,6 +40,7 @@ from . import workspaces
 from . import audit
 from .cancel import CancelHandle, TurnAborted
 from .tools import ToolContext, tool_specs, TOOLS_BY_NAME, approval_mode
+from .tools.base import ui_preview
 from .llm.base import StreamEvent
 
 MAX_TOOL_LOOPS = 6      # fallback cap when agent.max_tool_steps is unset
@@ -53,6 +56,33 @@ def load_history(conv_id: str) -> list[dict]:
         msgs = s.query(Message).filter(Message.conversation_id == conv_id) \
             .order_by(Message.created_at.asc()).all()
     return [{"role": m.role, "content": m.content, "meta": m.meta} for m in msgs]
+
+
+def _captioner_hint(settings: dict) -> str:
+    """One line telling the model an audio captioner exists — only when it actually does.
+
+    Tool descriptions already explain `describe_audio`; what they cannot say is that a file the
+    user attached was *already* listened to, so its description is in the message rather than
+    something to go and fetch. Emitted conditionally: claiming the capability while it is switched
+    off or unconfigured would invite the model to describe recordings from its imagination, which
+    is the one failure mode this feature must not have.
+    """
+    try:
+        if not bool(settings.get("captioner.enabled")):
+            return ""
+        from . import captioner as cap
+        if cap.preflight(settings):
+            return ""
+    except Exception:  # noqa: BLE001 — a hint is never worth breaking prompt assembly
+        return ""
+    return ("\n\n# Audio\nAn audio captioner model is available. Attached recordings are described "
+            "for you automatically (that description arrives as text in your message, NOT as audio — "
+            "you do not hear them). For any other audio file in the workspace use `describe_audio` "
+            "(and `audio_info` first for a long one). Treat a caption as another model's report: it "
+            "can be wrong about exact words, counts and identities, so never present it as a "
+            "transcript unless you are sure. A recording can also lose its description — if you see "
+            "only `[attached: name]` with no description text, it is not in your context: say so or "
+            "run `describe_audio` on that path rather than speaking from imagination.")
 
 
 def _workspace_context(user_id: str) -> str:
@@ -72,34 +102,407 @@ def _workspace_context(user_id: str) -> str:
             + "\n".join(lines))
 
 
-def _attachment_content(user_id: str, att_meta: list, text: str):
+def _project_context(user_id: str) -> str:
+    """Tell the model a real folder is linked, and how to move changes back (DEC-049).
+
+    Deliberately CHEAP: one indexed DB read plus a manifest file open. It must never call
+    diff_project() — that walks the copy and re-hashes every target file, which per message
+    would be far too expensive. Counts belong in the on-demand summary endpoint the UI calls;
+    the model is only told enough to know the tools exist and what `project/` means.
+    """
+    try:
+        from . import project_link as pl
+        link = pl.get_link(user_id)
+        if not link:
+            return ""
+        prefix = link["rel_prefix"]
+        imported = int(link.get("imported_at") or 0)
+        # A hint, not a diff: the copy may be stale relative to the real folder.
+        age = ""
+        if imported:
+            days = max(0, int((time.time() - imported) // 86400))
+            if days >= 3:
+                age = f" (imported {days} days ago — the real folder may have changed since)"
+        return (
+            f"\n\n# Linked project folder\n"
+            f"A real folder on disk is linked to your workspace. Its contents are copied under "
+            f"`{prefix}/` and behave like ordinary workspace files: read, search, edit and create "
+            f"them with the normal fs tools using `{prefix}/...` paths.{age}\n"
+            f"- Your edits stay in the workspace copy. They do NOT touch the real folder on their own.\n"
+            f"- `sync_preview` (read-only) reports what differs and lists CONFLICTS — files the user "
+            f"changed in the real folder since import.\n"
+            f"- `sync_apply` writes the changes back. It always needs the user's approval for that "
+            f"specific call, and refuses everything if any file conflicts.\n"
+            f"Never claim a change is 'saved to the project' until sync_apply has succeeded. "
+            f"Before applying, run sync_preview and tell the user what will change. Do not delete "
+            f"files expecting them to disappear from the real folder — deletions are never applied."
+        )
+    except Exception:  # noqa: BLE001 — a broken link must never break prompt building
+        return ""
+
+
+def _image_parts(user_id: str, images: list):
+    """Encode jail-relative image files as OpenAI `image_url` data-URL parts.
+
+    Shared by user uploads (`_attachment_content`) and media tools (pdf_read /
+    view_video), so both deliver pixels to the model through exactly the same shape —
+    the one shape known to reach an mmproj projector. Items are
+    {"path": <workspace-relative>, "mime": "image/png"}; a missing `mime` is guessed.
+    Unreadable files are skipped rather than failing the whole message, and each read
+    is capped at 8 MiB exactly as uploads are. Returns a list (possibly empty).
+    """
+    parts = []
+    for img in images or []:
+        try:
+            rel = (img or {}).get("path") or ""
+            mime = (img or {}).get("mime") or ""
+            if not rel:
+                continue
+            if not mime.startswith("image/"):
+                import mimetypes
+                mime = mimetypes.guess_type(rel)[0] or "image/png"
+            import base64
+            b64 = base64.b64encode(workspaces.read_bytes(user_id, rel)[:8 * 1024 * 1024]).decode()
+            parts.append({"type": "image_url",
+                          "image_url": {"url": f"data:{mime};base64,{b64}"}})
+        except Exception:  # noqa: BLE001 — skip an unreadable image, keep the rest
+            continue
+    return parts
+
+
+def _attachment_content(user_id: str, att_meta: list, text: str, captions: dict | None = None):
     """Build OpenAI multimodal `content` for a user message with attachments.
 
     Images become {type:image_url, image_url:{url:data:...;base64,...}} parts so a
-    vision-capable model actually sees them (never raw bytes dumped as text). Other
-    files are represented by the text we already stored. Returns a str if there are
-    no images (plain content), else a list of content parts.
+    vision-capable model actually sees them (never raw bytes dumped as text). Audio does
+    NOT get a part: the chat model generally has no audio encoder, and a base64 blob it
+    cannot read is pure context waste — instead `captions` (from the captioner model, see
+    hearth/captioner.py) is inserted per file. Other files stay as the text we already
+    stored. Returns a str when there are no images (plain content, with any captions
+    appended to it), else a list of content parts.
     """
-    parts = [{"type": "text", "text": text}]
+    base_text = text
+    extra_texts: list[str] = []
+    parts = [{"type": "text", "text": base_text}]
     has_image = False
+    captions = captions or {}
     for att in att_meta:
         mime = att.get("mime") or ""
+        rel = att.get("rel_path") or ""
+        cap_text = captions.get(rel)
         if not mime.startswith("image/"):
+            # Non-image attachments stay text. A caption belongs with that text so the
+            # plain-string return path (audio, no image — the common case) still carries it.
+            if cap_text:
+                extra_texts.append(cap_text)
             continue
+        if cap_text:
+            parts.append({"type": "text", "text": cap_text})
         try:
             import base64
             b64 = base64.b64encode(
-                workspaces.read_bytes(user_id, att["rel_path"])[:8 * 1024 * 1024]).decode()
+                workspaces.read_bytes(user_id, rel)[:8 * 1024 * 1024]).decode()
             parts.append({"type": "image_url",
                           "image_url": {"url": f"data:{mime};base64,{b64}"}})
             has_image = True
         except Exception:  # noqa: BLE001 — skip unreadable image, keep the text part
             continue
 
-    return parts if has_image else text
+    if not has_image:
+        return "\n\n".join([t for t in [base_text] + extra_texts if t])
+    parts[0] = {"type": "text", "text": "\n\n".join(
+        [t for t in [base_text] + extra_texts if t])}
+    return parts
 
 
-def build_messages(conv_id: str, user_id: str = "") -> list[dict]:
+def _cancel_requested(cancel) -> bool:
+    """Whether a cancel-like object is set — for code that may receive either shape.
+
+    The asyncio turn handle (hearth.cancel.CancelHandle) exposes ``.cancelled``, while
+    worker-thread helpers such as captioner.describe_file are polled through the
+    ``threading.Event`` interface (``.is_set()``). Anything blocking long enough to be worth
+    aborting must accept both, so this normalises them instead of assuming one — a wrong
+    assumption here previously raised AttributeError mid-caption for directly-attached audio.
+    Cheap and never raises: an unknown object reads as "cannot be aborted".
+    """
+    if cancel is None:
+        return False
+    try:
+        if hasattr(cancel, "is_set"):
+            return bool(cancel.is_set())
+        return bool(getattr(cancel, "cancelled", False))
+    except Exception:  # noqa: BLE001 — a dead handle reads as "not cancelled"
+        return False
+
+
+# Per-conversation caption cache: (workspace rel path -> text block for the model).
+# In-memory only, bounded, and keyed by user as well as conversation so one family member's
+# recording can never be quoted into another's context. Why cache at all: build_messages runs
+# once per agent round, and re-captioning a 3-minute attachment on every round would cost
+# minutes per turn for a description that cannot change. A restart simply forgets it and the
+# next send pays once — acceptable, and far cheaper than storing audio-derived text in the DB.
+_captions: dict[str, dict[str, str]] = {}
+_CAPTION_CACHE_MAX_CONVOS = 64
+_CAPTION_NOTE_MAX_CHARS = 1200   # a failure note is short; only captions can be long
+
+
+def _caption_cache_key(user_id: str, conv_id: str) -> str:
+    return f"{user_id}:{conv_id}"
+
+
+def _remember_caption(user_id: str, conv_id: str, rel: str, text: str) -> None:
+    key = _caption_cache_key(user_id, conv_id)
+    if key not in _captions and len(_captions) >= _CAPTION_CACHE_MAX_CONVOS:
+        # Dicts keep insertion order, so this drops the least recently *created* chat.
+        # Crude but bounded, which is all a convenience cache needs.
+        try:
+            del _captions[next(iter(_captions))]
+        except StopIteration:
+            pass
+    _captions.setdefault(key, {})[rel] = text[:_CAPTION_NOTE_MAX_CHARS + 4000]
+
+
+def get_caption(user_id: str, conv_id: str, rel: str) -> str:
+    """A previously produced caption/note for this attachment, or ""."""
+    return (_captions.get(_caption_cache_key(user_id, conv_id), {}) or {}).get(rel, "")
+
+
+# ---- durable captions (DEC-061) ---------------------------------------------------
+# The in-memory cache above was the whole story, which caused two real losses: a page
+# refresh showed nothing (the caption had no representation in the history endpoint at
+# all), and a LATER turn in the same chat sent the model a bare `[attached: x.mp3]` —
+# because build_messages only ever receives the CURRENT turn's caption dict. Persisting
+# onto the user message's meta fixes both, the same way reasoning survives on
+# meta.reasoning: no schema change, and it rides along with the row it belongs to.
+#
+# Stored as {"path": {"text": ..., "name": ..., "ok": bool}} so the client can render a
+# label and say honestly whether a description exists. Kept separate from `text` in the
+# model message: meta is never sent to the model, only the folded-in text is (see
+# _attachment_content), so persistence cannot inflate a prompt by itself.
+def persist_captions(conv_id: str, att_meta: list, captions: dict) -> None:
+    """Attach caption blocks to the newest user row that references these attachments.
+
+    Best-effort by design: a caption is derived data, and failing to store one must never
+    lose the user's message or break the turn. Rows are matched by artifact id so an older
+    message with the same filename is not overwritten.
+    """
+    if not conv_id or not captions or not att_meta:
+        return
+    ids = {a.get("artifact_id") for a in att_meta if a.get("artifact_id")}
+    if not ids:
+        return
+    try:
+        with session_scope() as s:
+            rows = (s.query(Message)
+                    .filter(Message.conversation_id == conv_id, Message.role == "user")
+                    .order_by(Message.created_at.desc()).limit(5).all())
+            for m in rows:
+                try:
+                    meta = json.loads(m.meta) if m.meta else {}
+                except Exception:  # noqa: BLE001 — not our meta to preserve
+                    continue
+                if not isinstance(meta, dict):
+                    continue
+                row_atts = meta.get("attachments") or []
+                if not any(a.get("artifact_id") in ids for a in row_atts if isinstance(a, dict)):
+                    continue
+                stored = meta.get("captions")
+                if not isinstance(stored, dict):
+                    stored = {}
+                for a in row_atts:
+                    rel = (a or {}).get("rel_path") or ""
+                    block = captions.get(rel)
+                    if rel and block:
+                        stored[rel] = {"text": block, "name": (a or {}).get("name") or rel,
+                                       "ok": not str(block).lstrip().startswith("[")
+                                             or "NOT analysed" not in str(block)}
+                meta["captions"] = stored
+                m.meta = json.dumps(meta)
+                return
+    except Exception as e:  # noqa: BLE001 — derived data; never break a turn over it
+        audit.log("", "caption_persist_failed", {"conv": conv_id, "err": str(e)[:120]})
+
+
+def captions_from_meta(meta_str: str) -> dict:
+    """{rel_path: text} from one message's meta JSON, or {} when there is nothing stored."""
+    if not meta_str:
+        return {}
+    try:
+        meta = json.loads(meta_str)
+    except Exception:  # noqa: BLE001
+        return {}
+    stored = meta.get("captions") if isinstance(meta, dict) else None
+    if not isinstance(stored, dict):
+        return {}
+    out = {}
+    for rel, v in stored.items():
+        if isinstance(v, dict) and v.get("text"):
+            out[rel] = str(v["text"])
+        elif isinstance(v, str) and v:
+            out[rel] = v      # tolerate a plain-string shape rather than lose it
+    return out
+
+
+def caption_state(meta_str: str) -> dict:
+    """{rel_path: {"name","ok"}} for display — whether a description exists per file.
+
+    Separate from captions_from_meta because the UI needs the label and the honest ok flag,
+    not just the text (the model path wants only text).
+    """
+    if not meta_str:
+        return {}
+    try:
+        meta = json.loads(meta_str)
+    except Exception:  # noqa: BLE001
+        return {}
+    stored = meta.get("captions") if isinstance(meta, dict) else None
+    if not isinstance(stored, dict):
+        return {}
+    out = {}
+    for rel, v in stored.items():
+        if isinstance(v, dict):
+            out[rel] = {"name": v.get("name") or rel, "ok": bool(v.get("ok"))}
+        else:
+            out[rel] = {"name": rel, "ok": True}
+    return out
+
+
+
+async def prepare_captions(user_id: str, conv_id: str, att_meta: list,
+                           settings: dict, emit=lambda ev: None, cancel=None) -> dict:
+    """Caption the audio attachments in `att_meta`; return {rel_path: text block}.
+
+    Called by the chat route BEFORE the turn starts (and by steering delivery), because a
+    caption is not free: ffmpeg conversion plus a model that has to listen. So progress is
+    emitted as `notice` events while it happens — otherwise a 40-second silence before the
+    first token is indistinguishable from a hang, which is the exact complaint this feature
+    could otherwise add.
+
+    Never raises and never blocks a message: every failure becomes a short text block saying
+    what went wrong and what to do about it, so the main model can tell the user instead of
+    inventing what the recording says. Already-captioned files are served from cache, which
+    is what makes replaying history on later agent rounds cheap.
+
+    `cancel` (optional) is a CancelHandle: when set, remaining files are skipped and the one
+    in flight unwinds via caption_sync's own cancel checks — so Stop abandons a recording
+    instead of listening to all of it first. The streamed description pieces are forwarded as
+    `caption_chunk` notices (DEC-057), throttled to keep SSE quiet on long captions.
+    """
+    from . import captioner as cap
+
+    out: dict[str, str] = {}
+    if not att_meta or not user_id:
+        return out
+    candidates = [a for a in att_meta
+                  if cap.is_audio(a.get("name") or "", a.get("mime") or "")]
+    if not candidates:
+        return out
+
+    enabled = bool(settings.get("captioner.enabled"))
+    auto = bool(settings.get("captioner.auto_route", True))
+    for att in candidates:
+        rel = att.get("rel_path") or ""
+        name = att.get("name") or rel
+        if not rel:
+            continue
+        # A Stop during a multi-file caption stops the whole batch, not just one file. Checked
+        # at the top of each iteration so we never START listening to a new recording after the
+        # user asked us to stop.
+        if _cancel_requested(cancel):
+            break
+        cached = get_caption(user_id, conv_id, rel)
+        if cached:
+            out[rel] = cached
+            continue
+        if not enabled or not auto:
+            # Deliberately NOT cached: enabling the captioner must start working at once.
+            why = ("the audio captioner is disabled" if not enabled
+                   else "auto-describing attachments is switched off (Admin → Audio)")
+            out[rel] = (f"[{name}: audio was attached but NOT analysed — {why}. The assistant "
+                        f"can ask for a description with describe_audio once it is available.]")
+            continue
+
+        emit({"type": "notice", "kind": "caption_start", "file": name,
+              "text": f"listening to {name}…"})
+        t0 = time.time()
+        # Stream the captioner's own words as they arrive so the wait is visibly working, not
+        # just labelled as working. Throttled: one notice per ~48 chars or ~0.3 s (whichever
+        # comes first) keeps a long caption from spamming SSE while still feeling live.
+        _pend: list[str] = []
+        _last_flush = [time.time()]
+
+        def _on_delta(piece: str, _name=name, _pend=_pend, _last=_last_flush) -> None:
+            if not piece:
+                return
+            _pend.append(piece)
+            now = time.time()
+            joined = "".join(_pend)
+            if len(joined) >= 48 or (now - _last[0]) >= 0.3:
+                emit({"type": "notice", "kind": "caption_chunk", "file": _name, "text": joined})
+                _pend.clear()
+                _last[0] = now
+
+        try:
+            res = await cap.describe_file(user_id, rel, settings=settings,
+                                          on_delta=_on_delta, cancel=cancel)
+        except cap.CaptionError as e:
+            # Flush whatever streamed before the failure so a partial caption is not lost.
+            if _pend:
+                emit({"type": "notice", "kind": "caption_chunk", "file": name,
+                      "text": "".join(_pend)})
+            note = (f"[{name}: could not be described — {e}]")
+            _remember_caption(user_id, conv_id, rel, note)
+            out[rel] = note
+            emit({"type": "notice", "kind": "caption_done", "file": name, "ok": False,
+                  "text": f"could not describe {name}"})
+            continue
+        except Exception as e:  # noqa: BLE001 — a captioner fault must never lose the message
+            if _pend:
+                emit({"type": "notice", "kind": "caption_chunk", "file": name,
+                      "text": "".join(_pend)})
+            note = (f"[{name}: describing it failed unexpectedly ({type(e).__name__}: "
+                    f"{str(e)[:160]})]")
+            _remember_caption(user_id, conv_id, rel, note)
+            out[rel] = note
+            emit({"type": "notice", "kind": "caption_done", "file": name, "ok": False,
+                  "text": f"could not describe {name}"})
+            continue
+
+        dur = res.get("duration_s") or 0.0
+        chunks = int(res.get("chunks") or 1)
+        block = (f"[Captioner description of the attached audio '{name}' "
+                 f"(duration {_fmt_secs(dur)}{', ' + str(chunks) + ' timed chunks' if chunks > 1 else ''}, "
+                 f"produced by a separate audio model in {int(time.time() - t0)} s — it is NOT "
+                 f"your own perception and can be wrong about words, counts or identities):\n\n"
+                 + str(res.get("caption") or "").strip())
+        for note in (res.get("notes") or []):
+            block += f"\nnote: {note}"
+        block += "]"
+        _remember_caption(user_id, conv_id, rel, block)
+        out[rel] = block
+        # Flush any tail that did not reach the throttle threshold so the streamed block ends
+        # with the complete caption (the client appends chunks; a dropped tail would truncate).
+        if _pend:
+            emit({"type": "notice", "kind": "caption_chunk", "file": name,
+                  "text": "".join(_pend)})
+            _pend.clear()
+        emit({"type": "notice", "kind": "caption_done", "file": name, "ok": True,
+              "text": f"described {name} in {int(time.time() - t0)} s"})
+    return out
+
+
+def _fmt_secs(seconds) -> str:
+    try:
+        s = int(float(seconds))
+    except (TypeError, ValueError):
+        return "unknown"
+    if s <= 0:
+        return "unknown"
+    return f"{s // 60}:{s % 60:02d}"
+
+
+def build_messages(conv_id: str, user_id: str = "", captions: dict | None = None,
+                   settings: dict | None = None) -> list[dict]:
     """Assemble OpenAI-style messages including a system prompt.
 
     Reconstructs the tool-calling protocol from stored history so a real
@@ -107,9 +510,11 @@ def build_messages(conv_id: str, user_id: str = "") -> list[dict]:
       - assistant rows carry meta.tool_calls (with ids).
       - each following `tool` row carries meta.tool_call_id matching one call;
         we attach it to the most recent assistant message's tool_calls.
-    User messages with image attachments are sent as multimodal content parts.
-    A workspace file listing is appended to the system prompt so the model knows
-    which files exist in this conversation's user space.
+    User messages with image attachments are sent as multimodal content parts. Audio
+    attachments are NOT sent as bytes — their `captions` (workspace-rel-path -> text from the
+    captioner model, prepared by prepare_captions()) are inserted instead. A workspace file
+    listing is appended to the system prompt so the model knows which files exist in this
+    conversation's user space.
     """
     with session_scope() as s:
         conv = s.get(Conversation, conv_id)
@@ -133,6 +538,8 @@ def build_messages(conv_id: str, user_id: str = "") -> list[dict]:
     system = prompt_mod.assemble(resolved, proto_doc.content if proto_doc else None)
     if user_id:
         system += _workspace_context(user_id)
+        system += _project_context(user_id)
+    system += _captioner_hint(settings or rs.get_all())
     messages: list[dict] = [{"role": "system", "content": system}]
     last_assistant_with_calls: dict | None = None
     for m in load_history(conv_id):
@@ -144,6 +551,11 @@ def build_messages(conv_id: str, user_id: str = "") -> list[dict]:
                 meta = {}
         if m["role"] == "assistant":
             entry = {"role": "assistant", "content": m["content"] or ""}
+            # Reasoning is NOT replayed into the request graph at all: it lives on meta for
+            # the UI, and re-sending a model its own previous thinking inflates the prompt and
+            # invites it to keep "thinking" out loud inside the answer. The retention policy
+            # below governs what happens to it in HISTORY (i.e. what the user sees after a
+            # reload) — never what the model is sent.
             if meta.get("tool_calls"):
                 entry["tool_calls"] = _clean_tool_calls(meta["tool_calls"])
                 last_assistant_with_calls = entry
@@ -153,8 +565,36 @@ def build_messages(conv_id: str, user_id: str = "") -> list[dict]:
             if meta.get("tool_call_id") and last_assistant_with_calls is not None:
                 entry["tool_call_id"] = meta["tool_call_id"]
             messages.append(entry)
+            # Media-tool images (pdf_read / view_video): a follow-up user-role message
+            # carrying the actual pixels. Deliberately transient — never stored as its
+            # own row, so the transcript shows one tool chip and the DB is not filled
+            # with synthetic user messages; regenerated here from meta["images"] on
+            # every replay, which keeps ordering right after the tool result it belongs
+            # to. See DEC-052: this is the same multimodal shape hearth's upload path
+            # uses, i.e. the only one known to reach an mmproj projector. A text-only
+            # model simply ignores the parts; the tool's own text still explains them.
+            if user_id and meta.get("images"):
+                parts = _image_parts(user_id, meta["images"])
+                if parts:
+                    messages.append({
+                        "role": "user",
+                        "content": [{"type": "text",
+                                     "text": f"[{meta.get('tool') or 'tool'} returned these "
+                                             f"{len(parts)} image(s) — the visual content of "
+                                             f"the files named in the tool result above.]"}]
+                                    + parts})
         elif m["role"] == "user" and meta.get("attachments") and user_id:
-            content = _attachment_content(user_id, meta["attachments"], m["content"])
+            # This row's OWN stored captions take precedence over the turn-level map, and
+            # fill it in where the map has nothing. Without this, an attachment from an
+            # earlier message reached the model as a bare `[attached: x.mp3]` on every
+            # later turn (the caption dict only ever covers the message being sent now),
+            # and a server restart lost even the current one. DEC-061.
+            row_caps = captions_from_meta(m.get("meta") or "")
+            if row_caps:
+                merged = {**row_caps, **(captions or {})}
+            else:
+                merged = captions
+            content = _attachment_content(user_id, meta["attachments"], m["content"], merged)
             messages.append({"role": "user", "content": content})
         else:
             messages.append({"role": m["role"], "content": m["content"]})
@@ -217,12 +657,20 @@ def conversation_exists(conv_id: str) -> bool:
 
 async def run_turn(user_id: str, conv_id: str, provider, settings: dict,
                    download_store: dict, pending_resume=None, gen: dict | None = None,
-                   cancel: CancelHandle | None = None) -> AsyncIterator[dict]:
+                   cancel: CancelHandle | None = None,
+                   captions: dict | None = None) -> AsyncIterator[dict]:
     """pending_resume: (PendingAction row data) if this turn continues a gated action.
     gen: per-turn generation overrides ({no_tools, max_tokens}).
     cancel: handle from cancel.begin(); None means "cannot be aborted".
+    captions: audio descriptions for this turn's attachments, prepared by the caller via
+        prepare_captions() so the wait happens where progress can be shown.
     """
     ctx = ToolContext(user_id, settings, download_store, conversation_id=conv_id)
+    # Let long-running tools observe cancellation (see ToolContext.cancel_event). Without
+    # this the describe_audio tool would keep listening to a recording after Stop — the
+    # repeat-suppress cache means an aborted tool is never re-run, so abort had no effect on
+    # it at all. The handle's lifetime is owned by routes/_stream_turn, same as here.
+    ctx.attach_cancel(cancel)
     gen = dict(gen or {})
 
     # If resolving a gated action, execute it now and append the tool result.
@@ -233,7 +681,8 @@ async def run_turn(user_id: str, conv_id: str, provider, settings: dict,
                 yield ev
             return
 
-        async for ev in _agent_loop(user_id, conv_id, provider, settings, ctx, gen, cancel):
+        async for ev in _agent_loop(user_id, conv_id, provider, settings, ctx, gen, cancel,
+                                    captions=captions):
             yield ev
     except TurnAborted:
         # The user pressed Abort. History is already consistent (we only abort
@@ -254,19 +703,172 @@ def _max_steps(settings: dict) -> int:
         return MAX_TOOL_LOOPS
 
 
-async def _stream_checked(provider, messages, specs, params, cancel):
+_LOG_POLL_S = 0.6   # how often to read new llama-server log lines during a model round
+
+
+def _progress_event(ev: dict) -> StreamEvent:
+    """Turn one parsed log event into a `progress` StreamEvent with an honest ETA.
+
+    Carries llama.cpp's own numbers and the ONE calculation worth doing here:
+
+        remaining tokens / last prefill rate = seconds left
+
+    The rate is what llama.cpp reported for THIS prompt on this very line, never averaged or
+    extrapolated; the remaining token count comes from the server's `n_tokens done` +
+    `progress fraction` pair (so the whole prompt size is n_done / progress). It is still a
+    flat-rate guess over a curve that is not flat (chunked prefill, cache hits), hence "≈".
+
+    Honesty rules that must not be relaxed:
+      * Below 1 % progress nothing is said at all. print_timing rounds the fraction to two
+        decimals, so dividing a handful of tokens by a hundredth of a prompt invents a huge
+        number out of rounding noise.
+      * No rate -> no ETA (not zero). format_seconds returns "" for anything under a second,
+        so a caller that appends it gets silence rather than a misleading "0s left".
+    """
+    data = dict(ev or {})
+    if data.get("kind") == "prefill":
+        n_done = data.get("n_tokens") or 0
+        frac = data.get("progress") or 0.0
+        rate = data.get("rate_tps")
+        data["phase"] = "prefill"
+        data["pct"] = max(0.0, min(1.0, float(frac)))
+        data["prompt_tokens"] = int(n_done)
+        n_left = None
+        if n_done and frac and rate:
+            n_total = int(round(n_done / frac))
+            n_left = max(0, n_total - int(n_done))
+            data["prompt_total"] = n_total
+        if n_left and rate and frac >= 0.01:
+            secs = n_left / float(rate)
+            from .perf import format_seconds
+            txt = format_seconds(secs)
+            if txt:
+                data["eta_s"] = round(secs, 1)
+                data["eta"] = txt
+    elif data.get("kind") == "perf":
+        # A pure speed line (decode rate while generating, or a perf-context summary).
+        # No percentage to report — the UI must not show a bar it has no basis for.
+        data.setdefault("phase", "decode")
+    return StreamEvent("progress", data=data)
+
+
+def _merge_progress(st: dict | None, evs: list) -> tuple[dict, list]:
+    """Advance a progress state machine by one batch of log events.
+
+    THE ONLY place the ETA baseline may be computed, which is why it exists at all: a naive
+    per-line calculation produced nothing useful, because llama.cpp prints its first
+    prompt-processing line before print_timing has any rate to report (rate=None), and each
+    later line carries only the CURRENT rate — never the elapsed time needed to work out how
+    fast the prompt got from 0 % to here. So: latch the first line's implied total
+    (`n_done / progress`) as this prompt's size, then on every subsequent line divide what is
+    left of that total by the current rate.
+
+    State is per-prompt and must be reset between prompts (see _agent_loop's cursor reset) —
+    a baseline from one prompt says nothing about the next: different size, cache state and
+    batch shape all change the rate. Returns (new_state, events_carrying_eta)."""
+    st = dict(st or {})
+    out = []
+    for ev in (evs or []):
+        e = dict(ev or {})
+        if e.get("kind") != "prefill":
+            out.append(e)
+            continue
+        n = int(e.get("n_tokens") or 0)
+        frac = float(e.get("progress") or 0.0)
+        rate = e.get("rate_tps")
+        total = None
+        if n and frac > 0:
+            total = int(round(n / frac))
+        # First usable line latches the prompt size for the rest of this prompt.
+        if st.get("total") is None and total:
+            st["total"] = total
+        # The server's own total for THIS line is the better estimate once it has read more
+        # (early lines round hard: 5000 tokens at progress=0.01 implies 500k). Prefer the
+        # larger of the two, so a rounding-noise early line cannot inflate later ETAs.
+        if total and st.get("total"):
+            st["total"] = max(st["total"], total) if frac < 0.5 else total
+        cur_total = st.get("total")
+        if cur_total and rate and frac >= 0.01:
+            left = max(0, cur_total - n)
+            secs = left / float(rate)
+            from .perf import format_seconds
+            txt = format_seconds(secs)
+            # Once the server says we are at (or past) the end, stop guessing: an ETA of "0s"
+            # next to 100 % is noise, and llama.cpp keeps printing lines while it wraps up.
+            if txt and frac < 0.995:
+                e["eta_s"] = round(secs, 1)
+                e["eta"] = txt
+        out.append(e)
+    return st, out
+
+    """Turn one parsed log event into a `progress` StreamEvent with an honest ETA.
+
+    Carries llama.cpp's own numbers and the ONE calculation worth doing here:
+
+        remaining tokens / last prefill rate = seconds left
+
+    The rate is what llama.cpp reported for THIS prompt on this very line, never averaged or
+    extrapolated; the remaining token count comes from the server's `n_tokens done` +
+    `progress fraction` pair (so the whole prompt size is n_done / progress). It is still a
+    flat-rate guess over a curve that is not flat (chunked prefill, cache hits), hence "≈".
+
+    Honesty rules that must not be relaxed:
+      * Below 1 % progress nothing is said at all. print_timing rounds the fraction to two
+        decimals, so dividing a handful of tokens by a hundredth of a prompt invents a huge
+        number out of rounding noise.
+      * No rate -> no ETA (not zero). format_seconds returns "" for anything under a second,
+        so a caller that appends it gets silence rather than a misleading "0s left".
+    """
+    data = dict(ev or {})
+    if data.get("kind") == "prefill":
+        n_done = data.get("n_tokens") or 0
+        frac = data.get("progress") or 0.0
+        rate = data.get("rate_tps")
+        data["phase"] = "prefill"
+        data["pct"] = max(0.0, min(1.0, float(frac)))
+        data["prompt_tokens"] = int(n_done)
+        n_left = None
+        if n_done and frac and rate:
+            n_total = int(round(n_done / frac))
+            n_left = max(0, n_total - int(n_done))
+            data["prompt_total"] = n_total
+        if n_left and rate and frac >= 0.01:
+            secs = n_left / float(rate)
+            from .perf import format_seconds
+            txt = format_seconds(secs)
+            if txt:
+                data["eta_s"] = round(secs, 1)
+                data["eta"] = txt
+    elif data.get("kind") == "perf":
+        # A pure speed line (decode rate while generating, or a perf-context summary).
+        # No percentage to report — the UI must not show a bar it has no basis for.
+        data.setdefault("phase", "decode")
+    return StreamEvent("progress", data=data)
+
+
+async def _stream_checked(provider, messages, specs, params, cancel, log_src=None):
     """Forward provider events, but bail out promptly if the turn is aborted.
 
-    IDLE timeout, reset on every event: the guard fires only when the stream
-    produced NOTHING for `stream_idle_timeout_s`. It used to wrap the whole
-    completion in one `asyncio.timeout(deadline)`, which — despite the docstring —
-    was a hard wall-clock cap per round, NOT an idle timer. A too-small
-    HEARTH_STREAM_IDLE_TIMEOUT_S (or `.env` leftover) then killed every request
-    at exactly N seconds regardless of progress: llama-server logged
-    `stop: cancel task` 1.000 s after each launch and the UI showed
-    "connection lost (ReadError)". Waiting per-event with asyncio.wait_for is a
-    true idle timer AND works on Python 3.10, so the old 3.11 feature-detect
-    (`asyncio.timeout`) is gone; `stream_idle_guard=false` still disables it.
+    IDLE timeout, reset on every *provider* event: the guard fires only when the stream
+    itself produced NOTHING for `stream_idle_timeout_s`. The deadline is tracked as an
+    absolute instant and pushed forward only by real provider activity — never by a
+    progress poll, and never recomputed at the top of an iteration. (Both of those were
+    bugs: with the log poller armed every `_LOG_POLL_S` the countdown restarted each pass,
+    so a wedged stream was never reported at all.) It used to wrap the whole completion in
+    one `asyncio.timeout(deadline)`, which — despite the docstring — was a hard wall-clock
+    cap per round, NOT an idle timer. A too-small HEARTH_STREAM_IDLE_TIMEOUT_S (or `.env`
+    leftover) then killed every request at exactly N seconds regardless of progress:
+    llama-server logged `stop: cancel task` 1.000 s after each launch and the UI showed
+    "connection lost (ReadError)". `stream_idle_guard=false` still disables it.
+
+    `log_src` (optional) is a zero-arg callable returning ``(events, new_state)`` from
+    llama-server's own log — see ModelManager.poll_log_perf. While it is polled the loop also
+    yields `progress` events, because during prefill the OpenAI stream sends NOTHING at all:
+    without this a 260 k context looks exactly like a hang. The poller is a waiter in the
+    same race as the provider event and the abort. Its completion is NOT an error and NOT a
+    timeout: it retires nothing, and the round keeps waiting on the SAME provider read task —
+    see the "ONE provider read at a time" note below, which is what the crash this loop grew
+    was all about.
     """
     from .config import get_boot_settings
     bs = get_boot_settings()
@@ -275,12 +877,80 @@ async def _stream_checked(provider, messages, specs, params, cancel):
 
     agen = provider.stream(messages, specs, params).__aiter__()
 
-    async def _next():
-        """One event from the provider, or StopAsyncIteration when it ends."""
-        return await agen.__anext__()
+    # ONE provider read at a time, for the whole model round.
+    #
+    # An async generator may only have one `__anext__()` in flight; entering it again
+    # raises RuntimeError "anext(): asynchronous generator is already running". That is
+    # easy to do by accident with a single-shot read task: whenever the log poll (or an
+    # abort) completed first, the loop retired that read and created a new one — but
+    # *cancelling* a `__anext__()` task does not synchronously unwind the generator
+    # frame, and abandoning it without cancelling at all leaves the read live. Either way
+    # the next iteration re-entered a still-running generator. (This is exactly what the
+    # idle-progress poller exposed: during prefill the provider emits nothing, so the
+    # poll won the race every ~0.6 s.)
+    #
+    # So the read task lives across iterations and is only ever created once, and every
+    # exit path closes `agen` FIRST (aclose() drives the pending read out through the
+    # provider's own finally) instead of cancelling it — see the teardown note at the
+    # bottom. A second creation attempt would be a bug, so it raises loudly rather than
+    # corrupting the stream.
+    read_task: asyncio.Task | None = None
+
+    def read_once():
+        """The single provider-read task (created at most once per round)."""
+        nonlocal read_task
+        if read_task is not None:
+            raise RuntimeError(
+                "provider read already in flight — the stream loop must reuse it, not "
+                "re-arm it")
+        read_task = asyncio.ensure_future(agen.__anext__())
+        return read_task
+
+    # Progress bookkeeping for THIS model round (see _merge_progress). Per-round by design:
+    # an ETA baseline describes one prompt, and reusing a previous prompt's latched total
+    # would estimate from numbers a different prompt produced.
+    prog_state: dict | None = None
+
+    async def _poll_log():
+        """Sleep a beat, then read new log lines. Returns (events, baseline_state).
+
+        THE reason this loop yields anything during prefill: the OpenAI endpoint streams no
+        progress at all while a prompt is being read, so without this a 260 k context looks
+        exactly like a hang.
+
+        This is a PLAIN waiter in the race below — sleep, then read — and that shape is not
+        incidental. Three earlier designs (single-shot poll cancelled on every provider event;
+        re-arm from the delivery branch; a self-driving pump feeding an asyncio.Queue drained
+        via `await q.get()`) all delivered NOTHING while every test stayed green: `asyncio.wait`
+        does not wake for a bare `Queue.get()` waiter, so the queue filled and never drained.
+        A timed sleep is what `asyncio.wait` reliably observes — the same reason the abort
+        branch has always worked. Keep this shape; do not reintroduce a queue.
+
+        Empty results are reported as empty and the caller re-arms: no event means "nothing new
+        in the log yet", which is the common case between llama.cpp's ~1 s print cadence.
+        """
+        await asyncio.sleep(_LOG_POLL_S)
+        if log_src is None:
+            return []
+        try:
+            # The CALLER owns the byte cursor and passes a ready-made callable; calling it with
+            # no args is the whole contract. (An earlier version did `nonlocal log_state` here —
+            # which compiled, because that name also exists in _agent_loop, but raised NameError
+            # at runtime on every poll. Swallowed by the except below, so live prefill progress
+            # silently never appeared while every test stayed green.)
+            events, _new = log_src()
+            if not events:
+                return []
+            nonlocal prog_state
+            prog_state, enriched = _merge_progress(prog_state, events)
+            return [_progress_event(e) for e in enriched]
+        except Exception:  # noqa: BLE001 — progress telemetry must never break a turn
+            return []
 
     timed_out = False
     aborted = False
+    eof = False
+    wait_deadline: float | None = None      # see the idle-deadline note in the loop
     try:
         while True:
             # Race three outcomes: the next provider event, an idle timeout, and a
@@ -288,58 +958,160 @@ async def _stream_checked(provider, messages, specs, params, cancel):
             # previously cancellation was only observed after __anext__() returned,
             # so during a long prefill or tool call (no events) Stop appeared to do
             # nothing until the round finished, and llama-server kept decoding.
-            next_task = asyncio.ensure_future(_next())
+            #
+            # `read_once()` returns the round's single read task; on iterations after a
+            # progress-only wake-up it is the SAME pending task, deliberately — see the
+            # "ONE provider read at a time" note above for why re-arming it was fatal.
+            next_task = read_once() if read_task is None else read_task
             waiters = [next_task]
             cancel_task = None
             if cancel is not None:
                 cancel_task = asyncio.ensure_future(cancel.wait_cancelled())
                 waiters.append(cancel_task)
-            timeout = idle_s if use_timeout else None
+            # Fourth waiter: the log poll. A plain timed sleep + read, re-created every
+            # iteration — deliberately NOT a long-lived task or a queue (see _poll_log for what
+            # that cost). It resolves after _LOG_POLL_S whether or not the log grew; an empty
+            # result just re-arms on the next pass, which is why this shape costs nothing while
+            # the model is streaming tokens normally. It is what lets prefill percentage reach
+            # the UI during the one phase where the provider emits no events at all.
+            prog_task = None
+            if log_src is not None:
+                prog_task = asyncio.ensure_future(_poll_log())
+                waiters.append(prog_task)
+            # THE idle deadline: absolute, not per-waiter. `wait_deadline` is the moment
+            # the round is allowed to give up, and it is only pushed forward when the
+            # PROVIDER produces something (see the delivery branch). It must never be
+            # recomputed from "now" at the top of an iteration — with the log poller armed
+            # every _LOG_POLL_S, that made the deadline impossible to reach: each poll
+            # restarted the countdown, so a genuinely wedged stream polled forever (a 40 s
+            # hang stayed live past 25 s with `stream_idle_timeout_s=1.5`) instead of being
+            # reported. Progress polls are not evidence of liveness either — they read the
+            # server's log, which keeps printing while a request is stuck.
+            if use_timeout and wait_deadline is None:
+                wait_deadline = time.monotonic() + idle_s
+            timeout = (max(0.0, wait_deadline - time.monotonic())
+                       if use_timeout else None)
             try:
                 done, _pending = await asyncio.wait(waiters, timeout=timeout,
                                                     return_when=asyncio.FIRST_COMPLETED)
             except asyncio.CancelledError:
-                # Our own task was cancelled (client disconnect / shutdown): release
-                # everything and propagate so the route tears down the stream.
-                next_task.cancel()
+                # Our own task was cancelled (client disconnect / shutdown): release the
+                # side waiters and propagate so the route tears down the stream. The
+                # provider read is deliberately NOT cancelled — see the abort branch: it
+                # is unwound by aclose() in `finally`, which is also what closes the HTTP
+                # connection. (The generator's frame cannot be dropped while a read owns
+                # it, so aclose() must come first.)
                 if cancel_task is not None:
                     cancel_task.cancel()
+                if prog_task is not None:
+                    prog_task.cancel()
                 raise
+
+            # Progress delivery, BEFORE the provider branch so a `usage`/`done` chunk arriving
+            # in the same batch cannot crowd out the percentage the user is waiting on. The
+            # poller is re-created at the top of the next iteration either way — it is stateless
+            # apart from prog_state, which _poll_log owns.
+            if prog_task is not None and prog_task in done:
+                try:
+                    for ev in (prog_task.result() or []):
+                        yield ev
+                except Exception:  # noqa: BLE001 — telemetry only
+                    pass
 
             if cancel_task is not None and cancel_task in done:
                 aborted = True
-                next_task.cancel()
-                # Surface a provider error raised concurrently, if any, before aborting.
-                if not next_task.cancelled():
-                    try:
-                        next_task.result()
-                    except Exception:  # noqa: BLE001 — we are aborting anyway
-                        pass
+                # Do NOT cancel the provider read here. Cancelling a `__anext__()` task
+                # does not unwind the generator frame synchronously, so `agen` would stay
+                # RUNNING while `finally` tries to close it — CPython then refuses with
+                # "aclose(): asynchronous generator is already running", which escaped as
+                # an error event and looked like a crash. Leaving the read pending instead
+                # means the GeneratorExit thrown by aclose() below unwinds it through the
+                # provider's own `finally` (which is what closes the HTTP connection and
+                # tells llama-server to stop decoding).
+                if cancel_task is not None:
+                    cancel_task.cancel()
             elif next_task in done:
+                # The read is finished; allow the next iteration to create a fresh one.
+                read_task = None
+                # Liveness reset for the idle guard, set BEFORE consulting the result so
+                # it applies whatever the read produced — a token, a usage chunk, or an
+                # exception. The guard is an IDLE timer (reset on any provider activity),
+                # not a wall-clock cap on a round: a model that keeps emitting must never
+                # be cut off mid-stream. Poll events do NOT reset it; see the deadline
+                # note above for why recomputing it per iteration made the guard
+                # unreachable while the poller was armed.
+                if use_timeout:
+                    wait_deadline = time.monotonic() + idle_s
                 try:
                     ev = next_task.result()
                 except StopAsyncIteration:
+                    eof = True
                     break
                 yield ev
+            elif prog_task is not None and prog_task in done:
+                # Only the log poll fired (the usual case during prefill, where the
+                # provider emits no events at all). That is NOT an idle timeout — it is
+                # progress. Loop on with the SAME pending read task; creating a second
+                # `__anext__()` was the crash.
+                #
+                # Falling through to the timeout branch here was the original bug: the
+                # very first poll (~_LOG_POLL_S) ended the round as "model produced no
+                # output for 300s" and cancelled the in-flight read. Cancelling does not
+                # unwind the generator frame synchronously, so the next iteration's fresh
+                # `__anext__()` re-entered a still-RUNNING generator: RuntimeError
+                # "anext(): asynchronous generator is already running", raised inside the
+                # read and surfaced at next_task.result().
+                continue
             else:
-                # Neither completed before the idle timeout.
+                # Genuine idle timeout: NEITHER a provider event NOR the ~0.6 s log poll
+                # completed inside `idle_s`. (Only the poll completing is not a timeout —
+                # see the branch above, and the "ONE provider read at a time" note for why
+                # re-arming that read used to blow up.)
+                #
+                # Here we DO cancel the read: unlike an abort, a timeout means the stream
+                # may be wedged forever, so leaving it pending would hang `finally` — and
+                # aclose() cannot drive a hung frame out either. Then wait for that
+                # cancellation to unwind the generator (bounded), because closing while it
+                # is still RUNNING raises "aclose(): asynchronous generator is already
+                # running". If the provider ignores cancellation entirely, the bounded
+                # wait gives up and `finally` falls back to abandoning the frame.
                 timed_out = True
-                next_task.cancel()
                 if cancel_task is not None:
                     cancel_task.cancel()
+                next_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await asyncio.wait_for(asyncio.shield(next_task), timeout=2.0)
+                break
             # Defensive: if cancel got set by some other path mid-loop, stop now.
             if cancel is not None and cancel.cancelled:
                 aborted = True
                 break
     finally:
-        # Release the provider generator on every exit path (abort, timeout, error).
-        # aclose() throws GeneratorExit into it so llama_server.stream()'s `finally`
-        # runs and the HTTP connection is returned/closed — which is what tells
+        # Release the provider generator on every exit path (abort, timeout, error,
+        # disconnect). aclose() throws GeneratorExit into it so llama_server.stream()'s
+        # `finally` runs and the HTTP connection is returned/closed — which is what tells
         # llama-server to cancel the in-flight task instead of decoding to completion.
+        #
+        # The ordering rule this whole function exists around: a pending `__anext__()`
+        # must never be cancelled and then abandoned, because that leaves the generator
+        # RUNNING (the frame unwinds only when its own task finishes) and CPython refuses
+        # to close a running async generator — "aclose(): asynchronous generator is
+        # already running". That escaped through _agent_loop/run_turn into the route,
+        # where it was misread as a crash. So: aclose() FIRST (it drives the read out
+        # through the provider's own finally), and only if CPython still says the
+        # generator is busy do we fall back to cancelling the read and retrying once.
+        closer = agen.aclose()
         try:
-            await agen.aclose()
-        except Exception:  # noqa: BLE001 — closing a dead stream is not our problem
+            await asyncio.shield(closer)
+        except asyncio.CancelledError:
             pass
+        except Exception:  # noqa: BLE001 — closing a dead stream is not our problem
+            if read_task is not None and not read_task.done():
+                read_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await asyncio.shield(read_task)
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await asyncio.shield(agen.aclose())
     if aborted:
         raise TurnAborted()
     if timed_out:
@@ -348,15 +1120,82 @@ async def _stream_checked(provider, messages, specs, params, cancel):
         yield StreamEvent("done", data={"finish": "timeout"})
 
 
+async def _run_tool_streaming(t, ctx) -> AsyncIterator[dict]:
+    """Await one tool while forwarding anything it reports to the client.
+
+    A tool that takes minutes (describe_audio listening to a recording) has no way to yield
+    into this generator itself — it is awaited, not iterated — so it writes events into
+    `ctx`'s progress sink instead and we drain them here. The task/queue shape is the same
+    one routes_chat uses around prepare_captions: while the tool runs we poll a queue and
+    yield each event; cancellation still reaches the tool through ctx.cancel_event(), which
+    it polls, so Stop abandons a recording rather than leaving the loop waiting on it.
+
+    Yields progress events and then the ToolResult as its FINAL yielded value — an async
+    generator cannot `return` a value, so callers take the result from the last item. This is
+    also the only place tool progress can reach the client: `_pending_notices` used to be
+    drained only in the steering branch, so anything queued elsewhere was silently dropped.
+
+    Module-level rather than nested in _agent_loop because the gated-resume path needs it
+    too: a describe_audio call set to approval 'ask' takes just as long as an auto one, and
+    streaming only on the auto path would make the behaviour depend on an admin toggle.
+    """
+    q: asyncio.Queue = asyncio.Queue()
+
+    def _sink(ev: dict) -> None:
+        # Called from the tool, possibly from a worker thread: only enqueue. put_nowait on an
+        # unbounded queue cannot block and is safe enough here (worst case a progress line is
+        # lost, never the result).
+        try:
+            q.put_nowait(ev)
+        except Exception:  # noqa: BLE001 — progress must never break a tool
+            pass
+
+    ctx.attach_progress(_sink)
+    task = asyncio.create_task(_run_tool(t, ctx))
+    try:
+        while True:
+            if task.done():
+                break
+            try:
+                yield await asyncio.wait_for(q.get(), timeout=0.25)
+            except asyncio.TimeoutError:
+                pass
+        # Drain anything queued between the last event and completion, in order.
+        while not q.empty():
+            yield q.get_nowait()
+        yield task.result()   # final item: the ToolResult itself (see docstring)
+    finally:
+        ctx.attach_progress(None)
+        if task.done():
+            await task   # propagate CancelledError / tool exceptions to the caller
+
+
 async def _agent_loop(user_id, conv_id, provider, settings, ctx,
-                      gen: dict | None = None, cancel=None, round_offset: int = 0) -> AsyncIterator[dict]:
+                      gen: dict | None = None, cancel=None, round_offset: int = 0,
+                      captions: dict | None = None) -> AsyncIterator[dict]:
     """Run model round-trips until the model stops asking for tools.
 
     `round_offset` shifts the ids used to correlate progress/pending chips so a resumed
     gated turn (`_resume_pending`) gets its own chip namespace instead of colliding with
     rounds retired before the approve/deny card appeared.
+    `captions` pre-supplies audio descriptions for this turn's attachments (see
+    prepare_captions); later rounds read them from the module cache instead of re-listening.
     """
     gen = gen or {}
+
+    _pending_notices: list[dict] = []
+
+    def _emit_notice(ev: dict) -> None:
+        # prepare_captions runs in a worker thread and reports progress through a plain
+        # callback, but this generator is the only way to reach the client. Queuing here and
+        # draining at the next seam keeps the loop single-threaded; it is best-effort by
+        # design — losing a "listening…" notice must never affect the caption itself.
+        try:
+            _pending_notices.append(ev)
+        except Exception:  # noqa: BLE001 — progress only
+            pass
+
+
     specs = [] if gen.get("no_tools") else tool_specs(settings)
     max_steps = _max_steps(settings)
     steps_used = 0
@@ -370,15 +1209,97 @@ async def _agent_loop(user_id, conv_id, provider, settings, ctx,
     # loop tracks its own prompt size + generated characters and synthesises an
     # estimated event (see _estimate_usage / _merge_usage).
     turn_usage: dict | None = None
+    # Live progress source (llama-server log tail). Only for a real llama-server — the stub
+    # synthesises its own `progress` events, and an externally-run server writes its log
+    # somewhere we cannot see, so passing nothing there is the honest answer rather than a
+    # guess. Admin → Model → "Show prefill progress from the server log" turns it off.
+    log_src = None
+    if (getattr(provider, "name", "") == "llama-server"
+            and bool(settings.get("agent.prefill_progress", True))):
+        from .manager import get_manager
+        _mgr = get_manager()
+        # Mutable cell holding the poll CURSOR. Owned here so the round loop can reset it
+        # between rounds: progress state describes ONE prompt, and carrying a previous
+        # prompt's baseline into the next would estimate from numbers a different prompt
+        # produced (different size, cache state and batch shape).
+        #
+        # The cursor is poll_log_perf()'s OWN dict shape ({"offset": int}), NOT None. Passing
+        # None was the bug that killed live progress outright: `state=None` means "begin at
+        # END of file", so every reset re-anchored the cursor to current EOF and each new
+        # print_timing line was, by definition, already behind it — nothing was ever read.
+        # Standalone tests of poll_log_perf passed because they threaded the returned dict
+        # through correctly; only this caller used the wrong shape.
+        log_state = {"v": {"offset": -1}}
+
+        def log_src(_m=_mgr, _st=log_state):
+            return _m.poll_log_perf(_st["v"])
     for loop in range(max_steps):
         if cancel is not None and cancel.cancelled:
-            raise TurnAborted()
-        # A turn can outlive its conversation (deleted while a tool ran, or a stale
+            raise TurnAborted()        # A turn can outlive its conversation (deleted while a tool ran, or a stale
         # client id). Stop before asking the model anything rather than failing on
         # the first write. Checked once per loop, not per token — cheap and enough.
         if not conversation_exists(conv_id):
             raise ConversationGone(conv_id)
-        messages = build_messages(conv_id, user_id)
+        # STEERING SEAM. This is the one place inside a turn where the message list is whole
+        # again: every tool_call_id from the previous round already has its result appended
+        # and no request is in flight, so appending user speech here cannot orphan the tool
+        # protocol. Reached at the top of the FIRST iteration too, which is what delivers a
+        # message queued while no turn was running (or after this one ended) instead of
+        # letting it sit until some later turn. User text is appended as ordinary user rows —
+        # the model cannot tell steering from a normal message, and that is the point.
+        try:
+            from . import steering as _steering
+            steered = _steering.drain(conv_id)
+        except Exception:  # noqa: BLE001 — a queue fault must never break a turn
+            steered = []
+        # Steering delivery: the queued item already carries resolved artifact refs (the
+        # /api/chat/steer route resolved them against the user's own artifacts at enqueue
+        # time, so a queue entry can never smuggle a path). Meta shape is identical to the
+        # normal send above, which is what lets build_messages render attachments unchanged.
+        for item in steered:
+            att_meta = item.get("attachments") or []
+            text_for_msg = item.get("text") or ""
+            if att_meta:
+                names = ", ".join(x["name"] for x in att_meta)
+                text_for_msg = (f"[attached: {names}]"
+                                + ("\n" + text_for_msg if text_for_msg else ""))
+            append_message(conv_id, "user", text_for_msg,
+                           meta=json.dumps({"attachments": att_meta}) if att_meta else "")
+            # Same audio treatment as a normal send: steered speech carrying a recording must
+            # not arrive mute just because it skipped the route's pre-turn captioning. The
+            # results are MERGED into this turn's caption map — `captions` was built before
+            # the turn started and cannot know about files that arrived mid-turn, so without
+            # this the block below would silently drop them and build_messages would render a
+            # bare filename for audio the captioner had just listened to.
+            if att_meta:
+                try:
+                    got = await prepare_captions(user_id, conv_id, att_meta, settings,
+                                                 emit=_emit_notice, cancel=cancel)
+                    if got:
+                        captions = {**(captions or {}), **got}
+                        # Persist onto the row we just appended, so a steered recording is
+                        # not a second-class attachment: it survives refresh and later turns
+                        # exactly like one sent through the normal path (DEC-061).
+                        persist_captions(conv_id, att_meta, got)
+                    # Surface anything the captioner queued while we awaited it.
+                    for _n in _pending_notices:
+                        yield {"type": "notice", **_n}
+                    _pending_notices.clear()
+                except Exception:  # noqa: BLE001 — never lose a steered message
+                    pass
+            yield {"type": "steered", "text": item.get("text") or "",
+                   "attachments": [x["name"] for x in att_meta]}
+        messages = build_messages(conv_id, user_id, captions=captions, settings=settings)
+        # Vision recovery. Once the server has REJECTED a request that carried image parts,
+        # the loaded model provably has no projector — regardless of what Admin says is
+        # configured (a mismatched mmproj loads as text-only). Stripping the parts for the
+        # REST OF THIS TURN keeps the conversation alive instead of failing on every round
+        # forever; the notice tells the model why the file it asked for is gone, so it stops
+        # asking. Turn-scoped and request-only: nothing is deleted from the DB, and a later
+        # turn with a properly loaded vision model sends images again.
+        if _strip_images_for.get(conv_id) and any(
+                isinstance(m.get("content"), list) for m in messages):
+            messages = _strip_image_parts(messages)
         params = {k.split(".", 1)[1]: v for k, v in settings.items() if k.startswith("model.")}
         if gen.get("max_tokens"):
             try:
@@ -386,6 +1307,9 @@ async def _agent_loop(user_id, conv_id, provider, settings, ctx,
             except (TypeError, ValueError):
                 pass
         assistant_text_parts: list[str] = []
+        # The model's own reasoning for THIS round, kept separate from the answer (see the
+        # `reasoning` event branch below).
+        reasoning_parts: list[str] = []
         tool_requests = []
         # Per-round bookkeeping for usage + progress chips. `round_id` is unique per
         # agent-loop iteration and lets the client tell apart chips belonging to
@@ -394,11 +1318,35 @@ async def _agent_loop(user_id, conv_id, provider, settings, ctx,
         gen_chars = 0                       # content chars + tool-argument chars
         prompt_tokens_est = _estimate_prompt_tokens(messages)
         stream_t0 = time.time()
-        async for ev in _stream_checked(provider, messages, specs, params, cancel):
+        # Fresh log cursor for THIS round's prompt (see log_src above). Same dict shape as
+        # the initial value — {"offset": -1} means "start at EOF", which is what a new prompt
+        # wants: its own print_timing lines only, never an earlier prompt's.
+        # NOTE: this consumes nothing (the file has not grown since the last poll in the
+        # previous round) but it MUST NOT return the priming value into the live state as
+        # `None`; poll_log_perf() reads None as "begin at EOF", so assigning a bare None here
+        # would re-anchor past every line this round is about to write — the exact bug that
+        # made live prefill progress invisible while standalone tests stayed green.
+        if log_src is not None:
+            try:
+                _ev0, _new_state = log_src()
+                log_state["v"] = _new_state if isinstance(_new_state, dict) else {"offset": -1}
+            except Exception:  # noqa: BLE001 — progress telemetry only
+                log_state["v"] = {"offset": -1}
+        async for ev in _stream_checked(provider, messages, specs, params, cancel,
+                                        log_src=log_src):
             if ev.type == "token":
                 assistant_text_parts.append(ev.text)
                 gen_chars += len(ev.text or "")
                 yield {"type": "token", "text": ev.text}
+            elif ev.type == "reasoning":
+                # The model's thinking, kept OUT of the answer stream (it is never appended to
+                # assistant_text_parts — mixing it in would make the model imitate its own
+                # reasoning as prose on later turns). Shown live and persisted on the
+                # assistant row's meta so a reload still shows it, and so the retention policy
+                # has something to strip from history (see _strip_reasoning_from_history).
+                reasoning_parts.append(ev.text)
+                gen_chars += len(ev.text or "")
+                yield {"type": "reasoning", "text": ev.text}
             elif ev.type == "progress":
                 yield {"type": "progress", "data": ev.data}
             elif ev.type == "tool_progress":
@@ -421,6 +1369,16 @@ async def _agent_loop(user_id, conv_id, provider, settings, ctx,
                 turn_usage = _merge_usage(ev.data or {}, turn_usage)
                 yield {"type": "usage", "data": _with_context_size(turn_usage, settings)}
             elif ev.type == "error":
+                # A 400/500 that smells like a vision rejection, on a round that actually
+                # sent image parts: recover instead of reporting a dead end. Only when this
+                # round carried images — otherwise it is an unrelated server error and the
+                # user needs to see it verbatim.
+                if (_looks_like_vision_reject(ev.text) and _sent_images_this_round(messages)
+                        and not _strip_images_for.get(conv_id)):
+                    _strip_images_for[conv_id] = True
+                    append_message(conv_id, "system", _VISION_NOTICE)
+                    yield {"type": "notice", "text": _VISION_NOTICE}
+                    continue
                 yield {"type": "error", "text": ev.text}
             elif ev.type == "tool_request" and ev.tool is not None:
                 tool_requests.append(ev.tool)
@@ -429,10 +1387,21 @@ async def _agent_loop(user_id, conv_id, provider, settings, ctx,
                 break
 
         text = "".join(assistant_text_parts)
+        reasoning_text = "".join(reasoning_parts).strip()
 
         if not tool_requests:
-            if text:
-                append_message(conv_id, "assistant", text)
+            if text or reasoning_text:
+                # Reasoning rides on meta, never in `content`: replaying it inside the answer
+                # would teach the model to emit its thinking as prose. A row with ONLY
+                # reasoning is still stored (it is real output and the UI shows it) even
+                # though `text` is empty.
+                append_message(conv_id, "assistant", text,
+                               meta=json.dumps({"reasoning": reasoning_text})
+                               if reasoning_text else "")
+            # End of turn: forget a vision rejection taken during it (see _strip_images_for).
+            # The next turn re-tries images, because the operator may well have loaded a
+            # proper mmproj and restarted the server in between.
+            _strip_images_for.pop(conv_id, None)
             yield {"type": "done"}
             return
 
@@ -472,6 +1441,16 @@ async def _agent_loop(user_id, conv_id, provider, settings, ctx,
              "function": {"name": t.name,
                           "arguments": json.dumps(t.args) + notes.get(t.call_id, "")}}
             for t in tool_requests]})
+        # Reasoning rides alongside the tool protocol on the same row (a reasoning model that
+        # calls a tool still thought first). Merged rather than written twice so one row keeps
+        # ONE meta object — see _tool_row_meta's consumers, which parse meta wholesale.
+        if reasoning_text:
+            try:
+                _m = json.loads(tc_meta)
+            except Exception:  # noqa: BLE001 — tc_meta is built above, so this is paranoia
+                _m = {}
+            _m["reasoning"] = reasoning_text
+            tc_meta = json.dumps(_m)
         append_message(conv_id, "assistant", text, meta=tc_meta)
 
         # Partition: approval-gated vs auto (per settings, falling back to Tool.gated).
@@ -511,15 +1490,21 @@ async def _agent_loop(user_id, conv_id, provider, settings, ctx,
                 audit.log(user_id, "tool_repeat_suppressed",
                           {"tool": t.name, "conv": conv_id})
                 yield {"type": "tool_result", "name": t.name, "ok": True,
-                       "preview": content[:800], "meta": {},
+                       "preview": ui_preview(content), "meta": {},
                        "step": steps_used, "of": max_steps, "round": round_id}
                 continue
-            result = await _run_tool(t, ctx)
+            result = None
+            async for _item in _run_tool_streaming(t, ctx):
+                # Progress events are dicts; the ToolResult arrives as the last item.
+                if isinstance(_item, dict):
+                    yield _item
+                else:
+                    result = _item
             calls_done[key] = result.content
             append_message(conv_id, "tool", result.content,
                            meta=json.dumps(_tool_row_meta(t.name, result, t.call_id)))
             yield {"type": "tool_result", "name": t.name, "ok": result.ok,
-                   "preview": result.content[:800], "meta": _ui_meta(t.name, result),
+                   "preview": ui_preview(result.content), "meta": _ui_meta(t.name, result),
                    "step": steps_used, "of": max_steps, "round": round_id}
 
         # If any gated tools requested -> persist (with call id) + stop.
@@ -553,11 +1538,16 @@ async def _resume_pending(pending, ctx, provider, settings, download_store,
 
     if pending["kind"] == "ask_user":
         # answer already in args["answer"] set at resolve time
-        result = await _run_tool(_mk_request(tool, args, call_id), ctx)
+        result = None
+        async for _item in _run_tool_streaming(_mk_request(tool, args, call_id), ctx):
+            if isinstance(_item, dict):
+                yield _item
+            else:
+                result = _item
         append_message(conv_id, "tool", result.content,
                        meta=json.dumps({"tool": "ask_user", "tool_call_id": call_id}))
         yield {"type": "tool_result", "name": "ask_user", "ok": True,
-               "preview": result.content[:800], "meta": {}}
+               "preview": ui_preview(result.content), "meta": {}}
     else:  # any approval-gated tool (exec, fs_delete, device_screenshot, ...): approved/denied
         if not pending.get("approved"):
             append_message(conv_id, "tool", "user denied this action.",
@@ -569,11 +1559,19 @@ async def _resume_pending(pending, ctx, provider, settings, download_store,
                 raise TurnAborted()
             yield {"type": "tool_call", "name": tool.name, "args": _redact(args),
                    "summary": _args_summary(tool, args)}
-            result = await _run_tool(_mk_request(tool, args, call_id), ctx)
+            # Streamed like the auto path: an approval-gated describe_audio takes exactly as
+            # long as an automatic one, so listening silently here would make the live output
+            # depend on an admin's approval setting (DEC-061).
+            result = None
+            async for _item in _run_tool_streaming(_mk_request(tool, args, call_id), ctx):
+                if isinstance(_item, dict):
+                    yield _item
+                else:
+                    result = _item
             append_message(conv_id, "tool", result.content,
                            meta=json.dumps(_tool_row_meta(tool.name, result, call_id)))
             yield {"type": "tool_result", "name": tool.name, "ok": result.ok,
-                   "preview": result.content[:800], "meta": _ui_meta(tool.name, result),
+                   "preview": ui_preview(result.content), "meta": _ui_meta(tool.name, result),
                    # No `round` on the events above: finishProgress(name) without one
                    # retires any chip for that tool, which is right for a resumed call.
                    }
@@ -612,6 +1610,12 @@ def _tool_row_meta(tool_name: str, result, call_id: str = "") -> dict:
     source info under key "web". Persisting it (instead of dropping the meta as
     before) is what lets the chat UI re-render source links when the
     conversation is reloaded, not just while it streams live.
+
+    Media tools add "images": jail-relative image files the model must SEE. They are
+    stored here (paths, never base64 — the DB row stays small and encryption at rest
+    still applies to the files themselves) and turned into a multimodal message by
+    `build_messages` on every replay. See DEC-052 for why they ride on a user-role
+    message rather than the tool message.
     """
     meta = {"tool": tool_name}
     if call_id:
@@ -619,6 +1623,10 @@ def _tool_row_meta(tool_name: str, result, call_id: str = "") -> dict:
     wm = _web_meta(result)
     if wm:
         meta["web"] = wm
+    imgs = getattr(result, "images", None) or []
+    if imgs:
+        meta["images"] = [{"path": str(i.get("path", "")), "mime": str(i.get("mime", "") or "")}
+                          for i in imgs if isinstance(i, dict) and i.get("path")]
     return meta
 
 
@@ -641,6 +1649,82 @@ def _ui_meta(tool_name: str, result) -> dict:
 # _strip_done_note, which removes it again wherever those arguments are parsed.
 _DONE_MARK = "[NOTE: you have ALREADY completed"
 _DONE_NOTE = "\n\n" + _DONE_MARK + " these calls this turn — {done}]"
+
+
+# ── Vision recovery (see the check in _agent_loop) ───────────────────────────
+# Conversations whose images must be stripped from the request graph. IN-MEMORY and
+# per-turn-cleared: it is a reaction to what THIS server build rejected, not a fact about
+# the user's files. Keys are removed at the end of the turn that set them so a later turn —
+# possibly against a restarted server with a real mmproj — tries images again.
+_strip_images_for: dict[str, bool] = {}
+
+_VISION_NOTICE = (
+    "[System notice] The model server rejected the image attachment(s) in this conversation: "
+    "the currently loaded model has no vision projector (mmproj), so it cannot see images. "
+    "The image content has been removed from context so the conversation can continue. Tell "
+    "the user their model needs a vision-capable GGUF plus a matching mmproj file (Admin → "
+    "Model → Vision projector path) to read images, and continue without relying on image "
+    "content — offer fs_read for text files instead."
+)
+
+# What counts as a vision rejection. Deliberately narrow: an HTTP status plus either the
+# word for the modality or for the content-part shape, so an unrelated 500 (OOM, context
+# overflow) is NOT mistaken for "no vision" and silently answered with stripped images —
+# which would hide a real fault and lose the user's picture for nothing.
+_VISION_REJECT_RE = re.compile(
+    r"(?:400|500).{0,160}?(?:image|vision|mmproj|multimodal)"
+    r"|(?:image|vision|mmproj|multimodal).{0,160}?(?:400|500)",
+    re.IGNORECASE | re.DOTALL)
+
+
+def _looks_like_vision_reject(text: str) -> bool:
+    """Does this provider error read as 'this model cannot accept images'."""
+    return bool(_VISION_REJECT_RE.search(text or ""))
+
+
+def _sent_images_this_round(messages: list[dict]) -> bool:
+    """Did the request we just sent actually carry image parts?
+
+    Recovery is only justified when it did. Without this check any 400/500 in a chat that
+    happens to contain an old attachment would flip the conversation into image-blind mode."""
+    return any(isinstance(m.get("content"), list)
+               and any(isinstance(p, dict) and p.get("type") == "image_url"
+                       for p in (m.get("content") or []))
+               for m in messages)
+
+
+def _strip_image_parts(messages: list[dict]) -> list[dict]:
+    """Return the message graph with image parts replaced by a text marker.
+
+    Text parts are kept in order; an image becomes one short line so the model still knows
+    something was there (and why it cannot use it) rather than silently losing a turn's
+    content. Rows that carry ONLY an image keep their role and gain the marker as content —
+    an empty content string is what makes some templates drop the message and orphan the
+    surrounding tool-call pairing."""
+    out: list[dict] = []
+    for m in messages:
+        c = m.get("content")
+        if not isinstance(c, list):
+            out.append(m)
+            continue
+        parts: list[dict] = []
+        dropped = 0
+        for p in c:
+            if isinstance(p, dict) and p.get("type") == "image_url":
+                dropped += 1
+                continue
+            parts.append(p)
+        if not dropped:
+            out.append(m)
+            continue
+        marker = {"type": "text",
+                  "text": f"[{dropped} image(s) omitted — this model has no vision projector]"}
+        # Keep a text part FIRST when there is one, so the message still opens as prose.
+        parts.append(marker)
+        new = dict(m)
+        new["content"] = parts
+        out.append(new)
+    return out
 
 
 def _call_key(t) -> str:
@@ -672,10 +1756,36 @@ async def _run_tool(treq, ctx):
         res = await tool.run(treq.args, ctx)
         if treq.name == "exec":
             audit.log(ctx.user_id, "exec", {"cmd": treq.args.get("command"), "ok": res.ok})
-        return res
+        # THE output-guard seam. Every auto tool result passes through here on its way to
+        # becoming the tool message, so one call covers every present and future tool
+        # without any tool having to co-operate. Guarding lower (inside each tool) would
+        # leave new tools unguarded; guarding higher (in build_messages) would clip results
+        # that were never the problem and re-clip on every replay. Gated tools resolve via
+        # _resume_pending, which guards there too — both paths are covered deliberately.
+        return _guard_result(res, ctx, treq.name)
     except Exception as e:  # noqa: BLE001
         from .tools.base import ToolResult
         return ToolResult(False, f"tool error: {str(e)[:200]}")
+
+
+def _guard_result(result, ctx, tool_name: str):
+    """Apply the Admin → Agent output-guard budget to one tool result.
+
+    Returns the same object when nothing was clipped (the overwhelmingly common case — no
+    copy, no cost). On a clip, an audit line records that the model did not see everything,
+    so "why did it miss that?" has an answer in Admin → Audit.
+    """
+    try:
+        from . import output_guard as og
+        policy = og.policy_from_settings(ctx.settings())
+        guarded, was = og.guard_tool_result(result, policy, tool_name)
+        if was:
+            audit.log(getattr(ctx, "user_id", ""), "tool_output_guarded",
+                      {"tool": tool_name, "original": len(result.content or ""),
+                       "cap": og.normalize_policy(policy)["max_chars"]})
+        return guarded
+    except Exception:  # noqa: BLE001 — a guard failure must never fail a tool call
+        return result
 
 
 def _persist_pending(conv_id, user_id, treq) -> str:
@@ -799,6 +1909,13 @@ def _merge_usage(new: dict, prior: dict | None) -> dict:
                 out[k] = prior[k]
         out["estimated"] = bool(prior.get("estimated"))
     out["measured"] = bool(out.get("measured") or prior.get("measured"))
+    # llama.cpp's measured rates are LATEST-WINS, never accumulated: they describe the speed
+    # of a generation, not a quantity, and averaging across rounds would invent a number
+    # that neither server nor user ever saw. A round that reported none (older build, or an
+    # estimated round) must not erase one that did — same outranking rule as prompt_tokens.
+    for k in ("prefill_tps", "decode_tps", "prompt_ms", "predicted_ms", "perf_source"):
+        if out.get(k) is None and prior.get(k) is not None:
+            out[k] = prior[k]
     return out
 
 

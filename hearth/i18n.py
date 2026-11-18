@@ -40,6 +40,29 @@ _EN = {
     "chat.rename_prompt": "New name for this conversation:",
     "chat.upload": "Attach files",
     "chat.upload_too_big": "File too large (over 25 MB)",
+    # Composer attach menu (replaces the standalone 📎/📷 buttons; add future
+    # composer actions here instead of growing the input row).
+    "chat.attach_menu": "Attach",
+    "chat.am_camera": "Camera / Photo",
+    "chat.am_proj_into": "Uploads \u2192 project",
+    "chat.am_proj_hint": "Send uploads into the linked project folder instead of attaching them to this chat",
+    # Linked project folder (DEC-049) — header chip + composer upload toggle.
+    "chat.proj_into": "\u2192 project",
+    "chat.proj_clean": "Linked project: no pending changes (click to refresh)",
+    "chat.proj_pending": "Pending project changes \u2014 click to review and apply",
+    "chat.proj_conflict": "Changes are blocked: files changed in the real folder since import. Re-import or discard your edits (Admin \u2192 Project).",
+    "chat.proj_err": "Could not read the linked project",
+    "chat.proj_review": "Project changes",
+    "chat.proj_apply": "Apply to folder",
+    "chat.proj_writing": "Writing\u2026",
+    "chat.proj_blocked": "Blocked \u2014 these changed in the real folder since import:",
+    "chat.proj_blocked_hint": "Re-import (Admin \u2192 Project) to adopt the folder's version, or undo your edits. Nothing can be applied while a conflict exists.",
+    "chat.proj_disabled": "Apply is unavailable on this system (no write backend, or workspace encryption at rest is on).",
+    "chat.proj_nothing": "Nothing to apply.",
+    "chat.proj_confirm": "Write these changes to the real folder?",
+    "chat.proj_confirm2": "Overwritten files are backed up first.",
+    "chat.proj_backup": "backup",
+    "chat.proj_failed": "Apply failed.",
     "chat.drop_here": "Drop files to upload",
     "chat.camera": "Camera / Photo",
     "chat.device_allow": "Allow device access",
@@ -67,6 +90,17 @@ _EN = {
     "chat.ctx_est": "estimated",
     "chat.ctx_warn": "Context is nearly full: start a new chat or shorten files.",
     "chat.download": "Download",
+    # Files panel: the filename is the download link, everything else is in the ⋮ menu.
+    "chat.art_open_dl": "Download (or use ⋮ for more options)",
+    "chat.art_attach": "Attach to message",
+    "chat.art_attached": "Attached to the next message.",
+    "chat.art_already_attached": "Already attached.",
+    "chat.art_preview": "Open preview",
+    "chat.art_copy_link": "Copy link",
+    "chat.art_link_copied": "Link copied.",
+    "chat.art_copy_failed": "Could not copy the link.",
+    "chat.art_delete_confirm": "Delete this file? It is removed from your workspace too.",
+    "chat.art_delete_failed": "Could not delete the file.",
     "chat.intro_head": "How files work here:",
     "chat.intro_body": "Ask for a file and the assistant writes it into your own workspace — every file is listed under Artifacts (this chat / all), where you can download it. You get an explicit ⬇ download button in the conversation only when you ask for one. Writing shows live progress while it happens.",
     "chat.intro_dismiss": "Got it",
@@ -78,6 +112,27 @@ _EN = {
     "chat.web_read": "read page",
     "chat.web_mode": "via",
     "chat.prefill": "prefill",
+    # Audio captioner: shown while a second model listens to an attached recording. The wait
+    # is real (ffmpeg + listening), so it must never look like a hang. See hearth/captioner.py.
+    "chat.listening": "listening to the audio…",
+    "chat.caption_failed": "I could not listen to that file — the note in my message says why.",
+    # Header of the collapsible block showing the captioner model's words as they stream in.
+    "chat.caption_streaming": "Audio model",
+    # Shown on a restored caption whose description failed, so an old failure is not mistaken
+    # for a missing feature after a reload (DEC-061).
+    "chat.caption_failed_short": "could not describe",
+
+    # Speed labels for the measured rates llama.cpp reports (see hearth/perf.py). The UI
+    # shows these in preference to Hearth's own wall-clock tok/s estimate.
+    "chat.decode": "decode",
+    # Collapsible header for the model's thinking block (live and in history).
+    "chat.reasoning": "Reasoning",
+    # Steering queue row (message sent while a turn owns the transcript).
+    "chat.steer_queued": "Queued for the next step",
+    "chat.steer_withdraw": "Withdraw",
+    "chat.steer_hint": "A turn is running — this will be read between tool steps.",
+    # ETA suffix on the live prefill label ("prefill 43 % · ≈1m 20s left").
+    "chat.left": "left",
     "chat.protocol": "Protocol",
     "chat.menu": "Menu",
     "chat.close_menu": "Close menu",
@@ -148,6 +203,29 @@ _DE = {
     "chat.rename_prompt": "Neuer Name für diese Unterhaltung:",
     "chat.upload": "Dateien anhängen",
     "chat.upload_too_big": "Datei zu groß (über 25 MB)",
+    # Anhefte-Menü im Composer (ersetzt die einzelnen 📎-/📷-Knöpfe; künftige
+    # Composer-Aktionen hier eintragen statt die Eingabezeile zu vergrößern).
+    "chat.attach_menu": "Anhängen",
+    "chat.am_camera": "Kamera / Foto",
+    "chat.am_proj_into": "Uploads \u2192 Projekt",
+    "chat.am_proj_hint": "Uploads in den verknüpften Projektordner senden, statt sie an diesen Chat anzuhängen",
+    # Verknüpfter Projektordner (DEC-049) — Kopfleiste + Upload-Ziel im Composer.
+    "chat.proj_into": "\u2192 Projekt",
+    "chat.proj_clean": "Verknüpftes Projekt: keine ausstehenden Änderungen (klik zum Aktualisieren)",
+    "chat.proj_pending": "Ausstehende Projektänderungen \u2014 klik zur Prüfung und Übernahme",
+    "chat.proj_conflict": "Änderungen gesperrt: Dateien wurden im echten Ordner seit dem Import geändert. Neu importieren oder eigene Bearbeitungen verwerfen (Admin \u2192 Projekt).",
+    "chat.proj_err": "Verknüpftes Projekt konnte nicht gelesen werden",
+    "chat.proj_review": "Projektänderungen",
+    "chat.proj_apply": "Auf Ordner anwenden",
+    "chat.proj_writing": "Schreibe\u2026",
+    "chat.proj_blocked": "Gesperrt \u2014 diese Dateien wurden im echten Ordner seit dem Import geändert:",
+    "chat.proj_blocked_hint": "Neu importieren (Admin \u2192 Projekt), um die Version des Ordners zu übernehmen, oder eigene Änderungen rückgängig machen. Bei Konflikten wird nichts angewendet.",
+    "chat.proj_disabled": "Anwenden ist auf diesem System nicht verfügbar (kein Schreib-Backend, oder Verschlüsselung im Ruhezustand ist aktiv).",
+    "chat.proj_nothing": "Nichts anzuwenden.",
+    "chat.proj_confirm": "Diese Änderungen in den echten Ordner schreiben?",
+    "chat.proj_confirm2": "Überschriebene Dateien werden vorher gesichert.",
+    "chat.proj_backup": "Sicherung",
+    "chat.proj_failed": "Anwenden fehlgeschlagen.",
     "chat.drop_here": "Dateien zum Hochladen hierher ziehen",
     "chat.camera": "Kamera / Foto",
     "chat.device_allow": "Gerätezugriff erlauben",
@@ -175,6 +253,17 @@ _DE = {
     "chat.ctx_est": "geschätzt",
     "chat.ctx_warn": "Kontext fast voll: neuen Chat starten oder Dateien kürzen.",
     "chat.download": "Herunterladen",
+    # Files panel: the filename is the download link, everything else is in the ⋮ menu.
+    "chat.art_open_dl": "Herunterladen (oder ⋮ für mehr Optionen)",
+    "chat.art_attach": "An Nachricht anhängen",
+    "chat.art_attached": "An die nächste Nachricht angehängt.",
+    "chat.art_already_attached": "Bereits angehängt.",
+    "chat.art_preview": "Vorschau öffnen",
+    "chat.art_copy_link": "Link kopieren",
+    "chat.art_link_copied": "Link kopiert.",
+    "chat.art_copy_failed": "Link konnte nicht kopiert werden.",
+    "chat.art_delete_confirm": "Diese Datei löschen? Sie wird auch aus deinem Arbeitsbereich entfernt.",
+    "chat.art_delete_failed": "Datei konnte nicht gelöscht werden.",
     "chat.intro_head": "So funktionieren Dateien hier:",
     "chat.intro_body": "Bitte um eine Datei – der Assistent schreibt sie in deinen eigenen Arbeitsbereich; alle Dateien bleiben unter „Dateien“ aufgelistet (dieser Chat / alle), inklusive Download. Einen eigenen ⬇-Download-Button im Gespräch gibt es nur, wenn du danach fragst. Beim Schreiben läuft die Fortschrittsanzeige live mit.",
     "chat.intro_dismiss": "Verstanden",
@@ -186,6 +275,27 @@ _DE = {
     "chat.web_read": "Seite gelesen",
     "chat.web_mode": "über",
     "chat.prefill": "Vorverarbeitung",
+    # Audio-Beschreiber: erscheint, während ein zweites Modell eine angehängte Aufnahme
+    # anhört. Das dauert real (ffmpeg + Zuhören) und darf nicht wie ein Hänger aussehen.
+    "chat.listening": "höre mir das Audio an…",
+    "chat.caption_failed": "Ich konnte mir diese Datei nicht anhören — der Hinweis in meiner Nachricht sagt warum.",
+    # Kopfzeile des ausklappbaren Blocks mit den Worten des Audio-Modells beim Mithören.
+    "chat.caption_streaming": "Audio-Modell",
+    # Erscheint bei wiederhergestellten Beschreibungen, die fehlgeschlagen sind — damit ein
+    # alter Fehler nach einem Neuladen nicht als fehlendes Feature gelesen wird (DEC-061).
+    "chat.caption_failed_short": "Konnte sie nicht beschreiben",
+
+    # Speed labels for the measured rates llama.cpp reports (see hearth/perf.py). The UI
+    # shows these in preference to Hearth's own wall-clock tok/s estimate.
+    "chat.decode": "Generierung",
+    # Collapsible header for the model's thinking block (live and in history).
+    "chat.reasoning": "Gedankengang",
+    # Steering queue row (message sent while a turn owns the transcript).
+    "chat.steer_queued": "Für den nächsten Schritt eingereiht",
+    "chat.steer_withdraw": "Zurückziehen",
+    "chat.steer_hint": "Ein Umlauf läuft — die Nachricht wird zwischen den Tool-Schritten gelesen.",
+    # ETA suffix on the live prefill label ("Vorverarbeitung 43 % · noch ≈1m 20s").
+    "chat.left": "noch",
     "chat.protocol": "Protokoll",
     "chat.menu": "Menü",
     "chat.close_menu": "Menü schließen",

@@ -1,0 +1,28 @@
+<!doctype html><html><head><meta charset="utf-8">
+<link rel="stylesheet" href="base.css">
+<style>
+.hidden { display: none !important; }
+.flex { display: flex; }
+body { margin:0; height:600px; background:#020617; color:#eee; }
+main { display:flex; flex-direction:column; height:100%; }
+#messages { flex:1; overflow:auto; }
+form#composer { display:flex; gap:8px; align-items:flex-end; }
+</style>
+</head><body>
+<div id="host"></div>
+<script>
+// Compose the REAL composer markup region from chat.html fetch, minus jinja.
+(async ()=>{
+  const html = await (await fetch('/chat.html')).text();
+  const body = html.match(/\{%\s*block body\s*%\}([\s\S]*?)\{%\s*endblock\s*%\}/)[1]
+    .replace(/\{\{[^}]*\}\}/g,'x').replace(/\{%[^%]*%\}/g,'');
+  document.getElementById('host').innerHTML = body;
+  window.dispatchEvent(new Event('composer-ready'));
+})();
+// Stubs: chat.js boots without a server.
+async function api(){ return {ok:false,status:200,json:async()=>({})}; }
+window.I18N = {lang:'en',strings:{},load:async()=>{},apply:()=>{},t:k=>k};
+</script>
+<script src="app.js"></script>
+<script src="chat.js"></script>
+</body></html>

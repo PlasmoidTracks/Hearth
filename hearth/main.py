@@ -138,6 +138,34 @@ def _bootstrap_admin() -> None:
             print("=" * 60)
 
 
+def ensure_bootstrap_admin(password: str | None = None) -> str:
+    """Idempotently guarantee a usable admin account, and return the password to use.
+
+    Exists for tests. ``_bootstrap_admin()`` deliberately does nothing once *any* user
+    exists, which is correct for production but makes HTTP tests order-dependent: an admin
+    created by an earlier request has an unknown random password, so login attempts 401 and
+    the test silently skips (the pre-existing upload test had this). Here we either create
+    the admin with a known password or reset an existing one's password to it, so the caller
+    always knows what to sign in with.
+
+    SECURITY: never call this from application code paths. Production boot uses
+    ``_bootstrap_admin()`` only. Test entry point, nothing else.
+    """
+    pw = password or "testpass123"
+    bs = get_boot_settings()
+    username = bs.bootstrap_admin_user or "admin"
+    with session_scope() as s:
+        user = s.query(User).filter(User.username == username).first()
+        if user is None:
+            user = User(username=username, pw_hash=hash_password(pw), is_admin=True,
+                        display_name="Administrator")
+            s.add(user)
+        else:
+            user.pw_hash = hash_password(pw)
+            user.is_admin = True
+    return pw
+
+
 def _seed_docs() -> None:
     """Create a default system prompt + example protocol if none exist."""
     from .models import Doc

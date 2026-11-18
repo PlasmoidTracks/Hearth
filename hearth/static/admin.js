@@ -91,7 +91,20 @@ function fieldsSafe(specs){
 }
 
 async function renderModel(){
-  const st = await (await api('/api/admin/model/status')).json();
+  // Both backends in one listing. /api/admin/models returns the chat model plus the audio
+  // captioner, each with its own reachable/configured/hint fields, so a second loaded model
+  // can never be invisible here (the old panel could only ever speak about one).
+  let models = null;
+  try {
+    const d = await (await api('/api/admin/models')).json();
+    models = d.models || [];
+  } catch(e){ models = null; }
+  // Fall back to the single-model endpoint if the combined one is unavailable, so a fault in
+  // the captioner probe can never leave the Model tab blank.
+  const st = models && models.length ? models[0]
+        : await (await api('/api/admin/model/status')).json();
+  const capModel = (models || []).find(m=>m.id==='captioner') || null;
+
   const modelSpecs = SPECS.filter(s=>s.group==='model');   // 'generation' is its own section below
   const running = st.proc_running || st.server_reachable;   // controls Restart+Stop vs Start
   // Settings arrive as one flat 'model' group; present them under headings so a
@@ -104,6 +117,7 @@ async function renderModel(){
     ['Memory / fit',         s=>['kv_cache_type','device','load_mode'].some(k=>s.key.endsWith('.'+k))],
     ['Reasoning / thinking', s=>s.key.endsWith('.reasoning')],
   ];
+
   // Catch-all: anything not claimed by a section above stays visible.
   const FALLBACK = ['Backend & context', s=>!SECTIONS.some(([,f])=>f(s))];
   const GEN_LABEL = 'Generation (applies immediately — no restart)';
@@ -139,6 +153,50 @@ async function renderModel(){
       <div class="mt-1 font-medium ${st.vision?'text-emerald-400':'text-slate-400'}">${st.vision?'mmproj set':'text-only'}</div>
       <div class="text-[11px] text-slate-400 mt-0.5">image attachments</div>
     </div>`;
+
+  // ---- Loaded models: every backend Hearth can talk to, side by side --------
+  // The point of this block is honesty about two things the tiles above cannot express:
+  // which models exist at all, and whether each is CONFIGURED or actually RUNNING. A
+  // captioner that is set up but not started must look different from one that was never
+  // configured, because the fix is a different click in each case.
+  function modelRow(m){
+    const isCap = m.id === 'captioner';
+    const isDif = m.kind === 'diffusion' || m.id === 'diffusion';
+    // A diffusion "server" is never resident — sd-cli runs per call and exits — so
+    // `reachable` (its binary exists) must not read as "running". Say what is true, or an
+    // admin hunts for a process that is supposed to come and go.
+    const live = isDif ? false : !!(m.reachable ?? m.server_reachable);
+    const cfgd = !!(m.configured ?? m.paths_configured);
+    const disabled = (isCap || isDif) && m.enabled === false;
+    const state = disabled ? 'off'
+                  : isDif ? (cfgd ? 'ready (runs per call)' : 'not configured')
+                  : (live ? 'running' : (cfgd ? 'configured, not running' : 'not configured'));
+    const col = disabled ? 'text-slate-500' : live ? 'text-emerald-400'
+                  : isDif && cfgd ? 'text-emerald-400'
+                  : cfgd ? 'text-amber-400' : 'text-slate-400';
+    // What is loaded, from the server's own /props — not what Admin says is configured.
+    const loaded = m.loaded_model || m.model_path || '';
+    const short = loaded.split('/').pop();
+    return `<div class="rounded-lg border ${live?'border-emerald-700/50 bg-emerald-900/10':'border-slate-700 bg-slate-800/30'} p-3">
+      <div class="flex items-center gap-2 flex-wrap">
+        <span aria-hidden="true" class="${col}">${live?'●':disabled?'◌':(isDif&&cfgd?'◆':'○')}</span>
+        <span class="font-medium text-sm">${esc(m.role||m.id)}</span>
+        <span class="text-[11px] ${col}">${esc(state)}</span>
+        ${(isCap||isDif) && m.backend ? `<span class="text-[11px] px-1.5 py-0.5 rounded bg-slate-800 border border-slate-700 font-mono">${esc(m.backend)}</span>`:''}
+        ${isCap && m.cpu_only ? `<span class="text-[11px] px-1.5 py-0.5 rounded bg-sky-900/40 border border-sky-800 text-sky-300" title="weights stay in system RAM">CPU offload</span>`:''}
+        ${isCap && m.mmproj_path ? `<span class="text-[11px] px-1.5 py-0.5 rounded bg-slate-800 border border-slate-700 text-slate-300" title="multimodal projector set">mmproj</span>`:''}
+        ${isDif ? `<button class="tab text-[11px] px-1.5 py-0.5 rounded bg-slate-800 border border-slate-700 text-sky-300 hover:bg-slate-700" data-tab="images">Images settings →</button>`:''}
+      </div>
+      <div class="mt-1 text-[11px] text-slate-400 break-all">${short?esc(short):'<span class=\'text-slate-600\'>no model path set</span>'}</div>
+      <div class="mt-0.5 text-[11px] text-slate-500 flex flex-wrap gap-x-3">
+        ${m.base_url?`<span title="endpoint">${esc(m.base_url)}</span>`:''}
+        ${m.n_ctx?`<span title="context window">ctx ${esc(String(m.n_ctx))}</span>`:''}
+        ${isCap && !m.capabilities?.ffmpeg?'<span class="text-amber-400" title="no ffmpeg: files are sent unmodified, long recordings are not split">no ffmpeg</span>':''}
+      </div>
+      ${(isDif && m.hint)?`<div class="mt-1 text-[11px] text-amber-300/90">⚠ ${esc(String(m.hint).slice(0,240))}</div>`:''}
+      ${(isCap && m.hint)?`<div class="mt-1 text-[11px] text-amber-300/90">⚠ ${esc(String(m.hint).slice(0,240))}</div>`:''}
+    </div>`;
+  }
 
   // One obvious control instead of a "Reload" that quietly did nothing: Start
   // launches llama-server with the saved paths, Restart relaunches it so changed
@@ -183,6 +241,20 @@ async function renderModel(){
     <div class="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-5 gap-2 mb-4 text-sm">
       ${stateTile}${effectiveTile}${ctxTile}${pathsTile}${visionTile}
     </div>
+
+    <h3 class="font-medium text-sm mb-2 text-slate-200">Loaded models</h3>
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-2 mb-4 text-sm" id="loadedModels">
+      ${models ? models.map(modelRow).join('') : modelRow({id:'chat', role:'Main chat model', ...st})}
+    </div>
+    <div class="-mt-2 mb-4 flex flex-wrap items-center gap-2 text-xs">
+      <button id="startCap" class="${BTN} bg-emerald-700 hover:bg-emerald-600 text-xs px-3 py-1.5">▶ Start captioner</button>
+      <button id="restartCap" class="${BTN} bg-amber-700 hover:bg-amber-600 text-xs px-3 py-1.5">⟳ Restart captioner</button>
+      <button id="stopCap" class="${BTN} bg-slate-700 hover:bg-slate-600 text-xs px-3 py-1.5">■ Stop captioner</button>
+      <button id="testCap" class="${BTN} bg-sky-800 hover:bg-sky-700 border border-sky-700 text-xs px-3 py-1.5"
+              title="Caption a 2-second test tone to verify the whole chain (ffmpeg → audio encoder → description).">🔊 Test captioner</button>
+      <span class="text-slate-500">the captioner is a second, independent model — starting or stopping it never touches the chat model</span>
+    </div>
+    <div id="capTest" class="hidden mb-4 rounded-lg border border-slate-700 bg-black/40 p-3 text-[11px] font-mono whitespace-pre-wrap break-words max-h-48 overflow-auto"></div>
 
     ${backendMismatch ? `<div class="mb-4 rounded-lg border border-amber-600 bg-amber-900/30 p-3 text-sm text-amber-300">
       ⚠ llama-server is <b>running</b>, but chats still use the built-in <b>stub</b>, because Backend is <code>${st.backend}</code>.
@@ -240,6 +312,39 @@ async function renderModel(){
       'Restarting llama-server', 'Restarting…');
   wireOp($('stopModel'), '/api/admin/model/stop', {}, null, null, 'Stopping…');
 
+  // Captioner controls — same single-flight/busy treatment as the chat model's, its own
+  // endpoints, and a re-render so the Loaded-models row reflects the new truth.
+  const capBtns = ['startCap','restartCap','stopCap'];
+  const wireCap = (btn, path, body, label, detail)=>{
+    if(!btn) return;
+    btn.onclick = beginOp(btn, label, async ()=>{
+      let out = null;
+      try { out = await (await api(path,{method:'POST',body:JSON.stringify(body||{})})).json(); }
+      catch(e){ out = {hint:String(e)}; }
+      const box = $('capTest');
+      if(box && out && out.hint){ box.classList.remove('hidden'); box.textContent = '⚠ '+out.hint; }
+      setTimeout(()=>renderModel(), 900);
+    }, {elapsed:detail||'loading captioner weights', keepElapsed:1000});
+  };
+  wireCap($('startCap'), '/api/admin/captioner/start', {}, 'Starting captioner…',
+          'loading the captioner model — can take minutes');
+  wireCap($('restartCap'), '/api/admin/captioner/start', {restart:true}, 'Restarting captioner…',
+          'reloading the captioner with the saved settings');
+  wireCap($('stopCap'), '/api/admin/captioner/stop', {}, 'Stopping captioner…', null);
+  const testBtn = $('testCap');
+  if (testBtn) testBtn.onclick = beginOp(testBtn, 'Testing…', async ()=>{
+    const box = $('capTest');
+    let d = null;
+    try { d = await (await api('/api/admin/captioner/test')).json(); }
+    catch(e){ d = {ok:false, note:String(e)}; }
+    if(box && d){
+      box.classList.remove('hidden');
+      box.textContent = (d.ok ? `✓ described in ${d.seconds}s (${d.backend}, ${d.chunks} chunk)\n\n`
+                              : `✗ could not caption the test tone:\n`)
+                      + (d.caption || d.note || '');
+    }
+  }, {elapsed:'captioning a 2-second test tone', keepElapsed:1000});
+
   // Copy launch command: fetch the exact argv Hearth builds and show it in a
   // selectable box + copy to clipboard. Debug aid for "works elsewhere, not here".
   const copyBtn = $('copyLaunchCmd');
@@ -273,12 +378,18 @@ async function renderModel(){
 }
 
 async function renderTools(){
-  const groups = [['tools-fs','Filesystem'],['tools-web','Web'],['tools-sys','System & exec'],['tools-device','Device']];
+  const groups = [['tools-fs','Filesystem'],['tools-project','Linked project folder'],['tools-web','Web'],['tools-media','Media (PDF / video)'],['tools-audio','Audio'],['tools-image','Image generation'],['tools-sys','System & exec'],['tools-device','Device']];
   let html = `<p class="text-xs text-slate-400 mb-3">Each tool has its own enable switch and approval mode ('auto' runs silently, 'ask' shows an approve/deny card per call). Legacy coarse toggles stay as fallbacks for older stored settings.</p>`;
   for (const [g,label] of groups){
     const specs = SPECS.filter(s=>s.group===g);
     if(!specs.length) continue;
     html += `<h3 class="font-medium text-sm mt-4 mb-1">${label}</h3>` + fieldsSafe(specs);
+    if (g==='tools-project'){
+      html += `<div class="text-[11px] text-slate-500 mt-1">A linked folder is copied into the workspace under <code>project/</code>, where the ordinary file tools edit it. "Apply" is the only action that writes to the real folder — it always asks first, refuses if the user changed a file meanwhile, and backs up everything it overwrites. Link folders under <b>Project</b>.</div>`;
+    }
+    if (g==='tools-image'){
+      html += `<div class="text-[11px] text-slate-500 mt-1">Needs the binary + model set under <b>Images</b>. Each call loads the model, draws, and exits — no server, but a cold load costs time, which is why approval defaults to <code>ask</code>. Pictures land in <code>generated/</code> and are shown back to the model.</div>`;
+    }
     if (g==='tools-device'){
       html += `<div class="text-[11px] text-slate-500 mt-1">Device tools need BOTH a helper URL above and the user's "Allow device access" button in the chat header — unless that requirement is switched off under Agent. User uploads and downloads are unaffected by either.</div>`;
     }
@@ -288,8 +399,165 @@ async function renderTools(){
   $('saveTools').onclick = beginOp($('saveTools'), 'Saving…', ()=> saveSettings(allToolSpecs));
 }
 
-async function renderAgent(){
-  const specs = SPECS.filter(s=>s.group==='agent');
+// ---- Audio captioner tab ----------------------------------------------------
+// A second model with its own settings group, so it gets its own tab rather than being
+// appended to the ~30-row Model tab. Rendered defensively: the status probe can fail (bad
+// path, wedged port) and that must not blank the settings form, since fixing the paths is
+// exactly what an admin needs to do when the probe fails.
+async function renderAudio(){
+  const specs = SPECS.filter(s=>s.group==='captioner');
+  let cs = null;
+  try {
+    const d = await (await api('/api/admin/models')).json();
+    cs = (d.models||[]).find(m=>m.id==='captioner') || null;
+  } catch(e){ cs = null; }
+
+  const live = !!(cs && cs.reachable);
+  const ffmpegOk = !!(cs && cs.capabilities && cs.capabilities.ffmpeg);
+  const on = !!(cs && cs.enabled);
+  const stateHtml = `
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-2 mb-4 text-sm">
+      <div class="rounded-lg border p-2.5 ${live?'border-emerald-700/60 bg-emerald-900/20':'border-slate-700 bg-slate-800/40'}">
+        <div class="stat-k">Captioner server</div>
+        <div class="mt-1 flex items-center gap-2 font-medium ${live?'text-emerald-400':'text-slate-300'}">
+          <span aria-hidden="true">${live?'●':'○'}</span>${live?'listening':'not running'}
+        </div>
+        <div class="text-[11px] text-slate-400 mt-0.5 truncate" title="${esc((cs&&cs.base_url)||'')}">${esc((cs&&cs.base_url)||'')}</div>
+      </div>
+      <div class="rounded-lg border p-2.5">
+        <div class="stat-k">Switch</div>
+        <div class="mt-1 font-medium ${on?'text-emerald-400':'text-slate-400'}">${on?'enabled':'disabled'}</div>
+        <div class="text-[11px] text-slate-400 mt-0.5">route audio to it</div>
+      </div>
+      <div class="rounded-lg border p-2.5">
+        <div class="stat-k">Backend</div>
+        <div class="mt-1 font-medium">${esc((cs&&cs.backend)||'?')}</div>
+        <div class="text-[11px] text-slate-400 mt-0.5">${(cs&&cs.backend)==='cli'?'reloads per caption':'weights stay loaded'}</div>
+      </div>
+      <div class="rounded-lg border p-2.5">
+        <div class="stat-k">ffmpeg</div>
+        <div class="mt-1 font-medium ${ffmpegOk?'text-emerald-400':'text-amber-400'}">${ffmpegOk?'available':'not found'}</div>
+        <div class="text-[11px] text-slate-400 mt-0.5">resample + chunking</div>
+      </div>
+    </div>
+    ${(cs && cs.hint) ? `<div class="mb-4 rounded-lg border border-amber-700/60 bg-amber-900/20 p-3 text-xs text-amber-300">⚠ ${esc(cs.hint)}</div>`:''}
+    ${(!ffmpegOk && cs) ? `<div class="mb-4 rounded-lg border border-slate-700 bg-slate-800/40 p-3 text-xs text-slate-300">
+      Without <code>ffmpeg</code> Hearth sends recordings unmodified and cannot split long ones, so a 40-minute file goes to the model whole. Install it (Debian/Ubuntu: <code>sudo apt install ffmpeg</code>) for 16 kHz mono conversion and timed chunks.</div>`:''}`;
+
+  const BTN = 'rounded-lg px-3 py-1.5 text-xs disabled:opacity-50 disabled:cursor-not-allowed';
+  $('panel').innerHTML = `
+    <p class="text-xs text-slate-400 mb-3">A second, independent llama.cpp model that listens to audio and describes it as text — voices, timbre, emotion, music, ambience — so the chat model can reason about a recording without needing audio support itself. Typically a Qwen-Omni-class MoE model; CPU offload is the default so it does not compete with the chat model for VRAM.</p>
+    ${stateHtml}
+    <div class="flex flex-wrap items-center gap-2 mb-4">
+      <button id="saveAudio" class="${BTN} bg-sky-600 hover:bg-sky-500 text-sm px-4 py-2">Save</button>
+      <button id="startCap2" class="${BTN} bg-emerald-700 hover:bg-emerald-600">▶ Start captioner</button>
+      <button id="restartCap2" class="${BTN} bg-amber-700 hover:bg-amber-600">⟳ Restart</button>
+      <button id="stopCap2" class="${BTN} bg-slate-700 hover:bg-slate-600">■ Stop</button>
+      <button id="testCap2" class="${BTN} bg-sky-800 hover:bg-sky-700 border border-sky-700">🔊 Test with a tone</button>
+    </div>
+    <div id="modelBusy" class="hidden text-xs text-sky-300 mb-3"></div>
+    <div id="capTest" class="hidden mb-4 rounded-lg border border-slate-700 bg-black/40 p-3 text-[11px] font-mono whitespace-pre-wrap break-words max-h-48 overflow-auto"></div>
+    ${fieldsSafe(specs)}
+    <button id="saveAudio2" class="mt-4 rounded-lg bg-sky-600 px-4 py-2 text-sm">Save</button>`;
+
+  const save = beginOp($('saveAudio'), 'Saving…', ()=> saveSettings(specs), {status:'modelBusy'});
+  $('saveAudio').onclick = save;
+  $('saveAudio2').onclick = beginOp($('saveAudio2'), 'Saving…', ()=> saveSettings(specs), {status:'modelBusy'});
+
+  const wire = (btn, path, body, label)=>{
+    if(!btn) return;
+    btn.onclick = beginOp(btn, label, async ()=>{
+      const b = $('modelBusy'); let out=null;
+      try { out = await (await api(path,{method:'POST',body:JSON.stringify(body||{})})).json(); }
+      catch(e){ out = {hint:String(e)}; }
+      if(b && out && out.hint){ b.classList.remove('hidden'); b.textContent = '⚠ '+out.hint; }
+      setTimeout(()=>renderAudio(), 900);
+    }, {elapsed:'loading captioner weights — can take minutes', keepElapsed:1000});
+  };
+  wire($('startCap2'), '/api/admin/captioner/start', {}, 'Starting…');
+  wire($('restartCap2'), '/api/admin/captioner/start', {restart:true}, 'Restarting…');
+  wire($('stopCap2'), '/api/admin/captioner/stop', {}, 'Stopping…');
+
+  const t = $('testCap2');
+  if (t) t.onclick = beginOp(t, 'Testing…', async ()=>{
+    const box = $('capTest'); let d=null;
+    try { d = await (await api('/api/admin/captioner/test')).json(); } catch(e){ d={ok:false,note:String(e)}; }
+    if(box && d){
+      box.classList.remove('hidden');
+      box.textContent = (d.ok ? `✓ described in ${d.seconds}s (${d.backend}, ${d.chunks} chunk)\n\n`
+                              : `✗ could not caption the test tone:\n`) + (d.caption||d.note||'');
+    }
+  }, {elapsed:'captioning a 2-second test tone', keepElapsed:1000});
+}
+
+// ---- Images tab (stable-diffusion.cpp) --------------------------------------
+// A third model kind, but with no server: `sd-cli` runs per call and exits, so there is
+// nothing to Start/Stop. What an admin needs to see instead is whether the FILES exist and
+// whether one generation actually produces a PNG — which is what "Draw a test image" proves.
+async function renderImages(){
+  const specs = SPECS.filter(s=>s.group==='diffusion');
+  let ds = null;
+  try { ds = await (await api('/api/admin/diffusion/status')).json(); } catch(e){ ds = null; }
+
+  const binOk = !!(ds && ds.capabilities && ds.capabilities.cli_present);
+  const modelOk = !!(ds && ds.capabilities && ds.capabilities.model_present);
+  const on = !!(ds && ds.enabled);
+  const busy = !!(ds && ds.capabilities && ds.capabilities.busy);
+  const BTN = 'rounded-lg px-3 py-1.5 text-xs disabled:opacity-50 disabled:cursor-not-allowed';
+
+  const tile = (k, val, sub, col) => `
+    <div class="rounded-lg border p-2.5 ${col==='ok'?'border-emerald-700/60 bg-emerald-900/20':'border-slate-700 bg-slate-800/40'}">
+      <div class="stat-k">${esc(k)}</div>
+      <div class="mt-1 flex items-center gap-2 font-medium ${col==='ok'?'text-emerald-400':col==='warn'?'text-amber-400':'text-slate-300'}">
+        <span aria-hidden="true">${col==='ok'?'●':col==='warn'?'◍':'○'}</span>${esc(val)}
+      </div>
+      <div class="text-[11px] text-slate-400 mt-0.5">${esc(sub)}</div>
+    </div>`;
+
+  $('panel').innerHTML = `
+    <p class="text-xs text-slate-400 mb-3">Hearth can draw pictures by running stable-diffusion.cpp's <code>sd-cli</code> as a subprocess. There is no server to keep running: each generation loads the model, draws, and exits — so it never competes with the chat model for a port, but a cold load does cost time. The finished image comes back to the chat model, which is how it can tell you what it actually drew.</p>
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-2 mb-4 text-sm">
+      ${tile('Switch', on?'enabled':'disabled', 'the tool is offered at all', on?'ok':'')}
+      ${tile('sd-cli binary', binOk?'found':'not found', 'Admin → Images → CLI path', binOk?'ok':'warn')}
+      ${tile('Model file', modelOk?'found':(ds&&ds.model_path?'missing':'not set'), 'the .gguf to draw with', modelOk?'ok':'warn')}
+      ${tile('Now', busy?'generating':'idle', 'one generation at a time', busy?'warn':'')}
+    </div>
+    ${(ds && ds.hint) ? `<div class="mb-4 rounded-lg border border-amber-700/60 bg-amber-900/20 p-3 text-xs text-amber-300">⚠ ${esc(ds.hint)}</div>`:''}
+    <div class="flex flex-wrap items-center gap-2 mb-4">
+      <button id="saveImg" class="${BTN} bg-sky-600 hover:bg-sky-500 text-sm px-4 py-2">Save</button>
+      <button id="testImg" class="${BTN} bg-sky-800 hover:bg-sky-700 border border-sky-700">🖼 Draw a test image</button>
+      <button id="copyImgCmd" class="${BTN} bg-slate-800 hover:bg-slate-700 border border-slate-700">Copy the sd-cli command</button>
+    </div>
+    <div id="imgBusy" class="hidden text-xs text-sky-300 mb-3"></div>
+    <div id="imgOut" class="hidden mb-4 rounded-lg border border-slate-700 bg-black/40 p-3 text-[11px] font-mono whitespace-pre-wrap break-words max-h-48 overflow-auto"></div>
+    ${fieldsSafe(specs)}
+    <button id="saveImg2" class="mt-4 rounded-lg bg-sky-600 px-4 py-2 text-sm">Save</button>`;
+
+  const save = beginOp($('saveImg'), 'Saving…', ()=> saveSettings(specs), {status:'imgBusy'});
+  $('saveImg').onclick = save;
+  $('saveImg2').onclick = beginOp($('saveImg2'), 'Saving…', ()=> saveSettings(specs), {status:'imgBusy'});
+
+  const t = $('testImg');
+  if (t) t.onclick = beginOp(t, 'Drawing…', async ()=>{
+    const box = $('imgOut'); let d=null;
+    try { d = await (await api('/api/admin/diffusion/test',{method:'POST',body:'{}'})).json(); }
+    catch(e){ d={ok:false, note:String(e)}; }
+    if(box && d){
+      box.classList.remove('hidden');
+      box.textContent = (d.ok ? `✓ drew ${d.image} image(s) in ${d.seconds}s`
+                              : '✗ could not generate:\n') + (d.note || JSON.stringify(d));
+    }
+  }, {elapsed:'loading the diffusion model and drawing 256×256 at 4 steps', keepElapsed:1000});
+
+  const c = $('copyImgCmd');
+  if (c) c.onclick = beginOp(c, 'Loading…', async ()=>{
+    const box = $('imgOut'); let d=null;
+    try { d = await (await api('/api/admin/diffusion/command')).json(); } catch(e){ d={ok:false, note:String(e)};}
+    if(box && d){ box.classList.remove('hidden'); box.textContent = d.ok ? d.command : ('⚠ '+(d.note||'no command')); }
+  });
+}
+
+async function renderAgent(){  const specs = SPECS.filter(s=>s.group==='agent');
   $('panel').innerHTML = `
     <p class="text-xs text-slate-400 mb-3">How much leeway one chat turn gets. The tool-step cap is the main guard against a model that keeps calling tools instead of answering.</p>`
     + fieldsSafe(specs)
@@ -419,7 +687,7 @@ async function renderLog(){
   if($('logAuto').checked && !LOG_TIMER) LOG_TIMER = setInterval(fetchLog, 3000);
 }
 
-const TABS = {model:renderModel, agent:renderAgent, tools:renderTools, users:renderUsers, docs:renderDocs, log:renderLog, audit:renderAudit};
+const TABS = {model:renderModel, audio:renderAudio, images:renderImages, agent:renderAgent, tools:renderTools, project:renderProject, users:renderUsers, docs:renderDocs, log:renderLog, audit:renderAudit};
 document.querySelectorAll('.tab').forEach(b=> b.onclick=async ()=>{
   document.querySelectorAll('.tab').forEach(x=>x.classList.remove('bg-slate-800'));
   b.classList.add('bg-slate-800');
@@ -427,3 +695,81 @@ document.querySelectorAll('.tab').forEach(b=> b.onclick=async ()=>{
   await loadSettings(); TABS[b.dataset.tab]();
 });
 (async()=>{ await loadSettings(); renderModel(); })();
+
+// ---- Linked project folder (DEC-049) ---------------------------------------
+// Admin-facing control for the one linked folder. The agent never uses this screen: it
+// works on the copy under project/ with the normal file tools, and asks for approval to
+// apply. Everything here is operator setup + an honest diff readout.
+async function renderProject(){
+  let st;
+  try { st = await (await api('/api/admin/project')).json(); }
+  catch(e){ $('panel').innerHTML = `<p class="text-sm text-red-400">Could not load project status: ${esc(e.message)}</p>`; return; }
+
+  let html = `<p class="text-xs text-slate-400 mb-3">Link one real folder on the server. Hearth copies it into your workspace under <code>${esc(st.prefix||'project')}/</code>, where the assistant edits it with the normal file tools. Only an approved <b>apply</b> writes back — conflicts are refused, never merged, and every overwritten file is backed up first.</p>`;
+
+  html += `<div class="flex flex-wrap gap-2 items-end mb-4">
+    <label class="flex-1 min-w-[260px]"><span class="text-xs text-slate-400">Folder path (absolute, on the machine running Hearth)</span>
+      <input id="projTarget" class="mt-1 w-full rounded-lg bg-slate-800 border border-slate-700 px-3 py-2 text-sm" placeholder="/home/you/projects/myapp" value="${esc(st.target_abs||'')}"/></label>
+    <button id="projLink" class="rounded-lg bg-sky-600 px-4 py-2 text-sm">Link</button>
+    ${st.linked?`<button id="projImport" class="rounded-lg bg-emerald-700 px-4 py-2 text-sm">${st.files?'Re-import':'Import'}</button>
+      <button id="projUnlink" class="rounded-lg bg-slate-700 px-4 py-2 text-sm">Unlink</button>`:''}
+  </div><div id="projMsg" class="text-xs mb-3"></div>`;
+
+  if (st.linked){
+    const alive = st.exists ? '' : `<div class="text-xs text-red-400 mb-3">The linked folder is not reachable right now — re-link or check the path.</div>`;
+    const enc = st.encryption_blocks_apply ? `<div class="text-xs text-amber-400 mb-3">Workspace encryption at rest is enabled, so apply-back is refused (it would write ciphertext into your project). Import and preview still work.</div>` : '';
+    const stub = st.backend === 'stub' ? `<div class="text-xs text-amber-400 mb-3">No usable write backend was detected on this system, so apply is disabled. Copy-in and preview still work.</div>` : '';
+    const counts = st.diff_error
+      ? `<div class="text-xs text-red-400 mb-3">${esc(st.diff_error)}</div>`
+      : `<div class="flex flex-wrap gap-2 text-xs mb-3">
+           <span class="px-2 py-1 rounded bg-slate-800">${st.files||0} imported</span>
+           <span class="px-2 py-1 rounded bg-emerald-900/40">+${st.added||0} new</span>
+           <span class="px-2 py-1 rounded bg-sky-900/40">~${st.modified||0} modified</span>
+           <span class="px-2 py-1 rounded ${ (st.conflicts||0) ? 'bg-red-900/50 text-red-300' : 'bg-slate-800'}">${st.conflicts||0} conflict(s)</span>
+           <span class="px-2 py-1 rounded bg-slate-800">${st.unchanged||0} unchanged</span>
+         </div>`;
+    html += alive + enc + stub + counts;
+    if (st.imported_at) html += `<div class="text-[11px] text-slate-500 mb-3">Last import: ${new Date(st.imported_at*1000).toLocaleString()}</div>`;
+
+    if ((st.backups||[]).length){
+      html += `<h3 class="font-medium text-sm mt-4 mb-1">Backups (each apply backs up what it overwrote)</h3><div class="space-y-1">`;
+      for (const b of st.backups)
+        html += `<div class="flex items-center gap-3 text-xs bg-slate-800/60 rounded px-3 py-2">
+          <code class="flex-1">${esc(b.id)}</code><span class="text-slate-400">${b.files} file(s), ${fmtBytes(b.bytes)}</span>
+          <button class="revertBtn rounded bg-slate-700 px-2 py-1" data-b="${esc(b.id)}">Revert to this</button></div>`;
+      html += `</div><div class="text-[11px] text-slate-500 mt-1">Revert restores exactly the files that apply replaced.</div>`;
+    }
+  } else {
+    html += `<div class="text-xs text-slate-500">No folder linked. Enter a path above and press Link, then Import.</div>`;
+  }
+
+  $('panel').innerHTML = html;
+  const msg = (t, bad)=>{ const m=$('projMsg'); if(m){ m.textContent=t; m.className='text-xs mb-3 '+(bad?'text-red-400':'text-emerald-400'); } };
+
+  if ($('projLink')) $('projLink').onclick = beginOp($('projLink'), 'Linking…', async ()=>{
+    const r = await api('/api/admin/project/link',{method:'POST',body:JSON.stringify({target:$('projTarget').value})});
+    const d = await r.json();
+    if(!r.ok){ msg(d.detail||'Could not link that folder.', true); return; }
+    msg(d.linked?'Linked. Now press Import to copy it in.':'Unlinked.'); renderProject();
+  });
+  if ($('projImport')) $('projImport').onclick = beginOp($('projImport'), 'Importing…', async ()=>{
+    const r = await api('/api/admin/project/import',{method:'POST',body:'{}'});
+    const d = await r.json();
+    if(!r.ok){ msg(d.detail||'Import failed.', true); renderProject(); return; }
+    msg(`Imported ${d.copied} of ${d.files} file(s)` + (d.truncated?' (hit the size/file cap — raise it under Tools → Linked project folder)':''));
+    renderProject();
+  });
+  if ($('projUnlink')) $('projUnlink').onclick = async ()=>{
+    const del = confirm('Unlink this folder?\n\nOK also deletes the workspace copy (project/). Cancel keeps the copy so you can still read what the assistant changed.');
+    await api('/api/admin/project/unlink',{method:'POST',body:JSON.stringify({delete_copy:del})});
+    renderProject();
+  };
+  document.querySelectorAll('.revertBtn').forEach(b=> b.onclick = beginOp(b, 'Reverting…', async ()=>{
+    const r = await api('/api/admin/project/revert',{method:'POST',body:JSON.stringify({backup_id:b.dataset.b})});
+    const d = await r.json();
+    msg(r.ok ? (d.note||'Reverted.') : (d.detail||'Revert failed.'), !r.ok);
+    renderProject();
+  }));
+}
+
+function fmtBytes(n){ if(n==null) return ''; if(n<1024) return n+' B'; if(n<1048576) return (n/1024).toFixed(1)+' KB'; return (n/1048576).toFixed(1)+' MB'; }

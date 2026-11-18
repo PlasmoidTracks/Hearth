@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -616,6 +617,34 @@ class ToolTests(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get("HEARTH_RUN_HTTP"), "set HEARTH_RUN_HTTP=1")
 class HttpTests(unittest.TestCase):
+    """HTTP integration tests (need fastapi/httpx/sqlalchemy).
+
+    Login used to be `if login != 200: skipTest("set BOOT_PW")`, which meant these tests
+    silently skipped in most runs: main._bootstrap_admin() only creates an admin when the DB
+    is empty, so once any user exists the password is unknown and every dependent test was a
+    no-op that still reported green. _login_admin() guarantees a known-password admin instead
+    (see hearth.main.ensure_bootstrap_admin). BOOT_PW still wins if set, so the documented
+    manual invocation keeps working.
+    """
+
+    def _login_admin(self, c):
+        """Sign a TestClient in as an admin with a known password. Returns CSRF header."""
+        from hearth.main import ensure_bootstrap_admin
+        pw = os.environ.get("BOOT_PW") or ensure_bootstrap_admin()
+        r = c.post("/auth/login", data={"username": "admin", "password": pw})
+        self.assertEqual(r.status_code, 200, f"admin login must work in tests: {r.status_code}")
+        return {"X-CSRF-Token": c.cookies.get("hearth_csrf", "")}
+
+    def _admin_uid(self):
+        """The id of the admin account _login_admin() signs in as. Workspace/artifact
+        helpers below take a raw user id, and routes derive it server-side — tests need
+        the same value to check jail contents directly."""
+        from hearth.db import session_scope
+        from hearth.models import User
+        with session_scope() as s:
+            u = s.query(User).filter(User.username == "admin").first()
+            return u.id if u else None
+
     def test_login_and_chat_stream(self):
         from fastapi.testclient import TestClient
         from hearth.main import create_app
@@ -654,13 +683,8 @@ class HttpTests(unittest.TestCase):
         # Full path: login -> upload (CSRF) -> list artifacts -> download -> ownership.
         from fastapi.testclient import TestClient
         from hearth.main import create_app
-        pw = os.environ.get("BOOT_PW", "testpass123")
         with TestClient(create_app()) as c:
-            # ensure an admin exists with known pw (bootstrap may have created one already)
-            login = c.post("/auth/login", data={"username": "admin", "password": pw})
-            if login.status_code != 200:
-                self.skipTest(f"no known admin pw; set BOOT_PW (login={login.status_code})")
-            csrf = c.cookies.get("hearth_csrf", "")
+            csrf = self._login_admin(c)["X-CSRF-Token"]
             up = c.post("/api/upload", data={"conversation_id": "httptestconv"},
                         files=[("files", ("hello.txt", b"hi from test", "text/plain"))],
                         headers={"X-CSRF-Token": csrf})
@@ -677,6 +701,158 @@ class HttpTests(unittest.TestCase):
             self.assertEqual(dl.status_code, 200)
             self.assertEqual(dl.content, b"hi from test")
 
+    def test_artifact_delete_purges_file(self):
+        # The Files panel's ⋮ → Delete. The endpoint used to drop only the DB row, which
+        # left the bytes in the workspace with nothing left to list or fetch them; now
+        # purge:true removes the file too, and the default (no body) keeps the old
+        # row-only behaviour for any other caller. CSRF is required like every mutation.
+        from fastapi.testclient import TestClient
+        from hearth.main import create_app
+        from hearth import artifacts, workspaces as ws
+        with TestClient(create_app()) as c:
+            csrf = self._login_admin(c)
+
+            # CSRF still guards the mutation.
+            nocfg = c.post("/api/artifact/nope/delete")
+            self.assertEqual(nocfg.status_code, 403)
+
+            def _upload(name, blob):
+                up = c.post("/api/upload", data={"conversation_id": "delconv"},
+                            files=[("files", (name, blob, "text/plain"))], headers=csrf)
+                self.assertEqual(up.status_code, 200, up.text)
+                return up.json()["artifacts"][0]
+
+            # Row-only delete: entry gone, bytes kept.
+            a1 = _upload("keepme.txt", b"keep")
+            r = c.post(f"/api/artifact/{a1['id']}/delete", json={}, headers=csrf)
+            self.assertEqual(r.status_code, 200, r.text)
+            self.assertTrue(r.json()["ok"])
+            self.assertFalse(r.json()["file_deleted"])
+            self.assertIsNone(artifacts.get(self._admin_uid(), a1["id"]))
+            self.assertEqual(ws.read_bytes(self._admin_uid(), a1["rel_path"]), b"keep")
+
+            # purge:true: entry gone AND file gone.
+            a2 = _upload("bye.txt", b"bye")
+            r = c.post(f"/api/artifact/{a2['id']}/delete", json={"purge": True}, headers=csrf)
+            self.assertEqual(r.status_code, 200, r.text)
+            self.assertTrue(r.json()["ok"])
+            self.assertTrue(r.json()["file_deleted"])
+            self.assertIsNone(artifacts.get(self._admin_uid(), a2["id"]))
+            with self.assertRaises((FileNotFoundError, ws.JailEscape)):
+                ws.read_bytes(self._admin_uid(), a2["rel_path"])
+
+            # Unknown id reports ok:false rather than raising.
+            r = c.post("/api/artifact/does-not-exist/delete", json={"purge": True}, headers=csrf)
+            self.assertEqual(r.status_code, 200)
+            self.assertFalse(r.json()["ok"])
+
+    def test_project_link_admin_flow(self):
+        # DEC-049 admin path: link -> import -> status shows diff -> revert, with CSRF.
+        from fastapi.testclient import TestClient
+        from hearth.main import create_app
+        proj = tempfile.mkdtemp(prefix="pl-http-")
+        (Path(proj) / "a.py").write_text("one\n", encoding="utf-8")
+        with TestClient(create_app()) as c:
+            H = self._login_admin(c)
+
+            # CSRF is required, like every other mutation.
+            nocfg = c.post("/api/admin/project/link", json={"target": proj})
+            self.assertEqual(nocfg.status_code, 403)
+
+            bad = c.post("/api/admin/project/link", json={"target": "relative/nope"}, headers=H)
+            self.assertEqual(bad.status_code, 400)
+
+            ok = c.post("/api/admin/project/link", json={"target": proj}, headers=H)
+            self.assertEqual(ok.status_code, 200, ok.text)
+            self.assertTrue(ok.json()["linked"])
+
+            imp = c.post("/api/admin/project/import", json={}, headers=H)
+            self.assertEqual(imp.status_code, 200, imp.text)
+            self.assertEqual(imp.json()["copied"], 1)
+
+            st = c.get("/api/admin/project", headers=H).json()
+            self.assertTrue(st["linked"])
+            self.assertEqual(st["files"], 1)
+            self.assertEqual(st["added"] + st["modified"] + st["conflicts"], 0)
+
+            # Revert with a bogus id is refused rather than crashing.
+            r = c.post("/api/admin/project/revert", json={"backup_id": "nope"}, headers=H)
+            self.assertEqual(r.status_code, 400)
+
+            unl = c.post("/api/admin/project/unlink", json={"delete_copy": True}, headers=H)
+            self.assertEqual(unl.status_code, 200)
+            self.assertFalse(c.get("/api/admin/project", headers=H).json()["linked"])
+
+    def test_project_chat_side_routes_and_upload_prefix(self):
+        """DEC-049 chat side: status/summary/apply on the user's own link + upload prefix."""
+        from fastapi.testclient import TestClient
+        from hearth.main import create_app, ensure_bootstrap_admin
+        proj = tempfile.mkdtemp(prefix="pl-chat-")
+        (Path(proj) / "a.py").write_text("one\n", encoding="utf-8")
+        with TestClient(create_app()) as c:
+            H = self._login_admin(c)
+            # No link yet -> chip has nothing to show.
+            self.assertFalse(c.get("/api/project/status").json()["linked"])
+            self.assertFalse(c.get("/api/project/summary").json()["linked"])
+
+            c.post("/api/admin/project/link", json={"target": proj}, headers=H)
+            c.post("/api/admin/project/import", json={}, headers=H)
+            st = c.get("/api/project/status").json()
+            self.assertTrue(st["linked"])
+            self.assertEqual(st["prefix"], "project")
+
+            # Upload into the project copy (item 4).
+            up = c.post("/api/upload", data={"conversation_id": "pc", "prefix": "project"},
+                        files=[("files", ("added.txt", b"from browser\n", "text/plain"))],
+                        headers=H)
+            self.assertEqual(up.status_code, 200, up.text)
+            self.assertEqual(up.json()["artifacts"][0]["rel_path"], "project/added.txt")
+
+            # Summary reports it as pending (item 2).
+            s = c.get("/api/project/summary").json()
+            self.assertEqual(s["added"], 1)
+            self.assertIn("added.txt", s["will_write"])
+            self.assertTrue(s["apply_enabled"])
+
+            # User-initiated apply, no model involved (item 3).
+            r = c.post("/api/project/apply", headers=H)
+            self.assertEqual(r.status_code, 200)
+            self.assertTrue(r.json()["ok"])
+            self.assertTrue((Path(proj) / "added.txt").is_file())
+
+            # CSRF still required on the write paths.
+            self.assertEqual(c.post("/api/project/apply").status_code, 403)
+            self.assertEqual(c.post("/api/project/revert", json={"backup_id": "x"}).status_code, 403)
+
+            # A bogus prefix is refused; it is never treated as a path.
+            for bad in ("../../etc", "secret", "uploads/../x"):
+                r2 = c.post("/api/upload", data={"conversation_id": "pc", "prefix": bad},
+                            files=[("files", ("f.txt", b"x", "text/plain"))], headers=H)
+                self.assertEqual(r2.status_code, 400, f"{bad} must be rejected")
+
+    def test_project_prompt_context_only_when_linked(self):
+        """Item 1: the model is told about project/ only while a link exists, and cheaply."""
+        from hearth import orchestrator as orch, project_link as pl
+        uid = "plctx"
+        self.assertEqual(orch._project_context(uid), "")
+        proj = tempfile.mkdtemp(prefix="pl-ctx-")
+        (Path(proj) / "a.py").write_text("x\n", encoding="utf-8")
+        link = pl.set_link(uid, proj)
+        pl.import_project(uid, {}, link)
+        ctx = orch._project_context(uid)
+        self.assertIn("sync_preview", ctx)
+        self.assertIn("sync_apply", ctx)
+        self.assertIn("project/", ctx)
+        # Cost guard: prompt building must never hash the tree.
+        real = pl.diff_project
+        try:
+            pl.diff_project = lambda *a, **k: (_ for _ in ()).throw(AssertionError("diff in prompt"))
+            orch._project_context(uid)
+        finally:
+            pl.diff_project = real
+        pl.clear_link(uid, delete_copy=True)
+        self.assertEqual(orch._project_context(uid), "")
+
     def test_i18n_endpoint(self):
         from fastapi.testclient import TestClient
         from hearth.main import create_app
@@ -688,11 +864,8 @@ class HttpTests(unittest.TestCase):
     def test_conversation_rename_delete_search(self):
         from fastapi.testclient import TestClient
         from hearth.main import create_app
-        pw = os.environ.get("BOOT_PW", "testpass123")
         with TestClient(create_app()) as c:
-            if c.post("/auth/login", data={"username": "admin", "password": pw}).status_code != 200:
-                self.skipTest(f"set BOOT_PW (login failed)")
-            csrf = c.cookies.get("hearth_csrf", "")
+            csrf = self._login_admin(c)["X-CSRF-Token"]
             H = {"X-CSRF-Token": csrf}
             cid = c.post("/api/chat/conversations", headers=H).json()["id"]
             # rename
@@ -1053,7 +1226,342 @@ def _fake_llama_client(lines):
     return orig
 
 
-class CryptoTests(unittest.TestCase):
+def _fake_caption_client(chunks, capture=None):
+    """Shared httpx stand-in for Captioner._run_server streaming tests.
+
+    _run_server does `with httpx.Client(...)` then `with c.stream("POST", ...)` and reads
+    SSE via `iter_lines()`, so the fake implements the sync context-manager protocol on both
+    the client and the response (the async fake above is for the chat provider and would fail
+    here). Each entry in `chunks` becomes one `data: {json}` line; a literal "[DONE]" sentinel
+    is appended, mirroring llama-server. `capture` (a dict) records the request body so a test
+    can assert stream:true was actually sent. Kept here so all streaming tests share one
+    interface and cannot drift.
+    """
+    import httpx
+
+    def _aiter():
+        for c in chunks:
+            if c == "[DONE]":
+                yield "data: [DONE]"
+            else:
+                yield "data: " + json.dumps({"choices": [{"delta": c}]})
+
+    class FakeResponse:
+        status_code = 200
+
+        def iter_lines(self): return _aiter()
+        def read(self): return b""
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    class FakeClient:
+        def stream(self, method, url, json=None):
+            if capture is not None:
+                capture["body"] = json
+                capture["stream_flag"] = (json or {}).get("stream")
+            return FakeResponse()
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    orig = httpx.Client
+    httpx.Client = lambda *a, **k: FakeClient()
+    return orig
+
+
+class CaptionerStreamTests(unittest.TestCase):
+    """Streaming the captioner's response + Stop reaching the audio model (DEC-057)."""
+
+    def _settings(self, **over):
+        from hearth import runtime_settings as rs
+        base = {s.key: s.default for s in rs.ALL_SPECS}
+        base.update({"captioner.enabled": True, "captioner.auto_route": True,
+                     "captioner.chunk_seconds": 0})
+        base.update(over)
+        return base
+
+    def _wav(self):
+        """A real (tiny) wav on disk — _run_server reads the chunk bytes to base64 them, so a
+        made-up path raises before any HTTP happens."""
+        import tempfile as _tf
+        fd, path = _tf.mkstemp(suffix=".wav")
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(b"RIFF....WAVEfmt ")
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+        return path
+
+    def _external_server(self):
+        """Point the captioner at an (unlaunched) external base_url for these tests.
+
+        Without it, _run_server sees no owned process and returns None before any HTTP — the
+        documented 'bring one up' path, which would launch a real server. An external
+        HEARTH_CAPTIONER_BASE_URL makes _owned() irrelevant (the request goes straight out) and
+        is never launched or killed by Hearth, so the fake httpx client is what answers.
+        """
+        prev = os.environ.get("HEARTH_CAPTIONER_BASE_URL")
+        os.environ["HEARTH_CAPTIONER_BASE_URL"] = "http://127.0.0.1:9"
+
+        def _restore():
+            if prev is None:
+                os.environ.pop("HEARTH_CAPTIONER_BASE_URL", None)
+            else:
+                os.environ["HEARTH_CAPTIONER_BASE_URL"] = prev
+        self.addCleanup(_restore)
+
+    def test_stream_setting_defaults_on(self):
+        from hearth import runtime_settings as rs
+        self.assertIs(rs.SPEC_BY_KEY["captioner.stream"].default, True)
+
+    def test_run_server_streams_deltas_in_order(self):
+        import httpx
+        from hearth import captioner as cap
+        self._external_server()
+        c = cap.Captioner()
+        got = []
+        cap_lines = [{"content": "Two "}, {"reasoning_content": "[think] "},
+                     {"content": "people talk."}, "[DONE]"]
+        orig = _fake_caption_client(cap_lines)
+        try:
+            text = c._run_server(self._wav(), self._settings(),
+                                 cap.resolve_paths(self._settings()), "",
+                                 on_delta=got.append)
+        finally:
+            httpx.Client = orig
+        # content AND reasoning_content are surfaced; the return value is their concatenation.
+        self.assertEqual("".join(got), text)
+        self.assertIn("[think] ", got)
+        self.assertEqual(text, "Two [think] people talk.")
+
+    def test_run_server_requests_streaming_when_enabled(self):
+        import httpx
+        from hearth import captioner as cap
+        self._external_server()
+        c = cap.Captioner()
+        cap_ = {}
+        orig = _fake_caption_client([{"content": "ok"}, "[DONE]"], capture=cap_)
+        try:
+            c._run_server(self._wav(), self._settings(),
+                          cap.resolve_paths(self._settings()), "", on_delta=lambda t: None)
+        finally:
+            httpx.Client = orig
+        self.assertIs(cap_.get("stream_flag"), True)
+
+    def test_run_server_no_stream_when_disabled(self):
+        # captioner.stream=false must NOT ask the server for a streamed response.
+        import httpx
+        from hearth import captioner as cap
+        self._external_server()
+        c = cap.Captioner()
+        seen = {}
+
+        class Resp:
+            status_code = 200
+            text = '{"choices":[{"message":{"content":"whole"}}]}'
+            def json(self): return {"choices": [{"message": {"content": "whole"}}]}
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        class Client:
+            def post(self, url, json=None):
+                seen["stream"] = (json or {}).get("stream")
+                return Resp()
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        orig = httpx.Client
+        httpx.Client = lambda *a, **k: Client()
+        try:
+            text = c._run_server(self._wav(), self._settings(**{"captioner.stream": False}),
+                                 cap.resolve_paths(self._settings()), "")
+        finally:
+            httpx.Client = orig
+        self.assertIs(seen.get("stream"), False)
+        self.assertEqual(text, "whole")
+
+    def test_run_server_honours_cancel_event(self):
+        import threading
+        import httpx
+        from hearth import captioner as cap
+        self._external_server()
+        c = cap.Captioner()
+        # A cancel flag that flips on after the first chunk: the loop must raise rather than
+        # finish listening. This is what makes Stop abandon a recording mid-caption.
+        ev = threading.Event()
+
+        def _aiter():
+            yield "data: " + json.dumps({"choices": [{"delta": {"content": "start"}}]})
+            ev.set()
+            for _ in range(50):
+                yield "data: " + json.dumps({"choices": [{"delta": {"content": "more"}}]})
+
+        class Resp:
+            status_code = 200
+            def iter_lines(self): return _aiter()
+            def read(self): return b""
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        class Client:
+            def stream(self, method, url, json=None): return Resp()
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        orig = httpx.Client
+        httpx.Client = lambda *a, **k: Client()
+        try:
+            with self.assertRaises(cap.CaptionError) as cm:
+                c._run_server(self._wav(), self._settings(),
+                              cap.resolve_paths(self._settings()), "", cancel=ev)
+        finally:
+            httpx.Client = orig
+        self.assertIn("stopped", str(cm.exception).lower())
+
+    def test_prepare_captions_forwards_stream_chunks_and_cancel(self):
+        import asyncio
+        import threading
+        from hearth import orchestrator as orch, captioner as cap
+        att = [{"name": "voice.mp3", "mime": "audio/mpeg", "rel_path": "uploads/vo-stream.mp3"}]
+        seen_events = []
+
+        async def fake_describe(user_id, rel, extra_prompt="", settings=None,
+                                on_delta=None, cancel=None):
+            if on_delta:
+                on_delta("hello ")
+                on_delta("world")
+            return {"caption": "hello world", "chunks": 1, "duration_s": 3.0,
+                    "backend": "server", "notes": []}
+
+        orig = cap.describe_file
+        cap.describe_file = fake_describe
+        try:
+            out = asyncio.run(orch.prepare_captions("u-stream", "conv-s", att, self._settings(),
+                                                    emit=seen_events.append))
+        finally:
+            cap.describe_file = orig
+        kinds = [e.get("kind") for e in seen_events]
+        self.assertIn("caption_chunk", kinds)
+        chunk_text = "".join(e["text"] for e in seen_events if e.get("kind") == "caption_chunk")
+        self.assertEqual(chunk_text, "hello world")
+        self.assertIn("uploads/vo-stream.mp3", out)
+
+    def test_prepare_captions_skips_when_already_cancelled(self):
+        import asyncio
+        from hearth import orchestrator as orch, captioner as cap
+        att = [{"name": "a.mp3", "mime": "audio/mpeg", "rel_path": "uploads/a-cancel.mp3"}]
+
+        class H:
+            cancelled = True
+
+        called = []
+        orig = cap.describe_file
+        cap.describe_file = lambda *a, **k: called.append(1)
+        try:
+            out = asyncio.run(orch.prepare_captions("u-c", "conv-c", att, self._settings(),
+                                                    cancel=H()))
+        finally:
+            cap.describe_file = orig
+        self.assertEqual(called, [], "must not start listening after a Stop")
+        self.assertEqual(out, {})
+
+    def test_tool_context_cancel_adapter(self):
+        from hearth.tools import ToolContext
+        ctx = ToolContext("u", {}, {})
+        # No handle attached -> nothing to poll (a tool must not crash checking it).
+        self.assertIsNone(ctx.cancel_event())
+
+        class H:
+            cancelled = False
+        ctx.attach_cancel(H())
+        ce = ctx.cancel_event()
+        self.assertFalse(ce.is_set())
+        H.cancelled = True
+        self.assertTrue(ce.is_set())
+
+    def test_cancel_handle_is_thread_interface_compatible(self):
+        # The regression: prepare_captions passes the RAW asyncio CancelHandle to
+        # captioner.describe_file for a directly-attached recording, while the describe_audio
+        # tool passes a threading.Event-shaped adapter. caption_sync polled only `.is_set()`,
+        # so every direct mp3 attachment died with AttributeError before describing anything.
+        import asyncio
+        from hearth.cancel import CancelHandle
+        h = CancelHandle(user_id="u")
+        self.assertFalse(h.is_set())
+        self.assertFalse(h.cancelled)
+        h.cancel()
+        self.assertTrue(h.is_set())
+        self.assertTrue(h.cancelled)
+
+    def test_captioner_accepts_both_cancel_shapes(self):
+        import threading
+        from hearth import captioner as cap
+        from hearth.cancel import CancelHandle
+        # Unset / set for each shape, plus None and an unknown object: no AttributeError ever.
+        # NOTE: build the SET instances inside each case list — a CancelHandle created up
+        # front and cancelled before the "off" assertions run would report itself set there.
+        cases_off = [None, CancelHandle(user_id="u"), threading.Event(), object()]
+        h = CancelHandle(user_id="u")
+        ev = threading.Event()
+        h.cancel()
+        ev.set()
+        cases_on = [h, ev]
+
+        class OnlyCancelled:
+            cancelled = True
+
+        for c in cases_off:
+            self.assertFalse(cap._cancel_requested(c), f"{c!r} read as cancelled")
+        for c in cases_on + [OnlyCancelled()]:
+            self.assertTrue(cap._cancel_requested(c), f"{c!r} not read as cancelled")
+
+    def test_caption_sync_with_raw_cancel_handle(self):
+        # End-to-end through caption_sync (the path an attachment takes), with the real
+        # CancelHandle rather than the tool's adapter.
+        import json
+        import tempfile as _tf
+        import httpx
+        from hearth import captioner as cap
+        from hearth.cancel import CancelHandle
+        self._external_server()
+        orig_chunks = cap.prepare_chunks
+        orig_info = cap.audio_info
+        cap.prepare_chunks = (lambda path, tmp, resample=True, chunk_seconds=30,
+                              window=None, log=lambda m: None: [(path, 0.0)])
+        cap.audio_info = lambda p: {"duration_s": 1.0, "audio_streams": 1}
+        self.addCleanup(setattr, cap, "prepare_chunks", orig_chunks)
+        self.addCleanup(setattr, cap, "audio_info", orig_info)
+
+        c = cap.Captioner()
+        # A real model file on disk: caption_sync runs preflight first, and preflight checks
+        # that the configured model path actually exists.
+        with _tf.TemporaryDirectory() as d:
+            model = os.path.join(d, "omni.gguf")
+            with open(model, "wb") as fh:
+                fh.write(b"x")
+            settings = self._settings(**{"captioner.model_path": model,
+                                         # preflight also wants a launchable server binary;
+                                         # no process is started here (external base_url).
+                                         "captioner.server_bin": sys.executable})
+
+            # Not cancelled -> a normal caption.
+            h = CancelHandle(user_id="u")
+            orig = _fake_caption_client([{"content": "a voice"}, "[DONE]"])
+            try:
+                res = c.caption_sync(self._wav(), settings, cancel=h)
+            finally:
+                httpx.Client = orig
+            self.assertEqual(res["caption"], "a voice")
+
+            # Cancelled -> CaptionError saying it stopped, not AttributeError.
+            h2 = CancelHandle(user_id="u")
+            h2.cancel()
+            orig = _fake_caption_client([{"content": "a voice"}, "[DONE]"])
+            try:
+                with self.assertRaises(cap.CaptionError) as cm:
+                    c.caption_sync(self._wav(), settings, cancel=h2)
+            finally:
+                httpx.Client = orig
+            self.assertIn("stopped", str(cm.exception).lower())
+
+
     """Codec + provider-stream behaviour (tool-call parsing, progress hints)."""
 
     def test_roundtrip_and_passthrough(self):
@@ -1792,6 +2300,75 @@ class CryptoTests(unittest.TestCase):
         self.assertIsNone(probe.get("n_ctx"))
         self.assertNotIn("effective", probe, "probe() must not report a provider choice")
 
+    def test_context_usage_never_launches_llama_server(self):
+        # The DEC-048 invariant has two halves: never launch on a passive page view, AND
+        # still take the live window from /props when a server IS up. Both were broken for
+        # /api/chat/context-usage — it called get_provider(), which reaches ensure_server(),
+        # so opening a conversation (chat.js loadContextUsage) restarted llama-server right
+        # after an admin had stopped it. The DEC-048 guard above only covers probe()/status()
+        # and the payload tests only cover the pure maths, so nothing exercised this route.
+        # NB: must pass a REAL conversation_id — the route returns before reaching the
+        # manager when it is empty, and an empty-id test passes against the buggy code too.
+        import asyncio
+        from unittest import mock
+        from hearth.db import init_db, session_scope
+        from hearth.models import Conversation, User
+        from hearth.manager import get_manager
+        from hearth.routes_chat import chat_context_usage
+
+        init_db()
+        uid, cid = "ctx-guard-user", "ctx-guard-conv"
+        with session_scope() as s:
+            if s.get(User, uid) is None:
+                s.add(User(id=uid, username=f"u-{uid}", pw_hash="x"))
+            if s.get(Conversation, cid) is None:
+                s.add(Conversation(id=cid, user_id=uid, title="ctx guard"))
+
+        class _U:
+            id = uid
+
+        m = get_manager()
+        launches = []
+
+        async def _boom(*a, **k):
+            launches.append(("ensure_server", a, k))
+            return ""
+
+        async def _never_provider(*a, **k):
+            launches.append(("get_provider", a, k))
+            raise AssertionError("context-usage must not resolve a provider")
+
+        async def _unreachable(*a, **k):
+            raise RuntimeError("no server here")
+
+        # Phase 1 — nothing answering. ensure_server is trapped; get_provider and probe()'s
+        # own probes are made to raise, so reaching ANY launch-capable path fails loudly
+        # instead of silently probing a llama-server that happens to run on this machine.
+        with mock.patch.object(m, "ensure_server", _boom), \
+             mock.patch.object(m, "get_provider", _never_provider), \
+             mock.patch.object(m, "_reachable", _unreachable), \
+             mock.patch.object(m, "_is_llama_server", _unreachable):
+            d = json.loads(asyncio.run(chat_context_usage(None, cid, user=_U())).body)
+        self.assertEqual(
+            launches, [],
+            "context-usage must not launch llama-server — it runs on every conversation "
+            "open (DEC-048)")
+        # Nothing answering => the configured window is still reported, so the bar keeps
+        # working instead of going blank.
+        self.assertGreater(d["n_ctx"], 0, "must fall back to the configured model.n_ctx")
+
+        # Phase 2 — a server IS answering: its live /props window must win over the
+        # setting, which is the whole reason this call exists. Patched on probe() itself so
+        # it also pins the route to the launch-free path (ensure_server stays trapped).
+        with mock.patch.object(m, "ensure_server", _boom), \
+             mock.patch.object(m, "probe",
+                               lambda: asyncio.sleep(0, result={"server_reachable": True,
+                                                                "base_url": "http://x",
+                                                                "n_ctx": 4242})):
+            d = json.loads(asyncio.run(chat_context_usage(None, cid, user=_U())).body)
+        self.assertEqual(launches, [], "context-usage must not launch llama-server")
+        self.assertEqual(d["n_ctx"], 4242, "live /props n_ctx must win over the setting")
+
     def test_new_settings_specs_registered(self):
         from hearth import runtime_settings as rs
         for key in ("agent.max_tool_steps", "agent.require_device_grant", "device.helper_url",
@@ -1886,6 +2463,51 @@ class CryptoTests(unittest.TestCase):
         insp = inspect(get_engine())
         cols = {c["name"] for c in insp.get_columns("conversations")}
         self.assertIn("device_granted", cols)
+
+    def test_stream_checked_releases_provider_generator_on_disconnect(self):
+        # Regression: cancelling the *route task* (what Starlette does when a client
+        # disconnects) unwinds _stream_checked through its `finally` while the provider
+        # generator is still suspended mid-read. CPython refuses to aclose() an async
+        # generator that is running, so the old bare `await agen.aclose()` raised
+        # "anext(): asynchronous generator is already running" out of the SSE route and
+        # leaked the stream. _stream_checked must swallow it and unwind quietly.
+        import asyncio
+        from hearth import orchestrator as orch
+        from hearth import cancel as cancel_mod
+
+        class Blocks:
+            name = "stub-blocker"          # not llama-server -> no log poller
+            async def stream(self, messages, tools, params):
+                if False:
+                    yield
+                await asyncio.sleep(30)    # stands in for a blocked httpx body read
+                yield StreamEvent("token", text="never")
+
+        async def go():
+            conv = "disconnect-conv"
+            self._make_conv(conv)
+            h = cancel_mod.begin(conv, "u")
+            try:
+                agen = orch._stream_checked(Blocks(), [], [], {}, h)
+                task = asyncio.ensure_future(agen.__aiter__().__anext__())
+                await asyncio.sleep(0.05)  # let it reach the blocked read
+                task.cancel()              # client disconnects mid-stream
+                try:
+                    await task
+                except (asyncio.CancelledError, StopAsyncIteration):
+                    pass
+                # The wrapper generator is torn down here; before the fix its finally
+                # raised RuntimeError instead of unwinding.
+                await asyncio.wait_for(agen.aclose(), timeout=5)
+            finally:
+                cancel_mod.end(conv, h)
+
+        try:
+            asyncio.run(go())
+        except RuntimeError as e:
+            self.fail(f"aclose() must not surface 'already running': {e}")
+        except (asyncio.CancelledError, StopAsyncIteration):
+            pass    # both are legitimate teardown outcomes
 
 
 def _specs():
@@ -2058,6 +2680,1613 @@ class ProviderStreamLifetimeTests(unittest.TestCase):
                       f"internal bug mislabelled: {text!r}")
         self.assertNotIn("check llama-server health", text,
                          "our own bug must not tell the user to debug llama-server")
+
+
+class ProjectLinkTests(unittest.TestCase):
+    """Linked project folder (DEC-049 / CONTRACT v1.3 REQ-041..048).
+
+    Uses real temp directories as the "real project" so hashing, conflict detection and
+    backups are exercised against actual files rather than mocks.
+    """
+
+    def _proj(self, files: dict) -> str:
+        d = tempfile.mkdtemp(prefix="pl-proj-")
+        for rel, content in files.items():
+            p = Path(d) / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content, encoding="utf-8")
+        return d
+
+    def _linked(self, uid: str, files: dict):
+        from hearth import project_link as pl
+        proj = self._proj(files)
+        link = pl.set_link(uid, proj)
+        pl.import_project(uid, {}, link)
+        return proj, link
+
+    def test_link_requires_absolute_existing_dir(self):
+        # REQ-041: validation of the target, and no link created on failure.
+        from hearth import project_link as pl
+        for bad in ["", "relative/path", "/definitely/not/here"]:
+            with self.assertRaises(pl.LinkError):
+                pl.set_link("plink1", bad)
+        self.assertIsNone(pl.get_link("plink1"))
+
+    def test_cannot_link_inside_own_workspace(self):
+        from hearth import project_link as pl, workspaces as ws
+        inside = Path(ws.root_for("plink2")) / "sub"
+        inside.mkdir(parents=True, exist_ok=True)
+        with self.assertRaises(pl.LinkError):
+            pl.set_link("plink2", str(inside))
+
+    def test_import_copies_and_records_baseline(self):
+        # REQ-042: copy + manifest; noise dirs skipped.
+        from hearth import project_link as pl, workspaces as ws
+        proj, link = self._linked("plimp", {"README.md": "hello\n", "src/a.py": "x = 1\n",
+                                            "node_modules/junk.js": "nope\n"})
+        mf = pl.load_manifest("plimp", link)
+        self.assertEqual(sorted(mf["files"]), ["README.md", "src/a.py"])
+        self.assertEqual(ws.read_text("plimp", "project/src/a.py"), "x = 1\n")
+        self.assertFalse((Path(ws.root_for("plimp")) / "project" / "node_modules").exists())
+
+    def test_clean_diff_is_empty(self):
+        from hearth import project_link as pl
+        proj, link = self._linked("plclean", {"a.py": "one\n"})
+        cs = pl.diff_project("plclean", link)
+        self.assertEqual(cs.applyable, [])
+        self.assertEqual(cs.conflicts, [])
+        self.assertEqual(cs.unchanged, 1)
+
+    def test_apply_writes_modified_and_new_files(self):
+        # REQ-044/045 happy path + backup id reported.
+        from hearth import project_link as pl, project_apply as pa, workspaces as ws
+        proj, link = self._linked("plapply", {"a.py": "one\n"})
+        ws.edit_text("plapply", "project/a.py", "one", "TWO")
+        ws.write_text("plapply", "project/new.md", "created\n")
+        cs = pl.diff_project("plapply", link)
+        self.assertEqual(cs.modified, ["a.py"])
+        self.assertEqual(cs.added, ["new.md"])
+
+        res = pa.apply_changes("plapply", {}, link)
+        self.assertTrue(res.ok, res.note)
+        self.assertEqual((Path(proj) / "a.py").read_text(), "TWO\n")
+        self.assertEqual((Path(proj) / "new.md").read_text(), "created\n")
+        self.assertTrue(res.backup_id)
+        # Baseline refreshed: a second preview must be clean.
+        self.assertEqual(pl.diff_project("plapply", link).applyable, [])
+
+    def test_revert_restores_previous_state(self):
+        from hearth import project_link as pl, project_apply as pa, workspaces as ws
+        proj, link = self._linked("plrev", {"a.py": "one\n"})
+        ws.edit_text("plrev", "project/a.py", "one", "TWO")
+        res = pa.apply_changes("plrev", {}, link)
+        self.assertEqual((Path(proj) / "a.py").read_text(), "TWO\n")
+        rv = pa.revert("plrev", res.backup_id, link)
+        self.assertTrue(rv.ok, rv.note)
+        self.assertEqual((Path(proj) / "a.py").read_text(), "one\n")
+
+    def test_conflict_refuses_and_preserves_user_edit(self):
+        # REQ-044: a target edited since import is refused, never merged. All-or-nothing.
+        from hearth import project_link as pl, project_apply as pa, workspaces as ws
+        proj, link = self._linked("plconf", {"a.py": "one\n", "b.py": "bee\n"})
+        ws.edit_text("plconf", "project/a.py", "one", "TWO")
+        ws.edit_text("plconf", "project/b.py", "bee", "BEE")
+        (Path(proj) / "a.py").write_text("user's own edit\n")   # concurrent user edit
+
+        cs = pl.diff_project("plconf", link)
+        self.assertEqual(len(cs.conflicts), 1, cs.conflicts)
+        res = pa.apply_changes("plconf", {}, link)
+        self.assertFalse(res.ok)
+        self.assertEqual(res.written, [], "a conflict must block the whole apply")
+        self.assertEqual((Path(proj) / "a.py").read_text(), "user's own edit\n")
+        self.assertEqual((Path(proj) / "b.py").read_text(), "bee\n")
+
+    def test_new_file_colliding_with_target_is_a_conflict(self):
+        from hearth import project_link as pl, project_apply as pa, workspaces as ws
+        proj, link = self._linked("plnewc", {"a.py": "one\n"})
+        ws.write_text("plnewc", "project/both.txt", "agent\n")
+        (Path(proj) / "both.txt").write_text("user\n")
+        cs = pl.diff_project("plnewc", link)
+        self.assertTrue(any("both.txt" in c for c in cs.conflicts), cs.conflicts)
+        res = pa.apply_changes("plnewc", {}, link)
+        self.assertFalse(res.ok)
+        self.assertEqual((Path(proj) / "both.txt").read_text(), "user\n")
+
+    def test_import_does_not_follow_symlinks(self):
+        from hearth import project_link as pl, workspaces as ws
+        proj = self._proj({"a.py": "x\n"})
+        try:
+            (Path(proj) / "sneaky").symlink_to("/etc/passwd")
+        except OSError:
+            self.skipTest("symlinks unsupported here")
+        link = pl.set_link("plsym", proj)
+        pl.import_project("plsym", {}, link)
+        self.assertEqual(sorted(pl.load_manifest("plsym", link)["files"]), ["a.py"])
+        self.assertFalse((Path(ws.root_for("plsym")) / "project" / "sneaky").exists())
+
+    def test_deletions_are_reported_but_never_applied(self):
+        from hearth import project_link as pl, project_apply as pa, workspaces as ws
+        proj, link = self._linked("pldel", {"a.py": "one\n", "gone.py": "bye\n"})
+        ws.delete_path("pldel", "project/gone.py")
+        cs = pl.diff_project("pldel", link)
+        self.assertEqual(cs.deleted, ["gone.py"])
+        pa.apply_changes("pldel", {}, link)
+        self.assertTrue((Path(proj) / "gone.py").exists(), "the tool must not delete real files")
+
+    def test_stub_backend_refuses_without_writing(self):
+        # REQ-046: unsupported backend -> refusal, no disk change.
+        from hearth import project_link as pl, project_apply as pa, workspaces as ws
+        proj, link = self._linked("plstub", {"a.py": "one\n"})
+        ws.edit_text("plstub", "project/a.py", "one", "TWO")
+        res = pa.apply_changes("plstub", {"project.apply_backend": "stub"}, link)
+        self.assertFalse(res.ok)
+        self.assertEqual(res.backend, "stub")
+        self.assertIn("not supported", res.note)
+        self.assertEqual((Path(proj) / "a.py").read_text(), "one\n")
+
+    def test_encryption_at_rest_blocks_apply(self):
+        # REQ-047: never write encrypted-at-rest workspace bytes out to a real project.
+        from hearth import project_link as pl, project_apply as pa, workspaces as ws
+        import hearth.crypto as crypto
+        proj, link = self._linked("plenc", {"a.py": "one\n"})
+        ws.edit_text("plenc", "project/a.py", "one", "TWO")
+        real = crypto.encryption_enabled
+        try:
+            crypto.encryption_enabled = lambda: True
+            res = pa.apply_changes("plenc", {}, link)
+        finally:
+            crypto.encryption_enabled = real
+        self.assertFalse(res.ok)
+        self.assertIn("encryption", res.note)
+        self.assertEqual((Path(proj) / "a.py").read_text(), "one\n")
+
+    def test_apply_is_gated_and_preview_is_not(self):
+        # The write-back tool must always interrupt for approval.
+        from hearth.tools import TOOLS_BY_NAME, approval_mode
+        pv, ap = TOOLS_BY_NAME["sync_preview"], TOOLS_BY_NAME["sync_apply"]
+        self.assertTrue(ap.gated)
+        self.assertEqual(approval_mode(ap, {}), "ask")
+        self.assertEqual(approval_mode(pv, {}), "auto")
+
+    def test_link_settings_exist_with_safe_defaults(self):
+        from hearth import runtime_settings as rs
+        specs = rs.SPEC_BY_KEY
+        self.assertTrue(specs["tools.sync_apply"].default)
+        self.assertEqual(specs["tools.sync_apply.approval"].default, "ask")
+        self.assertEqual(specs["project.apply_backend"].choices, ["auto", "local", "stub"])
+
+    def test_unlink_disables_and_optionally_removes_copy(self):
+        from hearth import project_link as pl, workspaces as ws
+        proj, link = self._linked("plunl", {"a.py": "one\n"})
+        self.assertTrue(pl.clear_link("plunl"))
+        self.assertIsNone(pl.get_link("plunl"))
+        self.assertTrue((Path(ws.root_for("plunl")) / "project" / "a.py").exists())
+        pl.set_link("plunl", proj)
+        pl.import_project("plunl", {}, pl.get_link("plunl"))
+        pl.clear_link("plunl", delete_copy=True)
+        self.assertFalse((Path(ws.root_for("plunl")) / "project" / "a.py").exists())
+
+
+class MediaToolTests(unittest.TestCase):
+    """PDF/video tools + how their images reach the model.
+
+    The rendering backends are external (pymupdf / poppler / ffmpeg), so each check
+    skips itself when the machine lacks one — a missing dependency must never look
+    like a broken tool. The parts that ARE ours and always testable: the images field
+    on ToolResult, its persistence on the tool row, and the multimodal replay shape.
+    """
+
+    def _conv(self, uid: str, cid: str):
+        from hearth.db import init_db, session_scope
+        from hearth.models import Conversation, User
+        init_db()
+        with session_scope() as s:
+            if s.get(User, uid) is None:
+                s.add(User(id=uid, username=f"u-{uid}", pw_hash="x"))
+            if s.get(Conversation, cid) is None:
+                s.add(Conversation(id=cid, user_id=uid, title="media"))
+
+    def test_toolresult_images_field_is_optional(self):
+        from hearth.tools.base import ToolResult
+        self.assertIsNone(ToolResult(True, "text").images)
+        r = ToolResult(True, "t", images=[{"path": "a.png", "mime": "image/png"}])
+        self.assertEqual(r.images[0]["path"], "a.png")
+
+    def test_media_tools_registered_with_settings_and_specs(self):
+        from hearth.tools import TOOLS_BY_NAME, tool_specs
+        names = ["pdf_info", "pdf_read", "video_info", "view_video", "context_usage"]
+        for n in names:
+            self.assertIn(n, TOOLS_BY_NAME, f"{n} not registered")
+            self.assertEqual(TOOLS_BY_NAME[n].enable_key, f"tools.{n}")
+        specs = {s["function"]["name"]: s for s in tool_specs({})}
+        for n in names:
+            self.assertIn(n, specs, f"{n} missing from tool specs")
+            self.assertTrue(specs[n]["function"]["description"].strip())
+        # Admin toggles must exist so an operator can turn each one off.
+        from hearth import runtime_settings as rs
+        for n in names:
+            self.assertIn(f"tools.{n}", rs.SPEC_BY_KEY)
+            self.assertTrue(rs.SPEC_BY_KEY[f"tools.{n}"].default)
+        self.assertEqual(rs.SPEC_BY_KEY["media.max_image_edge"].default, 1280)
+
+    def test_optimise_png_keeps_colour_and_caps_the_long_edge(self):
+        """Colour is preserved; only the long edge is capped (aspect kept, never upscaled).
+
+        Grayscaling used to be the default and was removed: it saved bytes while costing
+        nothing back — vision tokens depend on pixel dimensions, identical grey or colour.
+        Skips itself when Pillow is absent, like the other media checks.
+        """
+        import io
+        from hearth.tools import media_render as mr
+        try:
+            from PIL import Image
+        except Exception:  # noqa: BLE001 — Pillow is optional by design
+            self.skipTest("Pillow not installed")
+        buf = io.BytesIO()
+        # Deliberately a strongly COLOURED image: a red/green split. If anything converts
+        # to greyscale, R and G collapse to different luminances only after the fact, so
+        # assert mode "RGB" is what actually catches a regression.
+        im = Image.new("RGB", (1920, 1080))
+        for x in range(1920):
+            for y in (0, 1):
+                im.putpixel((x, y), (220, 30, 30) if x % 2 else (30, 200, 30))
+        im.save(buf, format="PNG")
+        out = mr.optimise_png(buf.getvalue(), max_edge=1280)
+        got = Image.open(io.BytesIO(out))
+        self.assertEqual(got.mode, "RGB", "colour must survive optimise_png() by default")
+        self.assertEqual(max(got.size), 1280)
+        self.assertEqual(got.size, (1280, 720), "aspect ratio must be preserved")
+        # An explicit grayscale=True still works — the parameter is kept, just not default.
+        grey = Image.open(io.BytesIO(mr.optimise_png(buf.getvalue(), max_edge=1280,
+                                                    grayscale=True)))
+        self.assertEqual(grey.mode, "L")
+        # Never upscaled: an image already under the cap keeps its dimensions.
+        small = io.BytesIO()
+        Image.new("RGB", (640, 480), (10, 200, 90)).save(small, format="PNG")
+        kept = Image.open(io.BytesIO(mr.optimise_png(small.getvalue(), max_edge=1280)))
+        self.assertEqual(kept.size, (640, 480))
+
+    def test_images_persist_on_tool_row_and_replay_as_multimodal(self):
+        # The core of DEC-052: images ride on the tool row's meta as PATHS (never
+        # base64 in the DB), and build_messages turns them into a user-role multimodal
+        # message — the one shape proven to reach an mmproj projector.
+        import json
+        from hearth import orchestrator as orch, workspaces as ws
+        uid, cid = "media-replay", "media-replay-conv"
+        self._conv(uid, cid)
+        png = ws.write_bytes(uid, "media/x_p1.png", b"\x89PNG\r\n\x1a\n" + b"0" * 200)
+
+        class Res:
+            meta = {"pages": [1]}
+            images = [{"path": png, "mime": "image/png"}]
+            content = "Rendered 1 page as an image."
+
+        meta = orch._tool_row_meta("pdf_read", Res(), "call_9")
+        self.assertEqual(meta["images"], [{"path": png, "mime": "image/png"}])
+        self.assertNotIn("base64", json.dumps(meta), "DB meta must hold paths, not pixels")
+
+        orch.append_message(cid, "assistant", "", meta=json.dumps({"tool_calls": [
+            {"id": "call_9", "type": "function",
+             "function": {"name": "pdf_read", "arguments": "{}"}}]}))
+        orch.append_message(cid, "tool", Res.content, meta=json.dumps(meta))
+        msgs = orch.build_messages(cid, uid)
+        roles = [m["role"] for m in msgs]
+        self.assertEqual(roles[-1], "user", "images must follow the tool message")
+        parts = msgs[-1]["content"]
+        self.assertIsInstance(parts, list)
+        self.assertEqual([p["type"] for p in parts][0], "text")
+        self.assertEqual([p["type"] for p in parts][1], "image_url")
+        self.assertTrue(parts[1]["image_url"]["url"].startswith("data:image/png;base64,"))
+        # The tool message itself stays plain text (option B: no multimodal tool role).
+        tool_msg = next(m for m in msgs if m["role"] == "tool")
+        self.assertIsInstance(tool_msg["content"], str)
+
+    def test_image_parts_survive_missing_files_and_no_conversation(self):
+        from hearth import orchestrator as orch
+        self.assertEqual(orch._image_parts("nobody", [{"path": "nope.png"}]), [])
+        self.assertEqual(orch._image_parts("u", []), [])
+        self.assertEqual(orch._image_parts("u", [{}]), [])
+
+    def test_stub_never_leaks_base64_from_media_messages(self):
+        # The stub flattens content lists; a media tool's data URLs must become
+        # '[image]' rather than being counted or keyword-matched as text.
+        from hearth.llm.stub import _flatten_content
+        parts = [{"type": "text", "text": "look"},
+                 {"type": "image_url", "image_url": {"url": "data:image/png;base64," + "A" * 5000}}]
+        flat = _flatten_content(parts)
+        self.assertIn("[image]", flat)
+        self.assertNotIn("base64", flat)
+
+    def test_frame_and_page_limits_are_bounded(self):
+        # Unbounded sampling would blow the context window in one call.
+        from hearth.tools import TOOLS_BY_NAME
+        self.assertLessEqual(TOOLS_BY_NAME["view_video"].DEFAULT_FRAMES, 8)
+        self.assertLessEqual(TOOLS_BY_NAME["view_video"].MAX_FRAMES, 16)
+        self.assertLessEqual(TOOLS_BY_NAME["pdf_read"].MAX_PAGES, 8)
+
+    def test_view_video_audio_window_derivation(self):
+        """DEC-064: the audio span is the sampled span — no separate audio range exists."""
+        from hearth.tools import TOOLS_BY_NAME
+        T = TOOLS_BY_NAME["view_video"]
+        frames = [(23.75, b""), (31.25, b""), (46.25, b"")]
+        # start_time/end_time drive it when given...
+        self.assertEqual(T._audio_window({"start_time": 20, "end_time": 50}, frames, 600.0),
+                         (20.0, 50.0))
+        # ...and without them it is first-to-last sampled frame, so looking at three moments
+        # never captions the whole film between them.
+        self.assertEqual(T._audio_window({}, frames, 600.0), (23.75, 46.25))
+        # One timestamp alone would be a zero-length span; give it a second of substance.
+        self.assertEqual(T._audio_window({}, [(7.0, b"")], 600.0), (7.0, 8.0))
+        # end_time omitted falls back to the runtime; junk gives no window rather than guessing.
+        self.assertEqual(T._audio_window({"start_time": 10}, [], 600.0), (10.0, 600.0))
+        self.assertIsNone(T._audio_window({"start_time": "x"}, frames, 600.0))
+        self.assertIsNone(T._audio_window({}, [], 0.0))
+
+    def test_view_video_audio_guidance_is_in_the_schema(self):
+        """The 2-minute rule must be stated where the model reads it (DEC-064)."""
+        from hearth.tools import TOOLS_BY_NAME
+        T = TOOLS_BY_NAME["view_video"]
+        desc = T.description + " " + str(T.parameters()["properties"]["with_audio"])
+        for needle in ("with_audio", "2 minutes", "gist"):
+            self.assertIn(needle, desc, f"schema/description should mention {needle!r}")
+        # The enforced ceiling matches the one advertised.
+        self.assertEqual(int(T.AUDIO_WINDOW_LIMIT_S), 120)
+
+    def test_view_video_refuses_audio_over_the_limit_but_keeps_frames(self):
+        """A long span must not silently buy N captioner calls; frames are still delivered."""
+        from hearth.tools import TOOLS_BY_NAME, media_tools as mt
+        T = TOOLS_BY_NAME["view_video"]
+
+        async def no_call(**kw):  # pragma: no cover - must not run
+            raise AssertionError("captioner must not be called for an over-limit span")
+
+        from hearth import captioner as cap
+        orig_preflight, orig_describe = cap.preflight, cap.describe_file
+        cap.preflight = lambda s: ""
+        cap.describe_file = no_call
+        self.addCleanup(setattr, cap, "preflight", orig_preflight)
+        self.addCleanup(setattr, cap, "describe_file", orig_describe)
+
+        seen = {}
+
+        def fake_extract(*a, **k):
+            # Synchronous, like the real extract_frames_even — an async fake would hand the
+            # tool a coroutine where it expects a list of frames.
+            return [(10.0, b"\x89PNG"), (200.0, b"\x89PNG")]
+
+        orig_even = mt.mr.extract_frames_even
+        mt.mr.extract_frames_even = fake_extract
+        self.addCleanup(setattr, mt.mr, "extract_frames_even", orig_even)
+
+        class Ctx:
+            user_id = "u-limit"
+            conversation_id = "c"
+
+            def settings(self):
+                return {"captioner.enabled": True}
+
+            def setting(self, k, default=None):
+                return default
+
+            def report_progress(self, **ev):
+                pass
+
+            def cancel_event(self):
+                return None
+
+        import hearth.workspaces as ws_mod
+        orig_store = mt._store_images
+        mt._store_images = lambda ctx, blobs, subdir: [{"path": f"media/{subdir}/f{i}.png",
+                                                        "mime": "image/png"}
+                                                       for i, _ in enumerate(blobs)]
+        self.addCleanup(setattr, mt, "_store_images", orig_store)
+        orig_info = mt.mr.video_info
+        mt.mr.video_info = lambda p: {"duration_s": 600.0, "fps": 25.0, "frames": 15000,
+                                      "width": 640, "height": 360, "codec": "h264",
+                                      "size_bytes": 1000, "audio_streams": 1}
+        self.addCleanup(setattr, mt.mr, "video_info", orig_info)
+        orig_jail = ws_mod.resolve_in_jail
+        ws_mod.resolve_in_jail = lambda uid, rel, allow_missing=True: Path("/nonexistent.mp4")
+        self.addCleanup(setattr, ws_mod, "resolve_in_jail", orig_jail)
+
+        res = asyncio.run(T.run({"path": "clip.mp4", "with_audio": True}, Ctx()))
+        self.assertTrue(res.ok, "frames must still be delivered when audio is refused")
+        self.assertIn("over the 120s limit", res.content)
+        self.assertIn("describe_audio", res.content, "should point at the affordable alternative")
+        self.assertFalse(res.meta["audio_described"])
+
+    def test_render_backends_report_honestly(self):
+        from hearth.tools import media_render as mr
+        caps = mr.capabilities()
+        for key in ("pymupdf", "pdftoppm", "gs", "mutool", "ffmpeg", "ffprobe", "opencv"):
+            self.assertIn(key, caps)
+        line = mr.capabilities_line()
+        self.assertTrue(line.startswith("render backends available: "))
+
+    def test_pdf_render_roundtrip_when_backend_available(self):
+        from hearth.tools import media_render as mr
+        if not (mr._pymupdf() or mr.have("pdftoppm") or mr.have("gs") or mr.have("mutool")):
+            self.skipTest("no PDF rendering backend on this machine")
+        # A minimal valid one-page PDF, written by hand so no PDF library is needed.
+        pdf = (b"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
+               b"2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n"
+               b"3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 240 320]>>endobj\n"
+               b"trailer<</Root 1 0 R>>\n%%EOF\n")
+        pages = mr.render_pdf_bytes(pdf, [0], dpi=60)
+        self.assertIn(0, pages)
+        self.assertEqual(pages[0][:4], b"\x89PNG", "rendered page must be a PNG")
+
+    def test_pdf_info_error_is_actionable(self):
+        from hearth.tools import media_render as mr
+        with self.assertRaises(mr.MediaError):
+            mr.pdf_info_bytes(b"not a pdf at all")
+        with self.assertRaises(mr.MediaError):
+            mr.pdf_info_bytes(b"")
+
+    def test_even_sampling_timestamps_are_ordered_and_clamped(self):
+        from hearth.tools import media_render as mr
+        # Pure maths used for spacing: fmt_time must round the total, not the remainder.
+        self.assertEqual(mr.fmt_time(0), "0:00")
+        self.assertEqual(mr.fmt_time(65), "1:05")
+        self.assertEqual(mr.fmt_time(3599.6), "60:00")
+        self.assertEqual(mr.fmt_time(None), "?")
+        self.assertEqual(mr._parse_rate("25/1"), 25.0)
+        self.assertEqual(mr._parse_rate("0/0"), 0.0)
+        self.assertEqual(mr._parse_rate("N/A"), 0.0)
+
+    def test_context_usage_tool_reports_absolute_and_percent(self):
+        import asyncio
+        from hearth.tools import TOOLS_BY_NAME, ToolContext
+        uid, cid = "media-ctx", "media-ctx-conv"
+        self._conv(uid, cid)
+        ctx = ToolContext(uid, {"model.n_ctx": 10_000}, {}, conversation_id=cid)
+        res = asyncio.run(TOOLS_BY_NAME["context_usage"].run({}, ctx))
+        self.assertTrue(res.ok)
+        self.assertIn("context used", res.content)
+        self.assertIn("remaining", res.content)
+        self.assertEqual(res.meta["n_ctx"], 10_000)
+        self.assertIsInstance(res.meta["pct"], float)
+        self.assertLessEqual(res.meta["pct"], 1.0)
+
+    def test_media_paths_are_jailed(self):
+        # Absolute/traversal paths must be refused before any renderer runs.
+        import asyncio
+        from hearth.tools import TOOLS_BY_NAME, ToolContext
+        ctx = ToolContext("media-jailed", {}, {}, conversation_id="")
+        for name in ("pdf_info", "pdf_read", "video_info", "view_video"):
+            res = asyncio.run(TOOLS_BY_NAME[name].run({"path": "/etc/passwd"}, ctx))
+            self.assertFalse(res.ok, f"{name} accepted an absolute path")
+            self.assertIn("refused", res.content)
+
+
+class OutputGuardTests(unittest.TestCase):
+    """The per-tool-result character budget (Admin → Agent)."""
+
+    def _make_conv(self, conv_id: str, user_id: str = "u") -> None:
+        """Create the user + conversation a turn needs (FK on Message.conversation_id)."""
+        from hearth.db import init_db, session_scope
+        from hearth.models import Conversation, User
+        init_db()
+        with session_scope() as s:
+            if s.get(User, user_id) is None:
+                s.add(User(id=user_id, username=f"user-{user_id}", pw_hash="x"))
+            if s.get(Conversation, conv_id) is None:
+                s.add(Conversation(id=conv_id, user_id=user_id, title="test"))
+
+    def test_guard_clips_and_announces_the_loss(self):
+        from hearth import output_guard as og
+        text = "x" * 5000
+        clipped, was = og.guard_text(text, 1000, "fs_read")
+        self.assertTrue(was)
+        self.assertIn(og.GUARD_MARKER, clipped)
+        self.assertIn("1,000", clipped)
+        self.assertIn("5,000", clipped)
+        self.assertIn("fs_read", clipped)
+        # The head must be untouched (a truncated file read still starts at the top),
+        # and the marker is what tells the model the rest is missing.
+        self.assertEqual(clipped[:1000], text[:1000])
+        self.assertTrue(clipped[1000:].lstrip().startswith(og.GUARD_MARKER))
+
+    def test_guard_is_idempotent_and_leaves_short_text_alone(self):
+        from hearth import output_guard as og
+        short, was = og.guard_text("hello", 1000)
+        self.assertFalse(was)
+        self.assertEqual(short, "hello")
+        # Guarding twice must not stack markers or shrink the budget again: a guarded
+        # result passes back through this seam on every re-send of the history.
+        once, _ = og.guard_text("y" * 5000, 1000)
+        twice, was2 = og.guard_text(once, 1000)
+        self.assertFalse(was2)
+        self.assertEqual(twice, once)
+        self.assertEqual(twice.count(og.GUARD_MARKER), 1)
+
+    def test_multimodal_content_is_never_sliced(self):
+        from hearth import output_guard as og
+        parts = [{"type": "text", "text": "hi"},
+                 {"type": "image_url", "image_url": {"url": "data:image/png;base64," + "A" * 99999}}]
+        out, was = og.guard_message_content(parts, {"enabled": True, "max_chars": 200})
+        # A part list is not a string: slicing it would corrupt the base64 payload and
+        # hand the model a broken image. Returned untouched, identity preserved.
+        self.assertFalse(was)
+        self.assertIs(out, parts)
+
+    def test_policy_coercion_never_produces_a_zero_cap(self):
+        from hearth import output_guard as og
+        for bad in ({"max_chars": 0}, {"max_chars": 5}, {"max_chars": "abc"}, {}):
+            p = og.normalize_policy(bad)
+            # A zero/tiny cap would silently blank every tool result: the model would see
+            # nothing and the failure would look like a broken tool, not a bad setting.
+            self.assertGreaterEqual(p["max_chars"], og.MIN_MAX_CHARS, f"policy {bad} too small")
+            self.assertFalse(og.normalize_policy({"enabled": "false"})["enabled"])
+            self.assertTrue(og.normalize_policy({"enabled": "true"})["enabled"])
+            p = og.normalize_policy({"exempt_tools": "fs_read, exec ,"})
+            self.assertEqual(p["exempt_tools"], ["exec", "fs_read"])
+            self.assertFalse(og.applies({"enabled": True, "exempt_tools": "fs_read"}, "fs_read"))
+            self.assertTrue(og.applies({"enabled": True, "exempt_tools": "fs_read"}, "exec"))
+
+    def test_tool_result_guard_returns_new_object_only_on_clip(self):
+        import asyncio  # noqa: F401  (kept for parity with sibling tests)
+        from hearth import output_guard as og
+        from hearth.tools.base import ToolResult
+        small = ToolResult(True, "short", meta={"download": "tok"})
+        same, was = og.guard_tool_result(small, {"max_chars": 1000}, "fs_read")
+        # Identity on the unchanged path: downstream code compares results by object.
+        self.assertFalse(was)
+        self.assertIs(same, small)
+        big = ToolResult(True, "z" * 5000, meta={"download": "tok"})
+        guarded, was = og.guard_tool_result(big, {"max_chars": 1000}, "fs_read")
+        self.assertTrue(was)
+        self.assertIsNot(guarded, big)
+        self.assertTrue(guarded.ok)
+        # The download token must survive the clip or the artifact link disappears.
+        self.assertEqual(guarded.meta, {"download": "tok"})
+
+    def test_orchestrator_applies_the_guard_to_a_tool_result(self):
+        import asyncio
+        from hearth import orchestrator as orch
+        from hearth import output_guard as og
+        from hearth.tools import ToolContext
+        from hearth.tools.base import ToolResult, Tool
+
+        class BigTool(Tool):
+            name = "fs_read"
+            description = "test double"
+            enable_key = "tools.fs_read"
+
+            def parameters(self) -> dict:
+                return {"type": "object", "properties": {}, "required": []}
+
+            async def run(self, args, ctx):
+                return ToolResult(True, "Q" * 60000)
+
+        conv = "guard-conv"
+        self._make_conv(conv)
+        # The seam lives in orchestrator._run_tool, so the guard is proven through the real
+        # call path rather than by calling output_guard directly.
+        _o = orch
+        orig = dict(_o.TOOLS_BY_NAME)
+        _o.TOOLS_BY_NAME["fs_read"] = BigTool()
+        try:
+            ctx = ToolContext("u", {"agent.tool_output_guard": True,
+                                    "agent.tool_output_max_chars": 2000})
+            req = _o._mk_request(BigTool(), {}, "c1")
+            res = asyncio.run(_o._run_tool(req, ctx))
+            self.assertLess(len(res.content), 4000)
+            self.assertIn(og.GUARD_MARKER, res.content)
+            # Off means off: full text, no marker.
+            ctx_off = ToolContext("u", {"agent.tool_output_guard": False})
+            res_off = asyncio.run(_o._run_tool(req, ctx_off))
+            self.assertNotIn(og.GUARD_MARKER, res_off.content)
+            self.assertEqual(len(res_off.content), 60000)
+        finally:
+            _o.TOOLS_BY_NAME.clear()
+            _o.TOOLS_BY_NAME.update(orig)
+
+
+class ErrorHintTests(unittest.TestCase):
+    """Model-facing next-action advice on tool failures."""
+
+    def test_hint_keeps_message_first_and_is_idempotent(self):
+        from hearth import errors as err
+        out = err.hint('no_match', 'old_text not found')
+        self.assertTrue(out.startswith('old_text not found'),
+                        'the original message must stay first (tests and prompt prose rely on it)')
+        self.assertIn(err.HINT_PREFIX, out)
+        self.assertEqual(out.count(err.HINT_PREFIX), 1)
+        # Re-hinting an already-hinted message must not stack advice.
+        self.assertEqual(err.hint('no_match', out), out)
+
+    def test_every_hint_names_an_action(self):
+        from hearth import errors as err
+        for kind, text in err.ERROR_HINTS.items():
+            self.assertTrue(text.strip(), f"empty hint for {kind}")
+            # A hint that only restates the problem is dead weight in the prompt: it has to
+            # contain a verb the model can act on. Checked against a list rather than
+            # grammar, because the useful wording is short and specific.
+            self.assertTrue(
+                any(v in text for v in ("fs_list", "fs_read", "Re-read", "Include", "Read",
+                                        "Use", "Try", "Resend", "Do not", "do not",
+                                        "answer", "tell")),
+                f"hint for {kind} gives no next action: {text}")
+
+    def test_unknown_kind_returns_message_unchanged(self):
+        from hearth import errors as err
+        self.assertEqual(err.hint('no_such_kind', 'boom'), 'boom')
+
+    def test_fs_edit_and_read_failures_carry_hints(self):
+        import asyncio
+        from hearth.tools.fs_tools import FsEditTool, FsReadTool
+        from hearth.tools import ToolContext
+        from hearth import errors as err
+        ws_mod = __import__('hearth.workspaces', fromlist=['x'])
+        ws_mod.write_text('hintuser', 'h.txt', 'alpha\nbeta\nalpha\n')
+        ctx = ToolContext('hintuser', {})
+        # Ambiguous match: the advice is to include surrounding lines, not to retry blindly.
+        multi = asyncio.run(FsEditTool().run(
+            {"path": "h.txt", "old_text": "alpha", "new_text": "x"}, ctx))
+        self.assertFalse(multi.ok)
+        self.assertIn(err.HINT_PREFIX, multi.content)
+        self.assertIn('surrounding lines', multi.content)
+        # No match at all: re-read before guessing.
+        nomatch = asyncio.run(FsEditTool().run(
+            {"path": "h.txt", "old_text": "zzz", "new_text": "x"}, ctx))
+        self.assertFalse(nomatch.ok)
+        self.assertIn('Re-read', nomatch.content)
+        # Jail escape: point at a workspace-relative path instead.
+        esc = asyncio.run(FsReadTool().run({"path": "../secret"}, ctx))
+        self.assertFalse(esc.ok)
+        self.assertIn('relative to your workspace', esc.content)
+
+
+class FeatureI18nTests(unittest.TestCase):
+    """Keys added with the reasoning / steering / prefill work must be translated."""
+
+    def test_feature_i18n_keys_have_german(self):
+        from hearth import i18n
+        want = ['chat.decode', 'chat.prefill', 'chat.left', 'chat.reasoning',
+                'chat.steer_queued', 'chat.steer_withdraw', 'chat.steer_hint',
+                'chat.listening', 'chat.caption_failed', 'chat.caption_streaming',
+                'chat.caption_failed_short']
+        de = i18n.dict_for('de')
+        en = i18n.dict_for('en')
+        # A key missing from EN renders as an empty label; missing DE shows English to a
+        # German user. Both are silent, so assert them explicitly.
+        missing_en = [k for k in want if k not in en]
+        missing_de = [k for k in want if k not in de]
+        self.assertEqual(missing_en, [], f"EN keys missing: {missing_en}")
+        self.assertEqual(missing_de, [], f"DE translations missing: {missing_de}")
+
+    def test_steering_queue_semantics(self):
+        from hearth import steering as st
+        conv = 'steer-unit-conv'
+        st.clear(conv)
+        # Whitespace is not a message: queue() reports -1 so the route can 400.
+        self.assertEqual(st.queue(conv, '   '), -1)
+        self.assertEqual(st.pending_count(conv), 0)
+        self.assertEqual(st.queue(conv, 'first thought'), 1)
+        self.assertEqual(st.queue(conv, 'second thought'), 2)
+        self.assertEqual(st.preview(conv), ['first thought', 'second thought'])
+        self.assertTrue(st.withdraw(conv, 0))
+        self.assertFalse(st.withdraw(conv, 9))       # stale index: already delivered
+        self.assertEqual(st.preview(conv), ['second thought'])
+        items = st.drain(conv)
+        self.assertEqual([i['text'] for i in items], ['second thought'])
+        self.assertEqual(st.drain(conv), [])          # drain is destructive
+        # Queues are per-conversation: one chat must never read another's steering.
+        other = 'steer-other-conv'
+        st.queue(other, 'belong elsewhere')
+        self.assertEqual(st.drain(conv), [])
+        self.assertEqual(len(st.drain(other)), 1)
+
+    def test_reasoning_retention_policies(self):
+        from hearth.routes_chat import _apply_reasoning_retention
+        rows = [{'role': 'assistant', 'content': 'answer one', 'meta': '{"reasoning":"think A"}'},
+                {'role': 'user', 'content': 'next question', 'meta': ''},
+                {'role': 'assistant', 'content': 'answer two', 'meta': '{"reasoning":"think B"}'}]
+        out = _apply_reasoning_retention([dict(r) for r in rows], 'keep_all')
+        self.assertEqual(out[0].get('reasoning'), 'think A')
+        self.assertEqual(out[2].get('reasoning'), 'think B')
+        # keep_last keeps only the newest — the one the user is still reading.
+        out = _apply_reasoning_retention([dict(r) for r in rows], 'keep_last')
+        self.assertNotIn('reasoning', out[0])
+        self.assertEqual(out[2].get('reasoning'), 'think B')
+        for pol in ('hide', 'drop'):
+            out = _apply_reasoning_retention([dict(r) for r in rows], pol)
+            self.assertTrue(all('reasoning' not in r for r in out), pol)
+        # An unknown policy must not destroy content nobody asked to lose.
+        out = _apply_reasoning_retention([dict(r) for r in rows], 'nonsense')
+        self.assertEqual(out[2]['content'], 'answer two')
+
+    def test_think_splitter_handles_tags_across_chunks(self):
+        from hearth.llm.llama_server import _ThinkSplitter
+        sp = _ThinkSplitter()
+        # Tags arrive split across SSE chunks; a per-chunk regex would miss them or leak
+        # a bare '<thi' into the answer.
+        got = (sp.feed('lead<th') + sp.feed('ink>deep thought</thi')
+               + sp.feed('nk>the answer') + sp.flush())
+        kinds = [k for k, _ in got]
+        self.assertIn('reasoning', kinds)
+        text = ''.join(t for k, t in got if k == 'token')
+        self.assertNotIn('<think>', text)
+        self.assertTrue(text.endswith('the answer'))
+
+    def test_think_splitter_unclosed_block_stays_reasoning(self):
+        from hearth.llm.llama_server import _ThinkSplitter
+        sp = _ThinkSplitter()
+        got = sp.feed('<think>started but never closed') + sp.flush()
+        # An unclosed block IS reasoning: it must not be dropped or shown as answer text.
+        self.assertIn('reasoning', [k for k, _ in got])
+        self.assertNotIn('token', [k for k, _ in got])
+
+    def test_vision_reject_detection_is_specific(self):
+        from hearth.orchestrator import _looks_like_vision_reject
+        self.assertTrue(_looks_like_vision_reject(
+            'llama-server 400: this model does not support image input'))
+        self.assertTrue(_looks_like_vision_reject('HTTP 500 — mmproj failed to load'))
+        # Must NOT match unrelated errors, or a genuine context overflow gets papered over
+        # by silently stripping the user's images.
+        self.assertFalse(_looks_like_vision_reject('400 Bad Request: n_ctx exceeded'))
+        self.assertFalse(_looks_like_vision_reject(''))
+
+    def test_output_guard_exempt_list_is_honoured_end_to_end(self):
+        import asyncio
+        from hearth import orchestrator as orch
+        from hearth.tools import ToolContext
+        from hearth.tools.base import ToolResult, Tool
+
+        class R(Tool):
+            name = "fs_read"
+            description = "d"
+            enable_key = "tools.fs_read"
+
+            def parameters(self) -> dict:
+                return {"type": "object", "properties": {}, "required": []}
+
+            async def run(self, args, ctx):
+                return ToolResult(True, "W" * 30000)
+
+        req = orch._mk_request(R(), {}, "c1")
+        orig_reg = dict(orch.TOOLS_BY_NAME)
+        orch.TOOLS_BY_NAME["fs_read"] = R()
+        try:
+            # Exempt: the full result reaches the model even though the cap is active.
+            ctx = ToolContext("u", {"agent.tool_output_guard": True,
+                                    "agent.tool_output_max_chars": 1000,
+                                    "agent.tool_output_exempt_tools": "fs_read"})
+            res = asyncio.run(orch._run_tool(req, ctx))
+            self.assertEqual(len(res.content), 30000)
+            # Not exempt: same tool, same cap, clipped.
+            ctx_on = ToolContext("u", {"agent.tool_output_guard": True,
+                                       "agent.tool_output_max_chars": 1000})
+            res_on = asyncio.run(orch._run_tool(req, ctx_on))
+            self.assertLess(len(res_on.content), 2000)
+        finally:
+            orch.TOOLS_BY_NAME.clear()
+            orch.TOOLS_BY_NAME.update(orig_reg)
+
+    def test_progress_event_eta_is_honest(self):
+        from hearth import orchestrator as orch
+        ev = orch._progress_event({'kind': 'prefill', 'n_tokens': 900,
+                                   'progress': 0.005, 'rate_tps': 700})
+        # Below 1 % llama.cpp's fraction is rounded to two decimals, so dividing a handful
+        # of tokens by a hundredth of a prompt invents a huge ETA out of noise.
+        self.assertNotIn('eta', ev.data)
+
+
+class StreamLoopReentryTests(unittest.TestCase):
+    """The idle-progress poller must not re-enter or time out the provider read.
+
+    Two bugs shared one root: `_stream_checked()` treated "only the log poll fired" as a
+    first-class outcome and retired/re-armed the provider `__anext__()` around it. An async
+    generator allows only ONE read in flight, and cancelling a read task does not unwind its
+    frame synchronously — so the next iteration re-entered a still-RUNNING generator and the
+    SSE route died with "anext(): asynchronous generator is already running". The same
+    fall-through also cut off prefill early, while a genuinely wedged stream timed out never
+    at all, because the idle deadline was recomputed per iteration and each poll restarted
+    the countdown.
+    """
+
+    def _idle(self, seconds: float) -> None:
+        from hearth.config import get_boot_settings
+        bs = get_boot_settings()
+        bs.stream_idle_timeout_s = seconds
+        bs.stream_idle_guard = True
+
+    def test_prefill_survives_many_poll_wakeups(self):
+        # A provider silent for several poll intervals (what llama-server does during
+        # prefill) must stream normally, delivering progress in between.
+        import asyncio
+        from hearth import orchestrator as orch
+        from hearth.llm.base import StreamEvent
+
+        polls = {"n": 0}
+
+        def log_src():
+            polls["n"] += 1
+            return ([{"kind": "prefill", "n_tokens": polls["n"] * 200,
+                      "progress": min(0.9, 0.1 * polls["n"]), "rate_tps": 800.0}],
+                    {"offset": 1})
+
+        class Prefill:
+            name = "llama-server"
+            async def stream(self, messages, tools, params):
+                await asyncio.sleep(orch._LOG_POLL_S * 3 + 0.2)
+                yield StreamEvent("token", text="hi")
+                yield StreamEvent("done")
+
+        self._idle(30)
+
+        async def go():
+            return [ev async for ev in orch._stream_checked(
+                Prefill(), [], [], {}, None, log_src=log_src)]
+
+        evs = asyncio.run(go())
+        kinds = [e.type for e in evs]
+        self.assertGreaterEqual(polls["n"], 2, "poller should have fired several times")
+        self.assertIn("progress", kinds, "prefill progress must reach the caller")
+        self.assertEqual(kinds[-2:], ["token", "done"],
+                         f"prefill must complete, not be cut off: {kinds}")
+        self.assertFalse([e for e in evs if e.type == "error"],
+                         "a healthy prefill must never yield an error event")
+
+    def test_wedged_stream_times_out_despite_poller(self):
+        # The mirror case: with a poller armed, a stream that NEVER produces anything must
+        # still hit the idle guard. Per-iteration deadline math made this unreachable —
+        # the poll restarted the countdown forever and a hung request hung forever.
+        import asyncio
+        import time
+        from hearth import orchestrator as orch
+
+        def log_src():
+            return [], {"offset": 1}
+
+        class Wedged:
+            name = "llama-server"
+            async def stream(self, messages, tools, params):
+                while True:
+                    await asyncio.sleep(0.05)
+                yield   # pragma: no cover - unreachable, keeps this an async generator
+
+        self._idle(1.0)
+
+        async def go():
+            out = []
+            t0 = time.monotonic()
+            agen = orch._stream_checked(Wedged(), [], [], {}, None, log_src=log_src)
+            async for ev in agen:
+                out.append(ev.type)
+                if len(out) > 200:      # a runaway poll loop must not spin forever
+                    break
+            return out, time.monotonic() - t0
+
+        kinds, elapsed = asyncio.run(go())
+        self.assertEqual(kinds[-2:], ["error", "done"],
+                         f"expected timeout error+done, got {kinds}")
+        self.assertLess(elapsed, 5.0,
+                        f"idle guard did not fire (took {elapsed:.1f}s of polling)")
+
+    def test_abort_and_disconnect_close_the_stream_quietly(self):
+        # Both unwind paths must release the provider generator without surfacing
+        # "already running" — the abort path leaves the read pending for aclose() to
+        # drive out, the disconnect path runs `finally` while a read owns the frame.
+        import asyncio
+        from hearth import orchestrator as orch
+        from hearth import cancel as cancel_mod
+        from hearth.llm.base import StreamEvent
+
+        self._idle(30)
+
+        class Blocks:
+            name = "llama-server"
+            async def stream(self, messages, tools, params):
+                await asyncio.sleep(30)
+                yield StreamEvent("token", text="never")
+
+        def log_src():
+            return [], {"offset": 1}
+
+        async def abort_case():
+            h = cancel_mod.begin("reentry-abort", "u")
+            try:
+                agen = orch._stream_checked(Blocks(), [], [], {}, h, log_src=log_src)
+                task = asyncio.ensure_future(agen.__aiter__().__anext__())
+                await asyncio.sleep(0.05)
+                h.cancel()
+                try:
+                    await asyncio.wait_for(task, timeout=5)
+                except (asyncio.CancelledError, StopAsyncIteration, orch.TurnAborted):
+                    pass
+            finally:
+                cancel_mod.end("reentry-abort", h)
+
+        async def disconnect_case():
+            agen = orch._stream_checked(Blocks(), [], [], {}, None, log_src=log_src)
+            it = agen.__aiter__()
+            task = asyncio.ensure_future(it.__anext__())
+            await asyncio.sleep(0.05)
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, StopAsyncIteration):
+                pass
+
+        for label, coro in (("abort", abort_case), ("disconnect", disconnect_case)):
+            try:
+                asyncio.run(coro())
+            except RuntimeError as e:
+                self.fail(f"{label}: teardown must not surface 'already running': {e}")
+            except (asyncio.CancelledError, StopAsyncIteration):
+                pass
+
+
+class CaptionerTests(unittest.TestCase):
+    """The audio captioner: config resolution, argv building, chunking, refusal paths.
+
+    No real model is ever launched — these check that Hearth builds the right command and
+    refuses clearly when something is missing, which is where an operator actually needs
+    help. Network/ffmpeg work is exercised only through fakes or absent-binary paths.
+    """
+
+    def _settings(self, **over):
+        from hearth import runtime_settings as rs
+        base = {s.key: s.default for s in rs.ALL_SPECS}
+        base.update({"captioner.enabled": True, "captioner.auto_route": True})
+        base.update(over)
+        return base
+
+    def test_defaults_are_off_and_cpu_first(self):
+        from hearth import runtime_settings as rs
+        specs = {s.key: s for s in rs.CAPTIONER_SPECS}
+        # Off until an admin supplies paths: a second model must never start by surprise.
+        self.assertIs(specs["captioner.enabled"].default, False)
+        # MoE-friendly default: CPU-only offload, its own port, modest context.
+        self.assertEqual(specs["captioner.n_gpu_layers"].default, "0")
+        self.assertEqual(specs["captioner.port"].default, 8091)
+        self.assertLess(specs["captioner.n_ctx"].default, 32768)
+
+    def test_ngl_normalisation_never_passes_the_word_auto(self):
+        # llama.cpp parses the literal "auto" as -2 and silently degrades to CPU tensor
+        # overrides; 'all' must become -1. Same rule as manager.build_argv.
+        from hearth import captioner as cap
+        self.assertEqual(cap._ngl_value({"captioner.n_gpu_layers": "auto"}), "")
+        self.assertEqual(cap._ngl_value({"captioner.n_gpu_layers": "all"}), "-1")
+        self.assertEqual(cap._ngl_value({"captioner.n_gpu_layers": "0"}), "0")
+        self.assertEqual(cap._ngl_value({"captioner.n_gpu_layers": "18"}), "18")
+        self.assertEqual(cap._ngl_value({"captioner.n_gpu_layers": "nonsense"}), "0")
+
+    def test_build_argv_cpu_default_and_flags(self):
+        from hearth import captioner as cap
+        with tempfile.TemporaryDirectory() as d:
+            model = os.path.join(d, "omni.gguf")
+            open(model, "wb").write(b"x")
+            s = self._settings(**{"captioner.model_path": model,
+                                  "captioner.server_bin": sys.executable})
+            argv = cap.build_argv(s)
+        self.assertEqual(argv[0], sys.executable)
+        self.assertIn("--model", argv)
+        self.assertIn("--n-gpu-layers", argv)
+        self.assertEqual(argv[argv.index("--n-gpu-layers") + 1], "0")
+        # Loopback only, on its own port, one slot (captioning is serialised anyway).
+        self.assertIn("--host", argv)
+        self.assertEqual(argv[argv.index("--host") + 1], "127.0.0.1")
+        self.assertEqual(argv[argv.index("--parallel") + 1], "1")
+        self.assertNotIn("auto", argv)
+
+    def test_build_argv_refuses_missing_paths_with_actionable_text(self):
+        from hearth import captioner as cap
+        with self.assertRaises(cap.CaptionError) as cm:
+            cap.build_argv(self._settings(**{"captioner.model_path": "",
+                                             "captioner.server_bin": sys.executable}))
+        self.assertIn("model", str(cm.exception).lower())
+        with tempfile.TemporaryDirectory() as d:
+            missing = os.path.join(d, "nope.gguf")
+            with self.assertRaises(cap.CaptionError) as cm2:
+                cap.build_argv(self._settings(**{"captioner.model_path": missing,
+                                                 "captioner.server_bin": sys.executable}))
+        self.assertIn("not found", str(cm2.exception))
+        with tempfile.TemporaryDirectory() as d:
+            model = os.path.join(d, "omni.gguf")
+            open(model, "wb").write(b"x")
+            with self.assertRaises(cap.CaptionError) as cm3:
+                cap.build_argv(self._settings(**{"captioner.model_path": model,
+                                                 "captioner.server_bin": "/no/such/llama-server"}))
+        self.assertIn("binary", str(cm3.exception).lower())
+
+    def test_bad_extra_args_are_refused_not_guessed(self):
+        from hearth import captioner as cap
+        with tempfile.TemporaryDirectory() as d:
+            model = os.path.join(d, "omni.gguf")
+            open(model, "wb").write(b"x")
+            s = self._settings(**{"captioner.model_path": model,
+                                  "captioner.server_bin": sys.executable,
+                                  "captioner.extra_args": "--unbalanced-quote \""})
+            with self.assertRaises(cap.CaptionError):
+                cap.build_argv(s)
+
+    def test_is_audio_by_extension_and_mime(self):
+        from hearth import captioner as cap
+        for name in ("a.wav", "b.MP3", "c.flac", "d.opus", "e.m4a", "f.webm"):
+            self.assertTrue(cap.is_audio(name), name)
+        self.assertTrue(cap.is_audio("voice-note", mime="audio/ogg"))
+        for name in ("notes.md", "photo.png", "archive.zip", ""):
+            self.assertFalse(cap.is_audio(name), name)
+
+    def test_route_candidate_requires_enabled_and_auto(self):
+        from hearth import captioner as cap
+        self.assertTrue(cap.route_candidate(self._settings(), "x.mp3"))
+        off = self._settings(**{"captioner.enabled": False})
+        self.assertFalse(cap.route_candidate(off, "x.mp3"))
+        manual = self._settings(**{"captioner.auto_route": False})
+        self.assertFalse(cap.route_candidate(manual, "x.mp3"))
+        self.assertFalse(cap.route_candidate(self._settings(), "notes.txt"))
+
+    def test_preflight_names_the_missing_thing(self):
+        from hearth import captioner as cap
+        s = self._settings(**{"captioner.enabled": False})
+        self.assertIn("disabled", cap.preflight(s))
+        s = self._settings(**{"captioner.model_path": ""})
+        self.assertIn("model path", cap.preflight(s))
+        # CLI backend needs both a cli binary and a projector — with a REAL model file so
+        # the (correctly) higher-priority model check does not mask these.
+        with tempfile.TemporaryDirectory() as d:
+            model = os.path.join(d, "omni.gguf")
+            open(model, "wb").write(b"x")
+            s = self._settings(**{"captioner.backend": "cli",
+                                  "captioner.model_path": model,
+                                  "captioner.cli_bin": "/definitely/not/here"})
+            self.assertIn("mtmd", cap.preflight(s).lower())
+            s = self._settings(**{"captioner.backend": "cli",
+                                  "captioner.model_path": model,
+                                  "captioner.cli_bin": sys.executable,
+                                  "captioner.mmproj_path": ""})
+            self.assertIn("mmproj", cap.preflight(s))
+
+    def test_prepare_chunks_without_ffmpeg_passes_file_through(self):
+        from hearth import captioner as cap
+        with tempfile.TemporaryDirectory() as d:
+            if cap.have("ffmpeg"):
+                self.skipTest("ffmpeg is installed here; passthrough path not reachable")
+            src = os.path.join(d, "input.wav")
+            with open(src, "wb") as fh:
+                fh.write(b"RIFF....WAVEfmt ")
+            logs = []
+            chunks = cap.prepare_chunks(src, d, resample=True, chunk_seconds=30,
+                                        log=logs.append)
+            self.assertEqual(chunks, [(src, 0.0)])
+            self.assertTrue(any("ffmpeg" in m for m in logs))
+
+    def test_chunk_offsets_are_labelled_per_chunk(self):
+        from hearth import captioner as cap
+        # The clamp floor is 5 s, so the test audio must be comfortably longer than that or
+        # ffmpeg produces a single segment and there is nothing to assert about offsets.
+        with tempfile.TemporaryDirectory() as d:
+            if not cap.have("ffmpeg"):
+                self.skipTest("ffmpeg needed to produce real chunks")
+            src = self._real_wav(d, seconds=13.0)
+            chunks = cap.prepare_chunks(src, d, resample=True, chunk_seconds=5)
+            self.assertGreater(len(chunks), 2, f"expected ~3 chunks, got {chunks}")
+            offsets = [c[1] for c in chunks]
+            self.assertEqual(offsets, [0.0, 5.0, 10.0])
+
+    def test_window_cut_extracts_only_that_span(self):
+        """DEC-064: a window must yield ONLY that part of the file, not the whole thing.
+
+        Verified acoustically rather than by reading argv: a 12 s clip whose tone changes
+        pitch at t=6 proves whether ffmpeg really cut, because describing the wrong half
+        would still 'work' as far as the code is concerned and silently feed the model audio
+        from a moment it never asked about.
+        """
+        from hearth import captioner as cap
+        import struct
+        with tempfile.TemporaryDirectory() as d:
+            if not cap.have("ffmpeg"):
+                self.skipTest("ffmpeg needed to cut a time window")
+            src = os.path.join(d, "two_tones.mp4")
+            subprocess.run(["ffmpeg", "-y", "-v", "error",
+                            "-f", "lavfi", "-i", "sine=frequency=220:duration=6",
+                            "-f", "lavfi", "-i", "sine=frequency=1760:duration=6",
+                            "-filter_complex", "[0:a][1:a]concat=n=2:v=0:a=1[a]",
+                            "-map", "[a]", "-c:a", "aac", src], check=True)
+
+            # Read the chunk bytes BEFORE their temporary directory is torn down, or the
+            # assertion measures a file that no longer exists. Returns [(offset_s, pcm_bytes)].
+            def measure(**kw):
+                with tempfile.TemporaryDirectory() as t:
+                    ch = cap.prepare_chunks(src, t, resample=True, chunk_seconds=30, **kw)
+                    out = []
+                    for path, offset in ch:
+                        with open(path, "rb") as fh:
+                            out.append((offset, fh.read()))
+                    return out
+
+            def approx_hz(data):
+                """Zero-crossing rate of 16 kHz mono PCM16 — a pitch proxy needing no library.
+
+                220 Hz and 1760 Hz are far enough apart that any reasonable threshold tells
+                them apart; the point is WHICH half of the clip survived the cut, not an
+                exact frequency.
+                """
+                raw = data[44:]                     # skip the WAV header ffmpeg wrote
+                n = len(raw) // 2
+                if n < 200:
+                    return 0.0
+                prev, cross = 0, 0
+                for i in range(0, (n - 1) * 2, 2):
+                    v = struct.unpack_from("<h", raw, i)[0]
+                    if (v >= 0) != (prev >= 0):
+                        cross += 1
+                    prev = v
+                return (cross / 2.0) / (n / 16000.0)
+
+            late = measure(window=(7.0, 12.0))
+            self.assertEqual(len(late), 1)
+            # Offset stays ABSOLUTE so caption labels quote real timestamps of the clip.
+            self.assertAlmostEqual(late[0][0], 7.0, delta=0.6)
+            self.assertGreater(approx_hz(late[0][1]), 900, "window should hold only the high tone")
+
+            early = measure(window=(0.0, 3.0))
+            self.assertLess(approx_hz(early[0][1]), 900, "window should hold only the low tone")
+
+    def test_window_needs_ffmpeg_rather_than_describing_whole_file(self):
+        """Without ffmpeg a window cannot be honoured — refuse instead of captioning everything."""
+        from hearth import captioner as cap
+        orig = cap.shutil.which
+        cap.shutil.which = lambda name: None
+        self.addCleanup(setattr, cap.shutil, "which", orig)
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "a.wav")
+            with open(src, "wb") as fh:
+                fh.write(b"RIFF....WAVEfmt ")
+            with self.assertRaises(cap.CaptionError):
+                cap.prepare_chunks(src, d, resample=True, chunk_seconds=30, window=(5.0, 9.0))
+
+    def test_window_chunk_offsets_stay_absolute(self):
+        """Chunk labels inside a window count from the WINDOW start, not from zero."""
+        from hearth import captioner as cap
+        with tempfile.TemporaryDirectory() as d:
+            if not cap.have("ffmpeg"):
+                self.skipTest("ffmpeg needed to produce real chunks")
+            src = self._real_wav(d, seconds=30.0)
+            chunks = cap.prepare_chunks(src, d, resample=True, chunk_seconds=5,
+                                        window=(10.0, 25.0))
+            offsets = [c[1] for c in chunks]
+            self.assertEqual(offsets[0], 10.0)
+            self.assertTrue(all(o >= 10.0 for o in offsets), offsets)
+
+    def test_chunk_clamp_floor_and_off(self):
+        # Sub-5-second chunks shred audio into pieces too short to describe; 0 means "don't
+        # split". Both are admin-facing values, so the clamping is deliberate and tested.
+        from hearth import captioner as cap
+        self.assertEqual(cap._clamp_chunk(1), 5)
+        self.assertEqual(cap._clamp_chunk(0), 0)
+        self.assertEqual(cap._clamp_chunk(None), 0)
+        self.assertEqual(cap._clamp_chunk("junk"), 0)
+        self.assertEqual(cap._clamp_chunk(30), 30)
+        self.assertEqual(cap._clamp_chunk(100000), cap._MAX_CHUNK_SECONDS)
+
+    def test_fmt_time(self):
+        from hearth import captioner as cap
+        self.assertEqual(cap.fmt_time(0), "0:00")
+        self.assertEqual(cap.fmt_time(90), "1:30")
+        self.assertEqual(cap.fmt_time(None), "?")
+
+    def test_caption_sync_refuses_when_disabled(self):
+        from hearth import captioner as cap
+        c = cap.Captioner()
+        with self.assertRaises(cap.CaptionError) as cm:
+            c.caption_sync("/tmp/whatever.wav", self._settings(**{"captioner.enabled": False}))
+        self.assertIn("disabled", str(cm.exception))
+
+    def test_cli_backend_reports_missing_binary_clearly(self):
+        from hearth import captioner as cap
+        with tempfile.TemporaryDirectory() as d:
+            model = os.path.join(d, "omni.gguf")
+            open(model, "wb").write(b"x")
+            wav = self._real_wav(d)
+            c = cap.Captioner()
+            s = self._settings(**{"captioner.backend": "cli",
+                                  "captioner.model_path": model,
+                                  "captioner.cli_bin": "/definitely/not/llama-mtmd-cli",
+                                  "captioner.chunk_seconds": 0})
+            with self.assertRaises(cap.CaptionError) as cm:
+                c.caption_sync(wav, s)
+        self.assertIn("mtmd", str(cm.exception).lower())
+
+    def test_cli_backend_needs_mmproj(self):
+        from hearth import captioner as cap
+        with tempfile.TemporaryDirectory() as d:
+            model = os.path.join(d, "omni.gguf")
+            open(model, "wb").write(b"x")
+            wav = self._real_wav(d)
+            c = cap.Captioner()
+            # `env` exists as a stand-in CLI, so the projector check is what must fire.
+            s = self._settings(**{"captioner.backend": "cli",
+                                  "captioner.model_path": model,
+                                  "captioner.cli_bin": "/usr/bin/env",
+                                  "captioner.mmproj_path": "",
+                                  "captioner.chunk_seconds": 0})
+            with self.assertRaises(cap.CaptionError) as cm:
+                c.caption_sync(wav, s)
+        self.assertIn("mmproj", str(cm.exception))
+
+    def _real_wav(self, d: str, seconds: float = 3.0, rate: int = 16000) -> str:
+        """A genuine PCM wav (sine tone) — ffmpeg and real models both accept it, whereas a
+        file of fake bytes is refused before any interesting code path runs."""
+        import math
+        import struct as _struct
+        import wave as _wave
+        path = os.path.join(d, "tone.wav")
+        with _wave.open(path, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(rate)
+            n = int(rate * seconds)
+            for i in range(n):
+                wf.writeframes(_struct.pack("<h", int(8000 * math.sin(2 * math.pi * 440 * i / rate))))
+        return path
+
+    def test_status_never_raises_and_reports_both_models_fields(self):
+        from hearth import captioner as cap
+        import asyncio
+        c = cap.Captioner()
+        st = asyncio.run(c.status(self._settings(**{"captioner.model_path": "",
+                                                    "captioner.server_bin": ""})))
+        self.assertEqual(st["kind"], "captioner")
+        self.assertIn("reachable", st)
+        self.assertIn("capabilities", st)
+        self.assertFalse(st["configured"])
+
+    def test_caption_cache_is_scoped_per_user_and_conversation(self):
+        # One family member's recording must never be quoted into another's context.
+        from hearth import orchestrator as orch
+        orch._remember_caption("alice", "c1", "uploads/a.mp3", "two speakers")
+        self.assertEqual(orch.get_caption("alice", "c1", "uploads/a.mp3"), "two speakers")
+        self.assertEqual(orch.get_caption("bob", "c1", "uploads/a.mp3"), "")
+        self.assertEqual(orch.get_caption("alice", "c2", "uploads/a.mp3"), "")
+
+    def test_prepare_captions_disabled_still_informs_the_model(self):
+        import asyncio
+        from hearth import orchestrator as orch
+        att = [{"name": "voice.mp3", "mime": "audio/mpeg", "rel_path": "uploads/voice.mp3"}]
+        out = asyncio.run(orch.prepare_captions("u1", "conv-off", att,
+                                                self._settings(**{"captioner.enabled": False})))
+        self.assertIn("uploads/voice.mp3", out)
+        self.assertIn("NOT analysed", out["uploads/voice.mp3"])
+        # And the reason is not cached, so switching it on takes effect immediately.
+        self.assertEqual(orch.get_caption("u1", "conv-off", "uploads/voice.mp3"), "")
+
+    def test_prepare_captions_ignores_non_audio(self):
+        import asyncio
+        from hearth import orchestrator as orch
+        att = [{"name": "notes.md", "mime": "text/markdown", "rel_path": "notes.md"}]
+        out = asyncio.run(orch.prepare_captions("u1", "conv-na", att, self._settings()))
+        self.assertEqual(out, {})
+
+    def test_attachment_content_inserts_caption_text_for_audio(self):
+        from hearth import orchestrator as orch
+        att = [{"name": "voice.mp3", "mime": "audio/mpeg", "rel_path": "uploads/voice.mp3"}]
+        caps = {"uploads/voice.mp3": "CAPTIONED"}
+        # With only an audio attachment and no image, content stays a plain string — the
+        # caption is folded into it (multimodal lists are for pixels the model can see).
+        content = orch._attachment_content("u1", att, "what is this?", caps)
+        self.assertIsInstance(content, str)
+        self.assertIn("CAPTIONED", content)
+        self.assertIn("what is this?", content)
+        # An image alongside still produces multimodal parts, plus the audio caption.
+        uid = "capattuser"
+        from hearth import workspaces as ws
+        ws.root_for(uid).mkdir(parents=True, exist_ok=True)
+        ws.write_bytes(uid, "pic.png", b"\x89PNG\r\n\x1a\nfake")
+        att2 = att + [{"name": "pic.png", "mime": "image/png", "rel_path": "pic.png"}]
+        content2 = orch._attachment_content(uid, att2, "look", caps)
+        self.assertIsInstance(content2, list)
+        joined = "\n".join(str(p.get("text") or "") for p in content2
+                           if p.get("type") == "text")
+        self.assertIn("CAPTIONED", joined)
+        self.assertTrue([p for p in content2 if p.get("type") == "image_url"])
+
+    def test_attachment_content_without_captions_is_unchanged(self):
+        from hearth import orchestrator as orch
+        att = [{"name": "notes.md", "mime": "text/markdown", "rel_path": "notes.md"}]
+        self.assertEqual(orch._attachment_content("u1", att, "hello"), "hello")
+
+    def test_describe_audio_tool_refuses_without_config(self):
+        import asyncio
+        from hearth.tools.audio_tools import DescribeAudioTool
+        from hearth.tools import ToolContext
+        uid = "captooluser"
+        from hearth import workspaces as ws
+        ws.root_for(uid).mkdir(parents=True, exist_ok=True)
+        ws.write_text(uid, "uploads/clip.mp3", "pretend audio")
+        ctx = ToolContext(uid, self._settings(**{"captioner.enabled": False}), {})
+        res = asyncio.run(DescribeAudioTool().run({"path": "uploads/clip.mp3"}, ctx))
+        self.assertFalse(res.ok)
+        self.assertIn("switched off", res.content)
+
+    def test_describe_audio_tool_rejects_escape_and_missing(self):
+        import asyncio
+        from hearth.tools.audio_tools import DescribeAudioTool
+        from hearth.tools import ToolContext
+        uid = "captooluser2"
+        from hearth import workspaces as ws
+        ws.root_for(uid).mkdir(parents=True, exist_ok=True)
+        t = DescribeAudioTool()
+        res = asyncio.run(t.run({"path": "../../etc/passwd"}, ToolContext(uid, {}, {})))
+        self.assertFalse(res.ok)
+        self.assertIn("refused", res.content)
+        res2 = asyncio.run(t.run({"path": "nope.mp3"}, ToolContext(uid, {}, {})))
+        self.assertFalse(res2.ok)
+        self.assertIn("not found", res2.content)
+
+    def test_audio_info_tool_without_ffprobe_says_so(self):
+        import asyncio
+        from hearth.tools import audio_tools as at
+        from hearth.tools import ToolContext
+        uid = "capinfouser"
+        from hearth import workspaces as ws
+        ws.root_for(uid).mkdir(parents=True, exist_ok=True)
+        ws.write_text(uid, "uploads/x.mp3", "not really audio")
+        # Force the no-ffprobe answer regardless of this machine.
+        orig = at.cap.audio_info_for_workspace
+        at.cap.audio_info_for_workspace = lambda u, r: {"note": "ffprobe not installed"}
+        try:
+            res = asyncio.run(at.AudioInfoTool().run({"path": "uploads/x.mp3"},
+                                                     ToolContext(uid, {}, {})))
+        finally:
+            at.cap.audio_info_for_workspace = orig
+        self.assertFalse(res.ok)
+        self.assertIn("ffmpeg", res.content)
+
+
+
+
+
+
+class CaptionerHttpTests(unittest.TestCase):
+    """Admin endpoints for the second model, through the real app (needs web deps)."""
+
+    def _login_admin(self, c):
+        from hearth.main import ensure_bootstrap_admin
+        pw = os.environ.get("BOOT_PW") or ensure_bootstrap_admin()
+        r = c.post("/auth/login", data={"username": "admin", "password": pw})
+        self.assertEqual(r.status_code, 200, f"admin login must work: {r.status_code}")
+        return {"X-CSRF-Token": c.cookies.get("hearth_csrf", "")}
+
+    def test_models_listing_shows_both_models(self):
+        from fastapi.testclient import TestClient
+        from hearth.main import create_app
+        with TestClient(create_app()) as c:
+            self._login_admin(c)
+            r = c.get("/api/admin/models")
+            self.assertEqual(r.status_code, 200, r.text)
+            ids = [m["id"] for m in r.json()["models"]]
+            # The whole point of the endpoint: a second loaded model is never invisible.
+            self.assertEqual(ids, ["chat", "captioner"])
+
+    def test_captioner_admin_routes_exist_and_require_csrf(self):
+        from fastapi.testclient import TestClient
+        from hearth.main import create_app
+        with TestClient(create_app()) as c:
+            self._login_admin(c)
+            # Mutations need CSRF; a GET must not.
+            self.assertEqual(c.post("/api/admin/captioner/stop").status_code, 403)
+            r = c.post("/api/admin/captioner/stop", headers=self._login_admin(c))
+            self.assertEqual(r.status_code, 200, r.text)
+            self.assertTrue(r.json().get("stopped"))
+            # Command preview works with no paths configured and explains itself.
+            cmd = c.get("/api/admin/captioner/command")
+            self.assertEqual(cmd.status_code, 200)
+            self.assertFalse(cmd.json()["ok"])
+            self.assertIn("captioner", cmd.json()["note"].lower())
+
+    def test_captioner_test_endpoint_reports_a_reason_not_a_crash(self):
+        # With no model configured the test probe must answer with an actionable note, never
+        # a 500 — an admin clicks this precisely when something is wrong.
+        from fastapi.testclient import TestClient
+        from hearth.main import create_app
+        with TestClient(create_app()) as c:
+            self._login_admin(c)
+            r = c.get("/api/admin/captioner/test")
+            self.assertEqual(r.status_code, 200, r.text)
+            body = r.json()
+            self.assertFalse(body["ok"])
+            self.assertTrue(body["note"])
+
+    def test_captioner_settings_round_trip(self):
+        from fastapi.testclient import TestClient
+        from hearth.main import create_app
+        with TestClient(create_app()) as c:
+            H = self._login_admin(c)
+            r = c.post("/api/admin/settings",
+                       headers={**H, "Content-Type": "application/json"},
+                       data=json.dumps({"captioner.enabled": True, "captioner.port": 8123,
+                                        "captioner.chunk_seconds": 45}))
+            self.assertEqual(r.status_code, 200, r.text)
+            vals = c.get("/api/admin/settings").json()["values"]
+            self.assertIs(vals["captioner.enabled"], True)
+            self.assertEqual(vals["captioner.port"], 8123)
+            self.assertEqual(vals["captioner.chunk_seconds"], 45)
+            # Restore the off default so later tests in this process see a clean slate.
+            c.post("/api/admin/settings", headers={**H, "Content-Type": "application/json"},
+                   data=json.dumps({"captioner.enabled": False, "captioner.port": 8091,
+                                    "captioner.chunk_seconds": 30}))
+
+    def test_audio_tools_appear_in_the_tools_setting_list(self):
+        from fastapi.testclient import TestClient
+        from hearth.main import create_app
+        with TestClient(create_app()) as c:
+            self._login_admin(c)
+            specs = c.get("/api/admin/settings").json()["specs"]
+            keys = {s["key"] for s in specs}
+            for k in ("tools.describe_audio", "tools.audio_info", "captioner.enabled",
+                      "captioner.n_gpu_layers"):
+                self.assertIn(k, keys)
+class CaptionStreamAndPersistenceTests(unittest.TestCase):
+    """DEC-061: describe_audio must stream like the upload path, and captions must survive.
+
+    The two complaints these guard against: a tool-driven caption arrived with no live
+    output at all (the captioner streamed internally and the text sat in a buffer), and a
+    description vanished on refresh — plus later turns reached the model as a bare
+    `[attached: x.mp3]` because build_messages only ever saw the current turn's dict.
+    """
+
+    def _settings(self, **over):
+        from hearth import runtime_settings as rs
+        s = {k: v.default for k, v in rs.SPEC_BY_KEY.items()}
+        s.update({"captioner.enabled": True, "captioner.auto_route": True})
+        s.update(over)
+        return s
+
+    def test_delta_throttle_batches_and_flushes(self):
+        from hearth.tools.base import DeltaThrottle
+        t = DeltaThrottle(min_chars=10, min_s=999)   # time-based flush disabled here
+        self.assertEqual(t.add("abc"), "")            # below threshold: buffered
+        out = t.add("defghij")                        # now >= 10 chars
+        self.assertEqual(out, "abcdefghij")
+        self.assertEqual(t.add("xyz"), "")            # buffered again
+        self.assertEqual(t.flush(), "xyz")            # tail is never lost
+        self.assertEqual(t.flush(), "")               # and flushing twice is harmless
+
+    def test_delta_throttle_emits_on_time_even_when_short(self):
+        import time as _t
+        from hearth.tools.base import DeltaThrottle
+        t = DeltaThrottle(min_chars=10_000, min_s=0.0)   # force the time path
+        self.assertEqual(t.add("hi"), "hi")
+
+    def test_tool_context_progress_sink_never_raises(self):
+        from hearth.tools import ToolContext
+        ctx = ToolContext("u", {}, {})
+        # No sink attached: a tool reporting progress must be a silent no-op, not a crash.
+        ctx.report_progress(type="notice", kind="caption_chunk", text="x")
+        seen = []
+        ctx.attach_progress(seen.append)
+        ctx.report_progress(type="notice", kind="caption_chunk", text="hello")
+        self.assertEqual(seen, [{"type": "notice", "kind": "caption_chunk", "text": "hello"}])
+
+        # A sink that explodes must not take the tool down with it.
+        def bad(ev): raise RuntimeError("queue gone")
+        ctx.attach_progress(bad)
+        ctx.report_progress(type="notice", kind="caption_chunk", text="still fine")
+        ctx.attach_progress(None)
+        ctx.report_progress(type="notice", kind="caption_chunk", text="ignored")
+
+    def test_ui_preview_is_generous_but_bounded(self):
+        from hearth.tools.base import ui_preview, UI_PREVIEW_MAX_CHARS
+        self.assertEqual(ui_preview("short"), "short")
+        self.assertEqual(len(ui_preview("x" * 50_000)), UI_PREVIEW_MAX_CHARS)
+        self.assertEqual(ui_preview(None), "")
+
+    def test_describe_audio_streams_progress_to_the_ui(self):
+        # The regression: the tool called describe_file WITHOUT on_delta, so nothing reached
+        # the client during a multi-minute listen. Now it must emit start/chunks/done.
+        import asyncio
+        from hearth.tools.audio_tools import DescribeAudioTool
+        from hearth.tools import ToolContext
+        from hearth import captioner as cap, workspaces as ws
+        uid = "capstreamuser"
+        ws.root_for(uid).mkdir(parents=True, exist_ok=True)
+        ws.write_text(uid, "uploads/clip.mp3", "pretend audio")
+
+        seen = []
+
+        async def fake_describe(user_id, rel, extra_prompt="", settings=None,
+                                cancel=None, on_delta=None):
+            self.assertIsNotNone(on_delta, "the tool must pass on_delta or nothing streams")
+            for piece in ["a long ", "caption ", "about voices "]:
+                on_delta(piece)
+            return {"caption": "two people talk", "chunks": 1, "duration_s": 4.0,
+                    "backend": "server", "notes": []}
+
+        orig = cap.describe_file
+        orig_pre = cap.preflight
+        # preflight() checks for a real ffmpeg/captioner install, which CI does not have;
+        # this test is about the tool's STREAMING contract, so pretend it is configured.
+        cap.preflight = lambda settings: ""
+        cap.describe_file = fake_describe
+        try:
+            ctx = ToolContext(uid, self._settings(), {})
+            ctx.attach_progress(seen.append)
+            res = asyncio.run(DescribeAudioTool().run({"path": "uploads/clip.mp3"}, ctx))
+        finally:
+            cap.describe_file = orig
+            cap.preflight = orig_pre
+        self.assertTrue(res.ok)
+        kinds = [e.get("kind") for e in seen]
+        self.assertIn("caption_start", kinds)
+        self.assertIn("caption_done", kinds)
+        streamed = "".join(e["text"] for e in seen if e.get("kind") == "caption_chunk")
+        # The tail must be flushed, so the streamed text is complete, not truncated.
+        self.assertEqual(streamed, "a long caption about voices ")
+
+    def test_describe_audio_reports_failure_completion(self):
+        import asyncio
+        from hearth.tools.audio_tools import DescribeAudioTool
+        from hearth.tools import ToolContext
+        from hearth import captioner as cap, workspaces as ws
+        uid = "capstreamfail"
+        ws.root_for(uid).mkdir(parents=True, exist_ok=True)
+        ws.write_text(uid, "uploads/bad.mp3", "pretend audio")
+
+        async def boom(user_id, rel, extra_prompt="", settings=None, cancel=None,
+                       on_delta=None):
+            raise cap.CaptionError("captioner model file not found")
+
+        seen = []
+        orig = cap.describe_file
+        orig_pre = cap.preflight
+        cap.preflight = lambda settings: ""   # see note in the streaming test above
+        cap.describe_file = boom
+        try:
+            ctx = ToolContext(uid, self._settings(), {})
+            ctx.attach_progress(seen.append)
+            res = asyncio.run(DescribeAudioTool().run({"path": "uploads/bad.mp3"}, ctx))
+        finally:
+            cap.describe_file = orig
+            cap.preflight = orig_pre
+        self.assertFalse(res.ok)
+        done = [e for e in seen if e.get("kind") == "caption_done"]
+        self.assertTrue(done, "a failed caption must still close its progress block")
+        self.assertFalse(done[0]["ok"])
+
+    def test_caption_meta_round_trip(self):
+        import json
+        from hearth import orchestrator as orch
+        meta = json.dumps({"attachments": [{"rel_path": "uploads/a.mp3", "name": "a.mp3"}],
+                           "captions": {"uploads/a.mp3": {"text": "a voice", "name": "a.mp3",
+                                                          "ok": True}}})
+        self.assertEqual(orch.captions_from_meta(meta), {"uploads/a.mp3": "a voice"})
+        self.assertEqual(orch.caption_state(meta),
+                         {"uploads/a.mp3": {"name": "a.mp3", "ok": True}})
+        # Junk / missing meta must read as "no captions", never raise.
+        self.assertEqual(orch.captions_from_meta(""), {})
+        self.assertEqual(orch.captions_from_meta("not json"), {})
+        self.assertEqual(orch.caption_state(None), {})
+        # A plain-string value is tolerated rather than dropped.
+        self.assertEqual(orch.captions_from_meta(json.dumps({"captions": {"x": "t"}})),
+                         {"x": "t"})
+
+    def test_build_messages_uses_stored_captions_for_older_attachments(self):
+        """The core persistence claim: a caption from an EARLIER message stays in context.
+
+        Before DEC-061 the model saw `[attached: x.mp3]` with no description on every turn
+        after the one that produced it, because build_messages only received the current
+        turn's dict and never consulted the row's stored captions.
+        """
+        import json
+        from hearth import orchestrator as orch
+        uid = "capprogressuser"
+        from hearth import workspaces as ws
+        ws.root_for(uid).mkdir(parents=True, exist_ok=True)
+
+        meta = json.dumps({"attachments": [{"name": "a.mp3", "mime": "audio/mpeg",
+                                           "rel_path": "uploads/a.mp3"}],
+                           "captions": {"uploads/a.mp3": {"text": "CAPTURED EARLIER",
+                                                          "name": "a.mp3", "ok": True}}})
+        # No turn-level captions at all — exactly the later-turn case.
+        content = orch._attachment_content(uid, json.loads(meta)["attachments"],
+                                           "[attached: a.mp3]",
+                                           orch.captions_from_meta(meta))
+        self.assertIn("CAPTURED EARLIER", content)
 
 
 if __name__ == "__main__":

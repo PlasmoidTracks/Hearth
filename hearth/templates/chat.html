@@ -54,8 +54,10 @@
           </div>
         </div>
         <ul id="artifactList" class="px-3 flex-1 min-h-0 overflow-auto space-y-1 text-sm">
-          <!-- Rows are rendered by loadArtifacts() with an explicit ⬇ button: a bare
-               filename link is easy to miss on touch, and "tap the name" is not obvious. -->
+          <!-- Rows are rendered by loadArtifacts(). The filename IS the download link;
+               anything else (attach to next message, preview, copy link, delete) lives in
+               the per-row ⋮ menu — see openFileMenu(). No standalone ⬇: it duplicated the
+               link and cost width a long filename needs. -->
         </ul>
       </section>
 
@@ -150,6 +152,14 @@
       <span id="modelBadge" title="Active model backend" class="shrink-0 max-[479px]:hidden">model: …</span>
       <span id="modelBadgeShort" title="Active model backend" class="shrink-0 hidden max-[479px]:inline">⚙</span>
 
+      <!-- Linked project chip (DEC-049). Hidden unless the user has a link. Shows pending
+           change counts and offers Apply; refreshed on turn end / manual click, never on a
+           timer — the summary endpoint hashes the tree, so polling it would be wasteful. -->
+      <span id="projWrap" class="hidden items-center gap-1 shrink-0">
+        <button id="projChip" title="Linked project folder"
+                class="shrink-0 rounded-lg px-2 py-1 text-xs bg-slate-800 hover:bg-slate-700 text-slate-300"></button>
+      </span>
+
       <!-- Context-window usage for THIS chat (what the model receives next turn).
            `shrink-0` matters: without it the bar collapses to 0 width inside the
            flex header and looks like the feature is missing. It lives at the far
@@ -189,6 +199,14 @@
       <!-- Staged attachments (uploaded, sent with next message) -->
       <div id="attachStrip" class="hidden flex-wrap gap-2 mb-2"></div>
 
+      <!-- Steering queue: messages sent while a turn owns the transcript. Rendered only when
+           something is queued; each row has Withdraw so a change of mind is recoverable
+           before the model reads it (chat.js loadSteerQueue). -->
+      <div id="steerWrap" class="hidden mb-2 rounded-xl border border-sky-800/60 bg-sky-950/20 px-3 py-2 text-xs">
+        <div class="text-sky-300 mb-1" data-i18n="chat.steer_queued">Queued for the next step</div>
+        <ul id="steerList" class="space-y-1"></ul>
+      </div>
+
       <div id="dropzone" class="hidden mb-2 border-2 border-dashed border-sky-600 rounded-xl p-4 text-center text-sm text-sky-300 bg-sky-950/30">
         <span data-i18n="chat.drop_here">Drop files to attach</span>
       </div>
@@ -196,10 +214,16 @@
       <form id="composer" class="flex gap-2 items-end">
         <input type="file" id="fileInput" multiple class="hidden"/>
         <input type="file" id="cameraInput" accept="image/*" capture="environment" class="hidden"/>
-        <button type="button" id="attachBtn" title="Attach files" data-i18n-title="chat.upload"
-                class="rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 px-3 py-2.5 md:py-2 text-lg leading-none">📎</button>
-        <button type="button" id="cameraBtn" title="Camera / Photo" data-i18n-title="chat.camera"
-                class="rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 px-3 py-2.5 md:py-2 text-lg leading-none">📷</button>
+        <!-- Attach menu: one button replaces the old 📎/📷 row (and later, more).
+             The panel is positioned by chat.js (fixed, above the button) and closes
+             on outside click / Escape / scroll / resize, like the conv ⋮ menu.
+             Menu items carry data-i18n so I18N.apply() re-translates them live when
+             the language changes while the menu happens to be open. -->
+        <div id="attachWrap" class="shrink-0">
+          <button type="button" id="attachMenuBtn" title="Attach" data-i18n-title="chat.attach_menu" aria-haspopup="true" aria-expanded="false"
+                  class="rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 px-3 py-2.5 md:py-2 text-lg leading-none">📎<span class="text-[9px] align-middle text-slate-400 ml-0.5">▾</span></button>
+          <div id="attachMenu" class="hidden z-50 min-w-[190px] max-w-[calc(100vw-16px)] rounded-xl border border-slate-700 bg-slate-800 shadow-xl py-1 text-sm"></div>
+        </div>
         <textarea id="input" rows="1" placeholder="Message Hearth…" data-i18n-placeholder="chat.placeholder"
           class="flex-1 resize-none rounded-xl bg-slate-800 border border-slate-700 px-3 py-2.5 md:py-2 outline-none focus:border-sky-500 max-h-40 text-base md:text-sm"></textarea>
         <!-- Send becomes Stop while a turn is running (same slot, always reachable). -->

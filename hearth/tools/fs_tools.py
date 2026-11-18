@@ -30,6 +30,7 @@ import re
 import zipfile
 
 from .base import Tool, ToolResult
+from ..errors import hint
 from .. import workspaces as ws
 
 
@@ -52,9 +53,9 @@ class FsReadTool(Tool):
         try:
             text = ws.read_text(ctx.user_id, args.get("path", ""))
         except ws.JailEscape as e:
-            return ToolResult(False, f"refused: {e}")
+            return ToolResult(False, hint("escape_root", f"refused: {e}"))
         except FileNotFoundError:
-            return ToolResult(False, f"not found: {args.get('path')}")
+            return ToolResult(False, hint("file_not_found", f"not found: {args.get('path')}"))
         sl, el = args.get("start_line"), args.get("end_line")
         if sl is None and el is None:
             return ToolResult(True, text)
@@ -64,15 +65,32 @@ class FsReadTool(Tool):
         except (TypeError, ValueError):
             return ToolResult(False, "start_line/end_line must be integers")
         lines = text.splitlines()
-        if start > len(lines):
-            return ToolResult(True, "(range beyond end of file)")
-        sel = lines[start - 1:min(end, len(lines))]
+        total = len(lines)
+        # Out-of-range start is an ERROR, not an ok empty read. Answering "(range beyond
+        # end of file)" with ok=True told the model nothing about how long the file is, so
+        # it kept guessing line numbers forever; naming the real size gives it the one fact
+        # needed to correct the call.
+        if start > total:
+            return ToolResult(False, f"start_line {start} is beyond the end of the file "
+                                     f"({total} lines). Read from line 1, or omit "
+                                     f"start_line/end_line for the whole file.")
+        # Clamp instead of failing: an over-large end_line means "to the end", which is a
+        # reasonable intent and costs nothing to honour.
+        sel = lines[start - 1:min(end, total)]
         # Return the lines VERBATIM. We used to prefix them with their line numbers
         # ("1: int main() {") so the model could quote positions back — but fs_edit
         # matches literally, and models quoted those prefixes straight into old_text,
         # producing a no-match, a re-read, and an infinite read/edit loop on small
         # models (DEC-045). A range read must give exactly what is in the file.
-        return ToolResult(True, "\n".join(sel))
+        #
+        # Nothing may be spliced into this string — not a header, not a trailing note.
+        # `ToolResult.meta` is NOT sent to the model (the orchestrator uses it for UI
+        # chips only), so "is there more file?" cannot be communicated in-band safely:
+        # any marker we add becomes text a model will quote back into fs_edit. A range
+        # read therefore reports exactly the lines asked for and nothing else; knowing
+        # the file's size is what `fs_list`/`wc`-style info and the follow-up read are for.
+        body = "\n".join(sel)
+        return ToolResult(True, body)
 
 
 class FsListTool(Tool):
@@ -95,9 +113,9 @@ class FsListTool(Tool):
                      + (f"  {e['size']}B" if e['size'] is not None else "") for e in entries]
             return ToolResult(True, "\n".join(lines))
         except ws.JailEscape as e:
-            return ToolResult(False, f"refused: {e}")
+            return ToolResult(False, hint("escape_root", f"refused: {e}"))
         except FileNotFoundError:
-            return ToolResult(False, f"not found: {args.get('path')}")
+            return ToolResult(False, hint("file_not_found", f"not found: {args.get('path')}"))
 
 
 class FsWriteTool(Tool):
@@ -120,7 +138,7 @@ class FsWriteTool(Tool):
         try:
             rel = ws.write_text(ctx.user_id, args.get("path", ""), str(args.get("content", "")))
         except ws.JailEscape as e:
-            return ToolResult(False, f"refused: {e}")
+            return ToolResult(False, hint("escape_root", f"refused: {e}"))
         # Register as a durable artifact so the file shows in the session's Artifacts
         # panel, but do NOT hand back meta.download: writing a file is not offering it.
         # Only the `upload` tool produces the in-transcript ⬇ button (operator policy,
@@ -157,9 +175,9 @@ class UploadTool(Tool):
         try:
             p = ws.resolve_in_jail(ctx.user_id, args.get("path", ""), allow_missing=False)
         except ws.JailEscape as e:
-            return ToolResult(False, f"refused: {e}")
+            return ToolResult(False, hint("escape_root", f"refused: {e}"))
         except FileNotFoundError:
-            return ToolResult(False, f"not found: {args.get('path')}")
+            return ToolResult(False, hint("file_not_found", f"not found: {args.get('path')}"))
         # Durable artifact row (survives restarts; listed in the artifacts panel).
         from .. import artifacts
         art = artifacts.record(ctx.user_id, ws.rel_from_jail(ctx.user_id, p),
@@ -187,7 +205,7 @@ class FsAppendTool(Tool):
         try:
             rel = ws.append_text(ctx.user_id, args.get("path", ""), str(args.get("content", "")))
         except ws.JailEscape as e:
-            return ToolResult(False, f"refused: {e}")
+            return ToolResult(False, hint("escape_root", f"refused: {e}"))
         # Same policy as fs_write: register the file (Artifacts panel) but offer no
         # download button — only `upload` does that. See DEC-045.
         from .. import artifacts
@@ -222,11 +240,18 @@ class FsEditTool(Tool):
                                str(args.get("old_text", "")), str(args.get("new_text", "")),
                                replace_all=bool(args.get("replace_all")))
         except ws.JailEscape as e:
-            return ToolResult(False, f"refused: {e}")
+            return ToolResult(False, hint("escape_root", f"refused: {e}"))
         except FileNotFoundError:
-            return ToolResult(False, f"not found: {args.get('path')}")
+            return ToolResult(False, hint("file_not_found", f"not found: {args.get('path')}"))
         except ValueError as e:
-            return ToolResult(False, str(e))   # no-match / not-unique messages
+            # no-match / not-unique messages from workspaces.edit_text. Classify by the
+            # wording it raises so each gets its own next action: "matches N places" needs
+            # MORE context, "not found" needs a fresh read — and both must explicitly say
+            # "do not repeat this call unchanged", because re-issuing the identical edit is
+            # the loop DEC-045's repeat guard exists to break.
+            text = str(e)
+            kind = "multi_match" if "matches" in text else "no_match"
+            return ToolResult(False, hint(kind, text))
         n, rel = res
         from .. import artifacts
         try:
@@ -253,9 +278,9 @@ class FsDeleteTool(Tool):
         try:
             ok = ws.delete_path(ctx.user_id, args.get("path", ""))
         except ws.JailEscape as e:
-            return ToolResult(False, f"refused: {e}")
+            return ToolResult(False, hint("escape_root", f"refused: {e}"))
         if not ok:
-            return ToolResult(False, f"not found: {args.get('path')}")
+            return ToolResult(False, hint("file_not_found", f"not found: {args.get('path')}"))
         from .. import audit
         audit.log(ctx.user_id, "fs_delete", {"path": args.get("path")})
         return ToolResult(True, f"deleted {args.get('path')}")
@@ -279,9 +304,9 @@ class FsMoveTool(Tool):
             rel = ws.move_path(ctx.user_id, args.get("from_path", ""), args.get("to_path", ""),
                                overwrite=bool(args.get("overwrite")))
         except ws.JailEscape as e:
-            return ToolResult(False, f"refused: {e}")
+            return ToolResult(False, hint("escape_root", f"refused: {e}"))
         except FileNotFoundError:
-            return ToolResult(False, f"not found: {args.get('from_path')}")
+            return ToolResult(False, hint("file_not_found", f"not found: {args.get('from_path')}"))
         except FileExistsError as e:
             return ToolResult(False, str(e))
         return ToolResult(True, f"moved to {rel}")
@@ -342,7 +367,14 @@ class FsSearchTool(Tool):
             if len(matches) >= self.MAX_MATCHES or scanned >= self.MAX_FILES:
                 break
         if not matches:
-            return ToolResult(True, "(no matches)")
+            return ToolResult(True, hint("empty_result", "(no matches)"))
+        # Capped results must SAY so. "60 lines and no note" reads to a model as a complete
+        # answer, so it stops looking; naming the cap tells it to narrow the pattern or
+        # scope with `path` instead of concluding there is nothing more.
+        if len(matches) >= self.MAX_MATCHES:
+            return ToolResult(True, "\n".join(matches) +
+                              f"\n(truncated at {self.MAX_MATCHES} matches — narrow the "
+                              f"pattern or pass 'path' to search one folder)")
         return ToolResult(True, "\n".join(matches))
 
 
@@ -378,14 +410,16 @@ class ZipPackTool(Tool):
                 data = ws.read_bytes(ctx.user_id, str(rel))
                 total += len(data)
                 if total > self.MAX_TOTAL_BYTES:
-                    return ToolResult(False, f"too much data to zip (>{self.MAX_TOTAL_BYTES // 1048576} MB)")
+                    return ToolResult(False, hint("too_large",
+                                                  f"too much data to zip "
+                                                  f"(>{self.MAX_TOTAL_BYTES // 1048576} MB)"))
                 resolved.append((os.path.normpath(str(rel)), data))
         except ws.JailEscape as e:
-            return ToolResult(False, f"refused: {e}")
+            return ToolResult(False, hint("escape_root", f"refused: {e}"))
         except FileNotFoundError as e:
-            return ToolResult(False, f"not found: {e}")
+            return ToolResult(False, hint("file_not_found", f"not found: {e}"))
         if not resolved:
-            return ToolResult(False, "none of the given paths are files")
+            return ToolResult(False, hint("empty_result", "none of the given paths are files"))
         import io
         buf = io.BytesIO()
         try:

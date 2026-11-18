@@ -486,6 +486,77 @@ class ModelManager:
             return {"ok": False, "path": str(p), "size": 0, "offset": 0,
                     "truncated": False, "text": "", "note": f"Could not read log: {e}"}
 
+    # --- live perf / prefill progress (log tail) --------------------------------
+    def poll_log_perf(self, state: dict | None = None) -> tuple[list[dict], dict]:
+        """Read NEW llama-server log lines and return the metrics they carry.
+
+        THE source for live progress with a real model. llama.cpp prints its own numbers —
+        ``prompt processing, n_tokens = 91424, progress = 0.73, ... / 697.05 tokens per
+        second`` while it reads a prompt, and ``n_gen = 262, tg = 2.76 t/s, tg_3s = ...``
+        while it decodes — and the OpenAI endpoint streams no such thing. So the only way to
+        show prefill percentage and an honest ETA during a turn is to read them from here.
+        ``hearth.perf`` parses; this method only advances the file cursor and forwards what
+        parsing returned, deriving nothing of its own.
+
+        ``state`` is the caller's cursor (``{"offset": int}``); pass None to start at the END
+        of the file — a fresh turn must not replay an old prompt's progress lines. Returns
+        ``(events, state)`` where each event is one of:
+
+          {"kind": "prefill", "n_tokens": int, "progress": float, "rate_tps": float|None}
+          {"kind": "perf", "prefill_tps": ..., "decode_tps": ...}   # from perf.py fields
+
+        Safe by construction: no log (external server, or none launched yet) yields an empty
+        list forever. Never raises — a log that cannot be read is not a chat error. The file
+        is opened in NON-binary-append-free read mode with no truncation assumption beyond
+        the shrink check below.
+        """
+        import os
+        from . import perf as perf_mod
+        st = {"offset": int((state or {}).get("offset", -1))}
+        out: list[dict] = []
+        try:
+            size = os.path.getsize(self._log_path)
+            # A cursor of -1 means "start at the END" — a fresh turn must not replay an old
+            # prompt's progress lines. Resolved HERE, inside the guarded block, because on a
+            # cold start the log does not exist yet: getsize() raises, and doing it outside
+            # this try propagated FileNotFoundError to the caller (whose blanket except then
+            # disabled live progress for good — every later poll re-raised the same way).
+            if st["offset"] < 0:
+                st["offset"] = size
+            # Log rotated or truncated: our cursor is now past EOF and would sit there
+            # reading nothing forever. Restart from 0 rather than go silently stale.
+            if size < st["offset"]:
+                st["offset"] = 0
+            if size == st["offset"]:
+                return [], st
+            with open(self._log_path, "rb") as f:
+                f.seek(st["offset"])
+                chunk = f.read()
+            # Do NOT consume a trailing partial line: llama.cpp may still be writing it, and
+            # half a print_timing line parses to nothing (or worse, to the wrong numbers).
+            # Leave it for the next poll.
+            end = chunk.rfind(b"\n")
+            if end < 0:
+                return [], st
+            st["offset"] += end + 1
+            for raw in chunk[:end].decode("utf-8", "replace").split("\n"):
+                if not raw.strip():
+                    continue
+                pp = perf_mod.parse_prompt_progress(raw)
+                if pp is not None:
+                    n, frac, rate = pp
+                    out.append({"kind": "prefill", "n_tokens": n, "progress": frac,
+                                "rate_tps": rate})
+                    continue
+                m = perf_mod.parse_log_line(raw)
+                if m is not None and m.has_data():
+                    ev = m.as_dict()
+                    ev["kind"] = "perf"
+                    out.append(ev)
+        except OSError:
+            return [], st
+        return out, st
+
 
 _manager: Optional[ModelManager] = None
 

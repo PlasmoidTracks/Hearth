@@ -150,3 +150,32 @@ class Artifact(Base):
     size: Mapped[int] = mapped_column(Integer, default=0)
     mime: Mapped[str] = mapped_column(String, default="application/octet-stream")
     created_at: Mapped[int] = mapped_column(Integer, default=now, index=True)
+
+
+class ProjectLink(Base):
+    """A user's link to a real folder on disk (DEC-049, REQ-041).
+
+    Generic project-collaboration feature: Hearth copies a bounded subtree of the linked
+    folder into the jail together with a baseline manifest, the agent works on that copy
+    with the ordinary jailed fs tools, and an explicitly approved `sync_apply` propagates
+    the diff back to the real folder. Nothing here restricts WHICH files or project type
+    can be linked — the feature is deliberately content-agnostic (see DEC-049 "Rejected:
+    guard-path list").
+
+    One active link per user is enforced in code (project_link.set_link), not by a DB
+    constraint, so history survives unlinking. `rel_prefix` is the workspace-visible prefix
+    the copy lives under (e.g. ``project``); it is stored so preview/apply keep working if
+    an operator later changes the default.
+
+    NOT a hard FK to users: like Artifact.user_id, workspaces are keyed by user-id string
+    and can exist independent of an account row. Ownership is enforced by filtering on this
+    indexed column.
+    """
+    __tablename__ = "project_links"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uid)
+    user_id: Mapped[str] = mapped_column(String, index=True)
+    target_abs: Mapped[str] = mapped_column(String, default="")   # canonical real folder
+    rel_prefix: Mapped[str] = mapped_column(String, default="project")
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    imported_at: Mapped[int] = mapped_column(Integer, default=0)  # last import (epoch s)
+    created_at: Mapped[int] = mapped_column(Integer, default=now, index=True)

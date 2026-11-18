@@ -40,6 +40,9 @@ from . import orchestrator as orch
 from . import artifacts
 from . import workspaces as ws
 from . import audit
+from . import project_link as pl
+from . import project_apply as pa
+from . import crypto
 
 # Max bytes per uploaded file (defense against trivial DoS). Configurable later.
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
@@ -160,14 +163,69 @@ async def configure_conversation(conv_id: str, request: Request, user=Depends(re
 
 @router.get("/api/chat/conversations/{conv_id}")
 async def get_conversation(conv_id: str, request: Request, user=Depends(require_user)):
+    # Reasoning retention decides what the transcript shows after a reload. Applied here and
+    # NOT in the model request path (orchestrator.build_messages never replays reasoning), so
+    # this can only ever change what the user sees, never what the model is sent.
+    retention = rs.get_all().get("model.reasoning_retention", "keep_last")
     with session_scope() as s:
         c = s.get(Conversation, conv_id)
         if not c or c.user_id != user.id:
             raise HTTPException(404, "not found")
         msgs = s.query(Message).filter(Message.conversation_id == conv_id) \
             .order_by(Message.created_at.asc()).all()
-    return JSONResponse([{"role": m.role, "content": m.content, "meta": m.meta,
-                          "created_at": m.created_at} for m in msgs])
+        rows = [{"role": m.role, "content": m.content, "meta": m.meta,
+                 "created_at": m.created_at} for m in msgs]
+    # Attach stored caption state so a refresh can re-render the 🎧 block that streamed live
+    # (DEC-061). Only a name/ok summary is sent here — the description text itself is already
+    # inside `meta`, and re-sending it as a second key would double the payload of every
+    # audio chat. Rows without captions are untouched, so nothing else grows.
+    for r in rows:
+        if r.get("role") != "user" or not r.get("meta"):
+            continue
+        state = orch.caption_state(r["meta"])
+        if state:
+            r["captions"] = state
+    return JSONResponse(_apply_reasoning_retention(rows, retention))
+
+
+def _apply_reasoning_retention(rows: list[dict], policy: str) -> list[dict]:
+    """Attach/drop stored reasoning on a transcript row set according to the admin policy.
+
+    Rows gain a `reasoning` key (parsed out of meta) for the client's collapsible block; the
+    policy decides how many survive. Only rows that change are rewritten.
+
+    'keep_last' keeps the LAST assistant row's reasoning (the one a user is still reading) and
+    hides earlier ones. 'drop' and 'hide' remove all of them from history — the live one is
+    unaffected because a `reasoning` SSE event arrives before any policy could be consulted.
+    Unknown values behave like keep_last rather than dropping content nobody asked to lose.
+
+    Applied ONLY here (never in orchestrator.build_messages), so this can change what the user
+    sees but never what the model is sent.
+    """
+    last_ai = -1
+    if policy == "keep_last":
+        for i, r in enumerate(rows):
+            if r.get("role") == "assistant":
+                last_ai = i
+    for i, r in enumerate(rows):
+        if r.get("role") != "assistant" or not r.get("meta"):
+            continue
+        try:
+            meta = json.loads(r["meta"])
+        except Exception:  # noqa: BLE001 — non-JSON meta is not ours to touch
+            continue
+        if not isinstance(meta, dict):
+            continue
+        text = meta.get("reasoning")
+        if not text:
+            continue
+        if policy == "keep_all" or (policy == "keep_last" and i == last_ai):
+            r["reasoning"] = text
+            continue
+        # Dropped from the transcript view. meta stays untouched in the DB — retention is a
+        # display decision, not a deletion, so changing the policy later restores it.
+        continue
+    return rows
 
 
 @router.post("/api/chat/conversations/{conv_id}/rename")
@@ -200,6 +258,12 @@ async def delete_conversation(conv_id: str, request: Request, user=Depends(requi
     except Exception:  # noqa: BLE001 — no/invalid body defaults to keeping artifacts
         pass
     delete_artifacts = bool(body.get("delete_artifacts"))
+    # Drop any steering queued for this conversation. It lives in the server process keyed by
+    # conversation id, so without this a deleted chat's queue would sit in memory forever and
+    # could in principle be drained by whoever next reused the id (ids are random, but a
+    # deleted conversation must not be able to deliver messages into anything).
+    from . import steering as _steering
+    _steering.clear(conv_id)
     removed_files = 0
     with session_scope() as s:
         c = s.get(Conversation, conv_id)
@@ -288,10 +352,22 @@ async def chat_stream(request: Request, user=Depends(require_user), _=Depends(ch
             raise HTTPException(404, "not found")
 
     # Only one turn per conversation at a time: two live streams on the same
-    # history would interleave tool_call/tool rows and confuse the model.
+    # history would interleave tool_call/tool rows and confuse the model. But refusing
+    # outright made a mid-turn thought unutterable for the whole duration of an agent turn,
+    # so a send arriving during a running turn is QUEUED as steering instead of rejected —
+    # the orchestrator delivers it at the next between-rounds seam (see hearth/steering.py).
+    # The reply is plain JSON rather than an SSE stream because nothing streams back: the
+    # caller's existing turn keeps running and its own stream carries everything.
     from . import cancel as cancel_mod
+    from . import steering as _steering
     if cancel_mod.is_running(conv_id, user.id):
-        raise HTTPException(409, "a turn is already running in this chat")
+        q_att = _resolve_steer_attachments(user, body.get("attachments") or [])
+        depth = _steering.queue(conv_id, content, q_att)
+        if depth < 0:
+            raise HTTPException(400, "nothing to queue (empty message, or too many queued)")
+        return JSONResponse({"ok": True, "queued": True, "queue_depth": depth,
+                             "note": "a turn is running — your message will be delivered "
+                                     "between tool steps"})
 
     settings = rs.get_all()
     provider = await get_manager().get_provider()
@@ -333,8 +409,74 @@ async def chat_stream(request: Request, user=Depends(require_user), _=Depends(ch
 
     async def gen_sse():
         last_usage = None
+        # Audio first, inside the stream: captioning a recording takes real time (ffmpeg plus
+        # a model that has to listen), and doing it before the response starts would leave the
+        # user staring at silence. Here the "listening…" notice reaches them as it happens.
+        # Cancellation is checked around each file so Abort works during this phase too —
+        # without it, Stop would appear to do nothing for the length of a recording.
+        captions: dict = {}
+        if att_meta and bool(settings.get("captioner.enabled")):
+            import asyncio as _aio
+            from . import cancel as _cancel_mod
+            from . import captioner as _cap_mod
+            handle = _cancel_mod.begin(conv_id, user.id)
+            # prepare_captions runs in a worker thread (ffmpeg + model), so it cannot yield
+            # into this generator itself. A queue is the seam: notices are drained here while
+            # the task runs, and the abort handle is checked on every drain tick.
+            _q: _aio.Queue = _aio.Queue()
+            try:
+                def _emit(ev, _qq=_q):
+                    try:
+                        _qq.put_nowait(ev)
+                    except Exception:  # noqa: BLE001 — progress must never break captioning
+                        pass
+
+                task = _aio.create_task(
+                    orch.prepare_captions(user.id, conv_id, att_meta, settings, emit=_emit,
+                                           cancel=handle))
+                while True:
+                    if handle.cancelled:
+                        break
+                    try:
+                        ev = await _aio.wait_for(_q.get(), timeout=0.25)
+                        yield _sse(ev)
+                    except _aio.TimeoutError:
+                        pass
+                    if task.done():
+                        break
+                # Flush any notice queued just before completion.
+                while not _q.empty():
+                    yield _sse(_q.get_nowait())
+                if handle.cancelled and not task.done():
+                    task.cancel()
+                    # Stop the audio model too, not just the chat. Cancelling the asyncio task
+                    # does NOT unblock the worker thread sitting in a blocking httpx read, so
+                    # without this llama.cpp keeps decoding the caption to completion (the
+                    # "captioner still running after Stop" complaint). stop_active terminates
+                    # the Hearth-owned child process; the thread then errors out and unwinds.
+                    try:
+                        _cap_mod.get_captioner().stop_active()
+                    except Exception:  # noqa: BLE001 — best-effort teardown of the audio model
+                        pass
+                    yield _sse({"type": "aborted",
+                                "text": "Aborted while describing audio."})
+                    return
+                try:
+                    captions = await task
+                except Exception as ce:  # noqa: BLE001 — never lose the user's message
+                    audit.log(user.id, "caption_prep_error", {"err": str(ce)[:200]})
+                    captions = {}
+                # Persist so a refresh still shows the description and later turns keep it in
+                # context (DEC-061). Done here rather than inside prepare_captions because
+                # this is where the message row that owns these attachments definitely exists.
+                if captions:
+                    orch.persist_captions(conv_id, att_meta, captions)
+            finally:
+                handle.cancel()
+                _cancel_mod.end(conv_id, handle)
         try:
-            async for ev in _stream_turn(user.id, conv_id, provider, settings, store, gen):
+            async for ev in _stream_turn(user.id, conv_id, provider, settings, store, gen,
+                                         captions=captions):
                 if ev.get("type") == "usage":
                     last_usage = ev.get("data")
                 yield _sse(ev)
@@ -445,19 +587,24 @@ def _with_device_grant(settings: dict, conv_id: str) -> dict:
 
 
 async def _stream_turn(user_id: str, conv_id: str, provider, settings: dict,
-                       store: dict, gen: dict | None = None, pending_resume=None):
+                       store: dict, gen: dict | None = None, pending_resume=None,
+                       captions: dict | None = None):
     """Run one turn as SSE-ready dicts, wired into the abort registry.
 
     The generator owns the handle's lifetime: it is registered before the first
     event and removed on any exit path (normal end, abort, exception, or the
     client disconnecting mid-stream), so a conversation can never be left in a
     stale "running" state that blocks Abort or reports a phantom turn.
+
+    `captions` carries audio descriptions prepared before the turn (see
+    orch.prepare_captions) so attachments arrive described rather than mute.
     """
     from . import cancel as cancel_mod
     handle = cancel_mod.begin(conv_id, user_id)
     try:
         async for ev in orch.run_turn(user_id, conv_id, provider, settings, store,
-                                      pending_resume=pending_resume, gen=gen, cancel=handle):
+                                      pending_resume=pending_resume, gen=gen, cancel=handle,
+                                      captions=captions):
             yield ev
     except asyncio.CancelledError:
         # Client went away (or server shutdown): tell the loop we're done so any
@@ -467,6 +614,67 @@ async def _stream_turn(user_id: str, conv_id: str, provider, settings: dict,
     finally:
         handle.cancel()
         cancel_mod.end(conv_id, handle)
+
+
+@router.get("/api/chat/steer")
+async def steer_pending(request: Request, conversation_id: str = "",
+                        user=Depends(require_user)):
+    """Queued-but-undelivered steering messages for a conversation.
+
+    The composer shows these so the user can see what is waiting and take it back. Re-read on
+    reload because a queue lives in the server process, not the page."""
+    from . import steering as _steering
+    if not conversation_id:
+        return JSONResponse({"ok": True, "queued": []})
+    with session_scope() as s:
+        c = s.get(Conversation, conversation_id)
+        if not c or c.user_id != user.id:
+            raise HTTPException(404, "not found")
+    return JSONResponse({"ok": True, "queued": _steering.preview(conversation_id)})
+
+
+@router.post("/api/chat/steer/withdraw")
+async def steer_withdraw(request: Request, user=Depends(require_user),
+                         _=Depends(check_csrf)):
+    """Take back one queued steering message before the model reads it.
+
+    Returns removed=False for a stale index — normal (it already went through), so the client
+    refreshes its row rather than reporting an error."""
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        pass
+    conv_id = body.get("conversation_id") or ""
+    from . import steering as _steering
+    with session_scope() as s:
+        c = s.get(Conversation, conv_id)
+        if not c or c.user_id != user.id:
+            raise HTTPException(404, "not found")
+    try:
+        idx = int(body.get("index"))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "index required")
+    removed = _steering.withdraw(conv_id, idx)
+    return JSONResponse({"ok": True, "removed": removed,
+                         "queued": _steering.preview(conv_id)})
+
+
+def _resolve_steer_attachments(user, attachments: list) -> list[dict]:
+    """Resolve queued attachment refs to owned artifacts, exactly as a normal send does.
+
+    Done at ENQUEUE time (not delivery) so the queue holds only ids we have already verified
+    belong to this user, and so a message cannot reference an artifact deleted in between —
+    build_messages re-resolves by id anyway, so a stale entry degrades to "no file" rather
+    than reaching the model as a path."""
+    out: list[dict] = []
+    for a in (attachments or []):
+        art = artifacts.get(user.id, a.get("artifact_id")) if a.get("artifact_id") else None
+        if not art:
+            continue
+        out.append({"artifact_id": art["id"], "name": art["filename"],
+                    "mime": art["mime"], "rel_path": art["rel_path"]})
+    return out
 
 
 @router.post("/api/chat/abort")
@@ -592,12 +800,19 @@ async def chat_context_usage(request: Request, conversation_id: str = "",
                 usage = mm["usage"]
         total_chars = sum(len(m.content or "") for m in rows)
 
+    # The live server's own window beats the configured setting, but asking for it
+    # must not START anything. This endpoint runs on every conversation open (see
+    # loadContextUsage in chat.js), so going through get_provider() meant a passive
+    # page view called ensure_server() and launched llama-server — resurrecting a
+    # model the admin had just stopped. probe() is the read-only half of that pair:
+    # it reads /health + /props only, never consults admin settings and never spawns
+    # a process (DEC-048). When nothing answers we keep the configured n_ctx above.
     provider_n_ctx = None
     try:
         from .manager import get_manager
-        prov = await get_manager().get_provider()
-        h = await prov.health()
-        provider_n_ctx = h.get("n_ctx") or None
+        h = await get_manager().probe()
+        if h.get("server_reachable"):
+            provider_n_ctx = h.get("n_ctx") or None
     except Exception:  # noqa: BLE001 — context bar must never break the page
         pass
     if provider_n_ctx:
@@ -761,20 +976,33 @@ async def download(token: str, request: Request, user=Depends(require_user)):
 # ---- User uploads (device -> server) ---------------------------------------
 @router.post("/api/upload")
 async def upload_files(request: Request, conversation_id: str = Form(""),
+                       prefix: str = Form("uploads"),
                        files: list[UploadFile] = File(...),
                        user=Depends(require_user), _=Depends(check_csrf)):
     """Accept one or more uploaded files into the caller's workspace jail.
 
     Files are streamed to disk in bounded chunks (never fully buffered), size-capped,
-    and stored under uploads/<safe-name>. Each becomes an Artifact row so it appears in
+    and stored under <prefix>/<safe-name>. Each becomes an Artifact row so it appears in
     the session Artifacts panel. Returns the created artifact list.
+
+    `prefix` picks the destination folder and is NOT free-form: only ``uploads`` (default)
+    or the caller's own linked-project prefix is accepted, and the client-supplied name is
+    still reduced to a bare basename by _safe_filename — so there is no traversal surface.
+    Uploading into the project copy stages files for sync_apply; nothing reaches the real
+    folder until an approved apply (DEC-049).
     """
     if not files:
         raise HTTPException(400, "no files")
+    target_prefix = (prefix or "uploads").strip().strip("/")
+    if target_prefix != "uploads":
+        link = pl.get_link(user.id)
+        if not link or target_prefix != link["rel_prefix"]:
+            raise HTTPException(400, f"cannot upload to '{target_prefix}' — no such "
+                                     f"destination is linked to your workspace")
     created = []
     for f in files:
         safe_name = _safe_filename(f.filename or "upload.bin")
-        rel_target = os.path.join("uploads", safe_name)
+        rel_target = os.path.join(target_prefix, safe_name)
         dest = ws.resolve_in_jail(user.id, rel_target)
         dest.parent.mkdir(parents=True, exist_ok=True)
         written = 0
@@ -847,8 +1075,34 @@ async def download_artifact(artifact_id: str, request: Request, user=Depends(req
 @router.post("/api/artifact/{artifact_id}/delete")
 async def delete_artifact(artifact_id: str, request: Request,
                           user=Depends(require_user), _=Depends(check_csrf)):
+    """Forget an artifact. Body: {purge?: bool}.
+
+    The row always goes. With purge=true the workspace file is deleted too — otherwise
+    the bytes stay in the jail with nothing left to list or download them (the original
+    row-only behaviour, kept as the default for callers that just want the entry gone).
+    Ownership is enforced by artifacts.delete(); the path is resolved through the jail
+    before anything is removed.
+    """
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001 — no/invalid body means row-only, as before
+        pass
+    art = artifacts.get(user.id, artifact_id)
+    if not art:
+        return JSONResponse({"ok": False})
+    removed_file = False
+    if bool(body.get("purge")):
+        try:
+            p = ws.resolve_in_jail(user.id, art["rel_path"])
+            if os.path.isfile(p):
+                os.remove(p); removed_file = True
+        except (ws.JailEscape, FileNotFoundError):
+            pass   # already gone; the row still gets forgotten below
     ok = artifacts.delete(user.id, artifact_id)
-    return JSONResponse({"ok": ok})
+    audit.log(user.id, "artifact_delete", {"id": artifact_id, "path": art["rel_path"],
+                                           "purged": removed_file})
+    return JSONResponse({"ok": ok, "file_deleted": removed_file})
 
 
 # ---- Language preference ----------------------------------------------------
@@ -910,3 +1164,112 @@ async def set_prefs(request: Request, user=Depends(require_user), _=Depends(chec
         merged.update(clean)
         u.prefs = json.dumps(merged)
     return JSONResponse({"ok": True, "prefs": {k: v for k, v in merged.items() if k in _PREF_KEYS}})
+
+
+# ---- Linked project folder (DEC-049, user-facing) ---------------------------
+# These four operate ONLY on the requesting user's own link (project_link.get_link filters
+# by user_id), so a user without a link simply gets "not linked" and a user can never reach
+# another user's target folder. Link/unlink stay admin-only because they name an absolute
+# path on the server filesystem; nothing here takes a path argument at all.
+def _project_summary(user_id: str) -> dict:
+    """Cheap-enough view for the chat chip: counts + conflicts, no file contents.
+
+    NOTE ON COST: diff_project() hashes every file in the copy and re-hashes each baseline
+    target, so this is O(project size). It is therefore called on demand only (turn end,
+    manual refresh, before an apply) — never from a poll timer or from prompt building.
+    """
+    link = pl.get_link(user_id)
+    if not link:
+        return {"linked": False}
+    out = {"linked": True, "prefix": link["rel_prefix"],
+           "imported_at": int(link["imported_at"] or 0),
+           "backend": pa.detect_backend("auto"),
+           "encryption_blocks_apply": crypto.encryption_enabled()}
+    try:
+        out["exists"] = pl.target_root(link).is_dir()
+    except pl.LinkError:
+        out["exists"] = False
+    mf = pl.load_manifest(user_id, link)
+    out["files"] = len(mf.get("files") or {})
+    try:
+        cs = pl.diff_project(user_id, link)
+        out.update({"added": len(cs.added), "modified": len(cs.modified),
+                    "conflicts": [str(c) for c in cs.conflicts],
+                    "deleted": len(cs.deleted), "unchanged": cs.unchanged})
+        # Only paths that an apply would actually write — shown in the confirm card.
+        out["will_write"] = cs.applyable[:200]
+    except pl.LinkError as e:
+        out["diff_error"] = str(e)
+    return out
+
+
+@router.get("/api/project/status")
+async def project_status(user=Depends(require_user)):
+    """Whether this user has a linked folder, and what the copy prefix is."""
+    link = pl.get_link(user.id)
+    if not link:
+        return JSONResponse({"linked": False})
+    return JSONResponse({"linked": True, "prefix": link["rel_prefix"],
+                         "imported_at": int(link["imported_at"] or 0),
+                         "backend": pa.detect_backend("auto"),
+                         "encryption_blocks_apply": crypto.encryption_enabled()})
+
+
+@router.get("/api/project/summary")
+async def project_summary(user=Depends(require_user)):
+    """Pending change counts + conflicts. On demand only (see _project_summary cost note)."""
+    if not pl.get_link(user.id):
+        return JSONResponse({"linked": False})
+    from . import runtime_settings as rs
+    try:
+        summary = _project_summary(user.id)
+    except pl.LinkError as e:
+        raise HTTPException(400, str(e))
+    summary["apply_enabled"] = (summary.get("backend") != "stub"
+                                and not summary.get("encryption_blocks_apply"))
+    summary["settings_ok"] = bool(rs.get_all().get("tools.sync_apply", True))
+    return JSONResponse(summary)
+
+
+@router.post("/api/project/apply")
+async def project_apply_now(user=Depends(require_user), _=Depends(check_csrf)):
+    """User-initiated write-back. The click IS the approval — no model involvement.
+
+    apply_changes() re-computes the diff and re-checks every target against the baseline
+    before writing, so a conflict discovered after the user pressed the button still blocks
+    the whole apply rather than half-applying.
+    """
+    link = pl.get_link(user.id)
+    if not link:
+        raise HTTPException(400, "No project folder is linked to your workspace.")
+    from . import runtime_settings as rs
+    settings = rs.get_all()
+    if not settings.get("tools.sync_apply", True):
+        audit.log(user.id, "sync_apply_refused_admin", {"why": "tool disabled"})
+        raise HTTPException(403, "Project sync-apply is disabled by an admin "
+                                 "(Admin → Tools → Linked project folder).")
+    res = pa.apply_changes(user.id, settings, link)
+    audit.log(user.id, "sync_apply_ui", {"target": link["target_abs"], "ok": res.ok,
+                                         "written": res.written[:40], "refused": res.refused[:20],
+                                         "backend": res.backend})
+    return JSONResponse({"ok": res.ok, "note": res.note, "written": res.written,
+                         "refused": res.refused[:50], "backup_id": res.backup_id,
+                         "backend": res.backend}, status_code=200)
+
+
+@router.post("/api/project/revert")
+async def project_revert_by_user(request: Request, user=Depends(require_user),
+                                 _=Depends(check_csrf)):
+    """Restore the files one apply backed up."""
+    body = await request.json()
+    backup_id = str(body.get("backup_id") or "")
+    try:
+        res = pa.revert(user.id, backup_id)
+    except pl.LinkError as e:
+        raise HTTPException(400, str(e))
+    audit.log(user.id, "project_revert_ui", {"backup_id": backup_id,
+                                             "restored": res.written[:40],
+                                             "refused": res.refused[:20]})
+    if not res.ok:
+        raise HTTPException(400, res.note)
+    return JSONResponse({"ok": True, "note": res.note, "restored": res.written})

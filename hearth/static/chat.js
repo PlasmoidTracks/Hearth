@@ -32,6 +32,66 @@ function addMsg(role, html, ts){
   return bubble;
 }
 
+// A finished reasoning block from history (or a live one is built inline in handleEvent).
+// Same shape as the live block so a reload does not restyle the transcript. Content goes in
+// as textContent, never innerHTML: reasoning is model output and can contain markup.
+// The wrap must carry `text-[12px]` exactly like the live block (handleEvent 'reasoning'):
+// the vendored Tailwind build only ships utilities it has seen at least once, so a class
+// present in just one of the two builders is styled on the page that generated it and falls
+// back to the inherited 14px bubble text on the other — which is why reasoning blobs grew
+// after returning from Admin (or after any re-render). Keep both builders' classes in sync.
+// Both builders open the block (`d.open = true`): thinking is expanded by default and the
+// user collapses what they do not want to see. Height cap lives in base.css.
+function addReasoningBlock(text, ts){
+  const wrap = document.createElement('div');
+  wrap.className = 'flex justify-start w-full text-[12px]';
+  if(ts) wrap.setAttribute('data-ts', String(ts));
+  const d = document.createElement('details');
+  d.open = true;   // expanded by default — the thinking is worth reading, click to tidy
+  d.className = 'mb-1 rounded-lg border border-slate-800 bg-slate-900/40';
+  const sum = document.createElement('summary');
+  sum.className = 'cursor-pointer px-2 py-1 text-slate-500 select-none';
+  sum.textContent = I18N.t('chat.reasoning','Reasoning');
+  const body = document.createElement('div');
+  // `bubble-body` caps the height at ~10 lines (base.css) with an inner scrollbar:
+  // long thinking scrolls inside the block instead of pushing the answer away.
+  body.className = 'bubble-body px-3 pb-2 pt-1 text-slate-400 italic whitespace-pre-wrap break-words';
+  body.textContent = text || '';
+  d.appendChild(sum); d.appendChild(body); wrap.appendChild(d);
+  msgsEl.appendChild(wrap);
+  return body;
+}
+
+// A finished audio caption from history — the persisted twin of the live caption_chunk
+// block (DEC-061). Same indigo styling as the streaming one so a reload does not restyle
+// the transcript, but collapsed: on a long chat, opening every past description at once
+// would push the conversation away. The summary says whether it succeeded, because the
+// honest distinction between "no description" and "description failed" is the part users
+// could not see before.
+function addCaptionBlockStatic(text, info, ts){
+  const wrap = document.createElement('div');
+  wrap.className = 'flex justify-start w-full text-[12px]';
+  if(ts) wrap.setAttribute('data-ts', String(ts));
+  const d = document.createElement('details');
+  d.className = 'mb-1 rounded-lg border border-indigo-900/60 bg-slate-900/40';
+  const sum = document.createElement('summary');
+  sum.className = 'cursor-pointer px-2 py-1 text-indigo-300/80 select-none';
+  const T = (k, fb)=> (window.I18N && I18N.t(k)) || fb;
+  const ok = info && info.ok !== false;
+  sum.textContent = `🎧 ${T('chat.caption_streaming','Audio model')}` +
+    (info && info.name ? ` · ${info.name}` : '') +
+    (ok ? '' : ` · ${T('chat.caption_failed_short','could not describe')}`);
+  const body = document.createElement('div');
+  // `bubble-body` replaces the old inline max-h-[60vh]: one cap for every transcript
+  // block, defined once in base.css (≈10 lines, scrolls inside, never clipped).
+  body.className = 'bubble-body px-3 pb-2 pt-1 text-slate-400 italic whitespace-pre-wrap break-words';
+  // textContent, never innerHTML: a caption is model output and can contain markup.
+  body.textContent = text || '';
+  d.appendChild(sum); d.appendChild(body); wrap.appendChild(d);
+  msgsEl.appendChild(wrap);
+  return body;
+}
+
 // ---- Auto-scroll (pref: auto_scroll) ----------------------------------------
 // The transcript follows output while streaming when the pref is on. When it's
 // off — or the user has scrolled up to read something — nothing yanks them back
@@ -69,16 +129,31 @@ function clearActivity(){
   S.activityEl = null;
 }
 
+// One tool result in the transcript. The whole bubble is a <details>: the header
+// (tool name + ✓/✗) is the collapse affordance, and the body is capped at ~10 lines
+// by base.css (`.bubble-body`) and scrolls inside — so nothing is ever cut short, but
+// a long file read cannot dominate the transcript either. Expanded by default; click
+// the header to tidy it away. Height lives in CSS, not Tailwind utilities — see the
+// note in base.css about the JIT build and first paint.
 function toolChip(name, ok, preview, live){
-  const el = document.createElement('div');
-  const label = (window.I18N && I18N.t('chat.tool')) || 'tool';
-  el.className = 'text-[11px] font-mono bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 max-w-[85%]';
-  el.innerHTML = `<span class="text-slate-400">${esc(label)}:</span> <b>${esc(name)}</b> ` +
-    `<span class="${ok?'text-emerald-400':'text-red-400'}">${ok?'✓':'✗'}</span>` +
-    `<pre class="mt-1 text-slate-300 whitespace-pre-wrap max-h-32 overflow-auto">${esc(preview||'')}</pre>`;
+  const el = document.createElement('details');
+  el.open = true;
+  el.className = 'tool-chip text-[11px] font-mono bg-slate-900 border border-slate-700 rounded-lg max-w-[85%]';
+  // The body used to be `max-h-32` — a ~5-line window on text the user needed to read,
+  // which is what made results look "cut off despite the scrollbar" (DEC-061). It now
+  // grows with the content and only scrolls past the shared cap.
+  el.innerHTML = `<summary class="cursor-pointer select-none">` +
+    `<span class="text-slate-400">${esc(labelTool())}:</span> <b class="text-slate-200">${esc(name)}</b> ` +
+    `<span class="${ok?'text-emerald-400':'text-red-400'}">${ok?'✓':'✗'}</span></summary>` +
+    `<div class="bubble-body border-t border-slate-700/60">` +
+    `<pre class="text-slate-300 whitespace-pre-wrap">${esc(preview||'')}</pre></div>`;
   msgsEl.appendChild(el); scrollToBottom();
   return el;
 }
+
+// The "tool:" prefix in a chip header. Kept as a function so the label is resolved
+// at render time (I18N loads per page, and switching language re-renders the transcript).
+function labelTool(){ return (window.I18N && I18N.t('chat.tool')) || 'tool'; }
 
 // ---- Web sources (search results / fetched pages) --------------------------
 // The web tools return structured meta: search -> meta.web.results[{title,url,
@@ -105,7 +180,7 @@ function webSourcesHtml(web){
     }).join('');
     if(!items) return '';
     return `<div class="mt-1 text-[11px] font-sans"><span class="text-slate-400">🔎 ${esc(T('chat.web_sources','Sources'))}${q}</span>${badge}` +
-      `<ul class="list-disc pl-4 mt-1 space-y-1 max-h-48 overflow-auto">${items}</ul></div>`;
+      `<ul class="list-disc pl-4 mt-1 space-y-1">${items}</ul></div>`;
   }
   if(web.url){
     const href = safeHref(web.url); if(!href) return '';
@@ -116,7 +191,7 @@ function webSourcesHtml(web){
         return `<li class="truncate"><a href="${esc(h)}" target="_blank" rel="noopener noreferrer" ` +
           `class="text-sky-400/80 hover:underline">${esc(l.text || hostOf(l.url))}</a></li>`;
       }).join('');
-      if(items) links = `<ul class="list-disc pl-4 mt-1 space-y-0.5 max-h-32 overflow-auto">${items}</ul>`;
+      if(items) links = `<ul class="list-disc pl-4 mt-1 space-y-0.5">${items}</ul>`;
     }
     return `<div class="mt-1 text-[11px] font-sans"><span class="text-slate-400">🌐 ` +
       `<a href="${esc(href)}" target="_blank" rel="noopener noreferrer" class="text-sky-400 hover:underline">${esc(T('chat.web_read','read page'))}: ${esc(hostOf(web.url))}</a>${badge}</span>${links}</div>`;
@@ -124,7 +199,9 @@ function webSourcesHtml(web){
   return '';
 }
 
-// Attach a rendered web-sources block to an existing chip/bubble element.
+// Attach a rendered web-sources block to an existing chip/bubble element. The list has
+// no max-height of its own: the chip body is the single scroll window (base.css), and a
+// nested scroller inside a scroller is how content used to look "cut off".
 function attachWebSources(el, web){
   const html = webSourcesHtml(web);
   if(!html || !el) return;
@@ -138,7 +215,7 @@ function attachWebSources(el, web){
 function pendingChip(name, summary){
   const el = document.createElement('div');
   el.dataset.tool = name;   // used to match this chip to its tool_result event
-  el.className = 'text-[11px] font-mono bg-slate-900/70 border border-sky-800 rounded-lg px-3 py-2 max-w-[85%]';
+  el.className = 'chip-transient text-[11px] font-mono bg-slate-900/70 border border-sky-800 rounded-lg px-3 py-2 max-w-[85%]';
   el.innerHTML = `<span class="text-sky-400 animate-pulse">●</span> <b>${esc(name)}</b> ` +
     `<span class="text-slate-400">${esc(summary||'')}</span>`;
   msgsEl.appendChild(el); scrollToBottom();
@@ -208,7 +285,7 @@ function toolProgress(ev, state){
   if(!p){
     const el = document.createElement('div');
     el.dataset.tool = ev.name;
-    el.className = 'text-[11px] font-mono bg-slate-900/70 border border-sky-800 rounded-lg px-3 py-2 max-w-[85%]';
+    el.className = 'chip-transient text-[11px] font-mono bg-slate-900/70 border border-sky-800 rounded-lg px-3 py-2 max-w-[85%]';
     const span = document.createElement('span');
     span.className = 'text-slate-400';
     el.innerHTML = `<span class="text-sky-400 animate-pulse">✎</span> <b>${esc(ev.name)}</b> `;
@@ -287,7 +364,7 @@ async function openConversation(id){
   S.convId = id; msgsEl.innerHTML = ''; clearActivity();
   S.lastUserText = '';
   setConvTitleLabel((S.convTitles || {})[id]);
-  scrollToBottom(true); refreshDeviceHint();
+  scrollToBottom(true); refreshDeviceHint(); loadSteerQueue();
   const r = await api(`/api/chat/conversations/${id}`); const hist = await r.json();  // History rows carry no event meta (a tool result's download link is not stored), so
   // downloads are re-resolved from the artifact store by filename: one ⬇ per file, and
   // only for `upload`/`zip_pack` rows — the live-stream policy of DEC-045. Scoped to this
@@ -298,8 +375,33 @@ async function openConversation(id){
   for(const a of arts){ if(!byName[a.filename]) byName[a.filename] = a; }
   const shownDl = new Set();
   for (const m of hist){
-    if (m.role === 'user') { addMsg('user', mdLite(m.content), m.created_at); S.lastUserText = m.content; continue; }
-    if (m.role === 'assistant'){ if (m.content) addMsg('assistant', mdLite(m.content), m.created_at); continue; }
+    if (m.role === 'user') {
+      addMsg('user', mdLite(m.content), m.created_at);
+      // A caption produced for this message's recording, restored after a refresh
+      // (DEC-061). It used to vanish entirely — the description lived only in an
+      // in-process cache and one transient SSE block. Rendered right after the user's
+      // bubble so it sits where it appeared live, collapsed by default (a reload of a
+      // long chat should not open every past caption at once).
+      const caps = m.captions || {};
+      for(const rel of Object.keys(caps)){
+        const info = caps[rel] || {};
+        let text = '';
+        try { const mt = m.meta ? JSON.parse(m.meta) : null;
+              const st = mt && mt.captions && mt.captions[rel];
+              text = (st && st.text) || ''; } catch(e){}
+        if(text) addCaptionBlockStatic(text, info, m.created_at);
+      }
+      S.lastUserText = m.content; continue;
+    }
+    if (m.role === 'assistant'){
+      // Stored reasoning (meta.reasoning) renders as the same collapsed block the live stream
+      // uses, ABOVE the answer. The server already applied the retention policy (Admin →
+      // Generation → Reasoning retention), so a missing key means "policy hid it", not "the
+      // model never thought" — either way there is nothing to render.
+      let rs = null;
+      try { const mt = m.meta ? JSON.parse(m.meta) : null; rs = mt && mt.reasoning; } catch(e){}
+      if (rs) addReasoningBlock(rs, m.created_at);
+      if (m.content) addMsg('assistant', mdLite(m.content), m.created_at); continue; }
     if (m.role !== 'tool') continue;
     let metaObj = {};
     try { metaObj = JSON.parse(m.meta) || {}; } catch(e){}
@@ -389,6 +491,10 @@ async function retryLastTurn(){
 // ---- Context-window usage bar --------------------------------------------
 function fmtTok(n){ if(n==null) return '—'; if(n>=1000000) return (n/1000000).toFixed(1)+'M'; if(n>=1000) return (n/1000).toFixed(n>=10000?0:1)+'k'; return String(Math.round(n)); }
 
+// Runs on every conversation open, so the endpoint it calls must be side-effect
+// free: /api/chat/context-usage used to resolve the provider (and thereby launch
+// llama-server), which meant entering the Chat UI restarted a model that had just
+// been stopped in Admin. It reads manager.probe() now — see DEC-048.
 async function loadContextUsage(){
   let d = null;
   try { const r = await api(`/api/chat/context-usage?conversation_id=${S.convId||''}`); if(!r || !r.ok) return; d = await r.json(); }
@@ -404,6 +510,19 @@ async function loadContextUsage(){
   }
   renderCtx({used: d.prompt_tokens, n_ctx: d.n_ctx, tokens_per_sec: d.tokens_per_sec,
              source: d.source, warning: d.warning});
+}
+
+// Human speed string for a usage payload. Prefers llama.cpp's measured rates
+// (decode_tps / prefill_tps, present only when the server reported them) and falls back
+// to Hearth's wall-clock tokens_per_sec marked with '~'. One function so the badge, the
+// context-bar tooltip and the debug line can never disagree about what a number means.
+function perfSpeedText(d){
+  if(!d) return '';
+  const parts = [];
+  if(d.decode_tps) parts.push(`${I18N.t('chat.decode','decode')} ${Number(d.decode_tps).toFixed(1)} t/s`);
+  if(d.prefill_tps) parts.push(`${I18N.t('chat.prefill', 'prefill')} ${Math.round(d.prefill_tps)} t/s`);
+  if(parts.length) return parts.join(' · ');
+  return d.tokens_per_sec ? `~${d.tokens_per_sec} tok/s` : '';
 }
 
 // Paint the header context bar. Shared by loadContextUsage() (server truth) and
@@ -426,9 +545,12 @@ function renderCtx(d){
   bar.style.width = Math.max(pct>0?1:0, pct*100).toFixed(1)+'%';
   bar.className = 'block h-full ' + (pct>=0.9 ? 'bg-red-500' : pct>=0.7 ? 'bg-amber-400' : 'bg-emerald-500');
   label.textContent = nctx ? `${fmtTok(used)} / ${fmtTok(nctx)}` : fmtTok(d.used);
-  const tps = d.tokens_per_sec ? ` · ${d.tokens_per_sec} tok/s` : '';
+  // Speed text: llama.cpp's OWN measured rates when the server reported them, our
+  // wall-clock figure only as the fallback — and labelled as an estimate so a heuristic
+  // never impersonates a measurement. perf.py parses, this only formats.
+  const spd = perfSpeedText(d);
   $('ctxWrap').title = I18N.t('chat.ctx_title',
-    'Tokens the model received on the last turn / configured window') + tps +
+    'Tokens the model received on the last turn / configured window') + (spd ? ` · ${spd}` : '') +
     (d.source==='estimate' ? ` (${I18N.t('chat.ctx_est','estimated')})` : '') +
     (d.warning ? ` — ${I18N.t('chat.ctx_warn','Context is nearly full: start a new chat or shorten files.')}` : '');
   label.classList.toggle('text-red-400', !!d.warning);
@@ -464,29 +586,108 @@ async function handleEvent(ev, state){
       activity(null);   // real output started; the chip was only for the quiet gaps
       if(!state.bubble) state.bubble = addMsg('assistant','');
       state.text = (state.text || '') + ev.text; state.bubble.innerHTML = mdLite(state.text); scrollToBottom(); break;
+    case 'reasoning': {
+      // The model's thinking, in its own collapsible block ABOVE the answer bubble and never
+      // merged into it. Rendered raw-escaped (no mdLite): reasoning text routinely contains
+      // half-written code and angle brackets that a markdown pass would mangle or that could
+      // inject markup. Created once per round and appended to, like the answer bubble.
+      if(!state.reasoningEl){
+        const wrap = document.createElement('div');
+        // Same wrapper classes as addReasoningBlock() — see the note there about keeping
+        // both in step so the vendored JIT build styles both identically.
+        wrap.className = 'flex justify-start w-full text-[12px]';
+        wrap.innerHTML = `<details open class="mb-1 rounded-lg border border-slate-800 bg-slate-900/40">
+          <summary class="cursor-pointer px-2 py-1 text-slate-500 select-none">${esc(I18N.t('chat.reasoning','Reasoning'))}</summary>
+          <div class="reasoning-body bubble-body px-3 pb-2 pt-1 text-slate-400 italic whitespace-pre-wrap break-words"></div></details>`;
+        msgsEl.appendChild(wrap);
+        state.reasoningEl = wrap.querySelector('.reasoning-body');
+      }
+      state.reasoningText = (state.reasoningText || '') + ev.text;
+      state.reasoningEl.textContent = state.reasoningText;
+      scrollToBottom(); break; }
     case 'progress': {
+      // Live prefill/decode telemetry from llama.cpp's own log lines (see perf.py +
+      // manager.poll_log_perf). A `decode` event has no percentage — never draw a bar for
+      // a number the server did not report.
+      const isPrefill = (ev.data.phase||'') === 'prefill';
+      if(!isPrefill){ dbg(`perf ${JSON.stringify(ev.data)}`); break; }
       $('progressWrap').classList.remove('hidden');
       const pct = Math.round((ev.data.pct||0)*100);
       $('progressBar').style.width = pct+'%';
-      $('progressLabel').textContent = `${ev.data.phase}… ${pct}%` + (ev.data.prompt_tokens?` (${ev.data.prompt_tokens} tok)`:'');
+      // ETA only when the server gave a rate AND enough of the prompt is measured — the
+      // server omits it otherwise, and an invented one is worse than none.
+      const eta = ev.data.eta ? ` · ≈${ev.data.eta} ${I18N.t('chat.left','left')}` : '';
+      const rate = ev.data.rate_tps ? ` · ${Math.round(ev.data.rate_tps)} t/s` : '';
+      $('progressLabel').textContent =
+        `${I18N.t('chat.prefill','prefill')}… ${pct}%` +
+        (ev.data.prompt_total ? ` (${fmtTok(ev.data.prompt_tokens)}/${fmtTok(ev.data.prompt_total)} tok)`
+                              : (ev.data.prompt_tokens?` (${fmtTok(ev.data.prompt_tokens)} tok)`:'')) +
+        rate + eta;
       if(ev.data.pct>=1) setTimeout(()=>$('progressWrap').classList.add('hidden'), 400);
-      activity(`${I18N.t('chat.prefill','prefill')}… ${pct}%`);
+      activity(`${I18N.t('chat.prefill','prefill')}… ${pct}%${eta}`);
       dbg(`progress ${JSON.stringify(ev.data)}`); break; }
     case 'usage': {
       // `~` marks an estimated figure (a tool round whose provider sent no usage) so a
-      // heuristic never silently impersonates a measured number.
-      setModelBadge(`model: ${ev.data.tokens_per_sec||'?'} tok/s · in ${ev.data.prompt_tokens||'?'}${ev.data.estimated?' ~':''}`, JSON.stringify(ev.data));
+      // heuristic never silently impersonates a measured number. Speed text prefers
+      // llama.cpp's measured rates — see perfSpeedText().
+      const spd = perfSpeedText(ev.data);
+      setModelBadge(`model: ${spd || '?'} · in ${ev.data.prompt_tokens||'?'}${ev.data.estimated?' ~':''}`, JSON.stringify(ev.data));
       // Feed the context bar live: this is the first moment a brand-new chat has
       // any token count at all (the persisted value only lands when the turn ends).
       if(ev.data.prompt_tokens || ev.data.n_ctx){
         renderCtx({used: ev.data.prompt_tokens, n_ctx: ev.data.n_ctx,
-                   tokens_per_sec: ev.data.tokens_per_sec, estimated: ev.data.estimated});
+                   tokens_per_sec: ev.data.tokens_per_sec, estimated: ev.data.estimated,
+                   decode_tps: ev.data.decode_tps, prefill_tps: ev.data.prefill_tps});
       }
       dbg(`usage ${JSON.stringify(ev.data)}`); break; }
     case 'tool_progress': {
       // The model is still composing a tool call (args streaming in) — show the
       // growing write buffer so long fs_writes never look like a hang.
       toolProgress(ev, state); break; }
+    case 'notice': {
+      // Server-side progress that is not a tool call: describing an attached recording with
+      // the captioner model takes real time (ffmpeg + listening), and without any signal it
+      // is indistinguishable from a hang. The start/done pair is one activity line; the
+      // streamed caption text (caption_chunk) grows its own collapsible block, like reasoning,
+      // so the user can watch the audio model work rather than guess. Never a transcript
+      // bubble per file — that would spam the chat for something that succeeded.
+      //
+      // Keyed PER FILE (state.captions), not one shared element: DEC-061 added a second
+      // source of these events (the describe_audio TOOL, alongside attachment captioning), so
+      // two recordings in one turn would otherwise interleave their text into a single block.
+      if(ev.kind === 'caption_start') activity(`🎧 ${esc(ev.text || '')}`);
+      else if(ev.kind === 'caption_chunk'){
+        const key = ev.file || '_';
+        state.captions = state.captions || {};
+        let c = state.captions[key];
+        if(!c){
+          const wrap = document.createElement('div');
+          // Same wrapper classes as addCaptionBlockStatic() — keep both in step.
+          wrap.className = 'flex justify-start w-full text-[12px]';
+          wrap.innerHTML = `<details open class="mb-1 rounded-lg border border-indigo-900/60 bg-slate-900/40">
+            <summary class="cursor-pointer px-2 py-1 text-indigo-300/80 select-none">🎧 ${esc(I18N.t('chat.caption_streaming','Audio model'))}${ev.file ? ' · ' + esc(ev.file) : ''}</summary>
+            <div class="caption-body bubble-body px-3 pb-2 pt-1 text-slate-400 italic whitespace-pre-wrap break-words"></div></details>`;
+          msgsEl.appendChild(wrap);
+          c = state.captions[key] = {el: wrap.querySelector('.caption-body'), text: ''};
+        }
+        // Server sends the (throttled) accumulated pieces as deltas, so append — same shape
+        // as reasoning. textContent, never innerHTML: model output can contain markup.
+        c.text += (ev.text || '');
+        c.el.textContent = c.text;
+        activity(`🎧 ${esc(I18N.t('chat.listening','listening to the audio…'))}`);
+        scrollToBottom();
+      }
+      else if(ev.kind === 'caption_done'){
+        // Collapse now that it is finished: the answer bubble carries the real result, and a
+        // permanently-open transcript block would push the assistant's reply off screen.
+        const key = ev.file || '_';
+        const c = (state.captions || {})[key];
+        if(c){ const d = c.el.closest('details'); if(d) d.open = false; }
+        activity(null);
+        dbg(`caption ${esc(ev.file||'')} ok=${ev.ok}`);
+        if(!ev.ok) addMsg('assistant', `<span class="text-amber-400">${esc(I18N.t('chat.caption_failed','I could not listen to that file — see its note in the message.'))}</span>`);
+      } else dbg(`notice ${JSON.stringify(ev)}`);
+      break; }
     case 'tool_call': {
       // Show what it is doing, and keep showing it until the result lands —
       // a long fs_write/zip/exec must never look like a frozen UI.
@@ -534,12 +735,26 @@ async function handleEvent(ev, state){
     case 'aborted':
       state.aborted = true;
       clearPending(state);
+      // Collapse any caption block that was mid-stream when Stop hit (partial, and the turn
+      // is over, so leaving them expanded would push the "Turn aborted." line off screen).
+      // All of them: DEC-061 means there can be more than one now.
+      Object.values(state.captions || {}).forEach(c => {
+        const d = c.el.closest('details'); if(d) d.open = false;
+      });
       activity(null);
       addMsg('assistant', `<span class="text-amber-400">${esc(I18N.t('chat.aborted','Turn aborted.'))}</span>`);
       break;
     case 'error': activity(null); clearPending(state);
       addMsg('assistant', `<span class="text-red-400">${esc(ev.text)}</span>`); break;
-    case 'done': if(ev.awaiting){ state.awaiting = true; } else { clearPending(state); } setBusy(false); break;
+    case 'steered':
+      // A message the user sent WHILE this turn was running, now delivered at the
+      // between-rounds seam. It becomes an ordinary user bubble at that point in the
+      // transcript — which is exactly what it was: speech the model read before continuing.
+      addMsg('user', mdLite(ev.text || ((ev.attachments||[]).join(', '))));
+      loadSteerQueue();
+      break;
+
+    case 'done': if(ev.awaiting){ state.awaiting = true; } else { clearPending(state); } setBusy(false); loadSteerQueue(); break;
   }
 }
 
@@ -608,14 +823,31 @@ async function loadArtifacts(){
   for(const a of items){
     const li = document.createElement('li'); li.className='flex items-center gap-2 text-sm';
     const kindIcon = a.kind==='uploaded' ? '⬆' : '📄';
-    // Explicit ⬇ button: on touch, tapping the filename alone is not an obvious
-    // affordance, and `download` links can be swallowed by some browsers.
+    // No separate ⬇ button any more: the filename already downloads, and every
+    // other action lives in the ⋮ menu (openFileMenu) — attach to next message,
+    // preview, copy link, delete. Keeps the row quiet on narrow phones while
+    // still exposing everything; long-press / right-click open the same menu.
     li.innerHTML = `<span class="opacity-60">${kindIcon}</span>` +
-      `<a href="${a.download_url}" class="truncate flex-1 text-sky-400 hover:underline" download>${esc(a.filename)}</a>` +
+      `<a href="${a.download_url}" class="truncate flex-1 text-sky-400 hover:underline" download title="${esc(a.rel_path||a.filename)}" data-i18n-title="chat.art_open_dl">${esc(a.filename)}</a>` +
       `<span class="text-[10px] text-slate-500 shrink-0">${fmtSize(a.size)}</span>` +
-      `<a href="${a.download_url}" title="Download" data-i18n-title="chat.download" class="shrink-0 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1 text-xs" download>⬇</a>`;
+      `<button type="button" data-art-menu="${esc(a.id)}" title="More options" data-i18n-title="chat.more_options" ` +
+      `class="shrink-0 rounded px-1.5 py-0.5 text-slate-500 hover:text-white opacity-60 hover:opacity-100">⋮</button>`;
     ul.appendChild(li);
   }
+}
+
+// The artifact list is re-rendered wholesale by loadArtifacts(), so its click and
+// long-press handlers are delegated once on the <ul> (see wiring below) rather than
+// per row. findArtifact() recovers what the menu needs from the row itself — the
+// panel already renders name + download URL, so nothing has to be cached at load time.
+function findArtifact(id){
+  const li = document.querySelector(`#artifactList [data-art-menu="${CSS.escape(id)}"]`);
+  if(!li) return null;
+  const row = li.closest('li'); if(!row) return null;
+  const a = row.querySelector('a[href]');
+  const sizeEl = row.querySelector('span.text-slate-500');
+  return { id, name: a ? a.textContent.trim() : '', url: a ? a.getAttribute('href') : '',
+           size: sizeEl ? sizeEl.textContent.trim() : '' };
 }
 
 // ---- Uploads (staged; sent with the next message) -------------------------
@@ -635,6 +867,11 @@ async function stageFiles(fileList){
     }
     const fd = new FormData();
     fd.append('conversation_id', S.convId || '');
+    // Upload-destination toggle: files normally land in uploads/; with the toggle on they
+    // go into the linked project copy so sync_apply can write them to the real folder.
+    // The server validates this value against the caller's own link — it is a hint, not
+    // a path, and an unknown value is rejected with 400.
+    if (S.uploadToProject && S.proj && S.proj.linked) fd.append('prefix', S.proj.prefix);
     fd.append('files', f, f.name);
     try {
       const r = await fetch('/api/upload', { method:'POST', credentials:'same-origin',
@@ -660,6 +897,125 @@ function renderAttachStrip(){
   strip.innerHTML = S.attachments.map((a,i)=>`<span class="inline-flex items-center gap-1 text-xs bg-slate-800 border border-slate-700 rounded-lg px-2 py-1">
       ${esc(a.name)} <button data-rmatt="${i}" class="text-red-400 hover:text-red-300 ml-1" title="remove">✕</button></span>`).join('');
   strip.querySelectorAll('[data-rmatt]').forEach(b=> b.onclick = ()=>{ S.attachments.splice(parseInt(b.getAttribute('data-rmatt')),1); renderAttachStrip(); });
+}
+
+// Stage an EXISTING artifact (Files panel → "Attach to message") into the composer.
+// No upload happens: the file is already in the workspace with an owned artifact row,
+// and /api/chat/stream re-resolves artifact ids by owner (DEC-024), so referencing it
+// is all that "send as attachment" needs. Deduped by id so pressing the item twice
+// does not stack two identical chips. The chat must exist first, because attachments
+// are always scoped to a conversation on the server.
+async function stageArtifact(art){
+  if(!art || !art.id) return;
+  if(!S.convId) await newConversation();
+  if(S.attachments.some(a=> a.artifact_id === art.id)){ flashAttachHint(I18N.t('chat.art_already_attached','Already attached.')); return; }
+  S.attachments.push({ artifact_id: art.id, name: art.name, mime: '' });
+  renderAttachStrip();
+  flashAttachHint(I18N.t('chat.art_attached','Attached to the next message.'));
+}
+
+// Brief confirmation next to the composer that staging worked — the strip chip alone
+// is easy to miss when the sidebar drawer is open on a phone.
+function flashAttachHint(text){
+  const hint = $('turnHint'); if(!hint) return;
+  hint.textContent = text;
+  clearTimeout(flashAttachHint._t);
+  flashAttachHint._t = setTimeout(()=>{ hint.textContent = ''; }, 2600);
+}
+
+// ---- Files panel ⋮ menu ---------------------------------------------------
+// Actions on one file. Everything lives here instead of as buttons per row: the
+// filename is already a download link, so a second ⬇ was pure noise (and ate width
+// a truncated name needs). The item list is data-driven like ATTACH_ITEMS, so a new
+// action is one entry — `visible` hides it when it cannot apply.
+const FILE_MENU_ITEMS = [
+  { act: 'download', icon: '⬇', label: 'chat.download' },
+  { act: 'attach',   icon: '📎', label: 'chat.art_attach' },
+  { act: 'preview',  icon: '👁', label: 'chat.art_preview',
+    visible: (a)=> !!a.url && /\.(png|jpe?g|gif|webp|bmp|svg|avif|heic)$/i.test(a.name) },
+  { act: 'copylink', icon: '⧉', label: 'chat.art_copy_link' },
+  { act: 'delete',   icon: '🗑', label: 'chat.delete', danger: true },
+];
+
+function fileMenuItemHtml(it){
+  return `<button type="button" data-act="${it.act}" class="w-full text-left px-3 py-2 hover:bg-slate-700 flex items-center gap-2 ${it.danger ? 'text-red-300 hover:bg-red-900/60' : ''}">` +
+         `<span class="shrink-0">${it.icon}</span><span data-i18n="${it.label}">${esc(I18N.t(it.label))}</span></button>`;
+}
+
+function openFileMenu(art, x, y){
+  closeConvMenu();
+  closeFileMenu();
+  if(!art) return;
+  const menu = document.createElement('div');
+  menu.id = 'fileMenu';
+  menu.className = 'fixed z-50 min-w-[190px] rounded-lg border border-slate-700 bg-slate-800 shadow-xl py-1 text-sm';
+  const items = FILE_MENU_ITEMS.filter(it=> !it.visible || it.visible(art));
+  // A subheading with the file name: several rows look alike once truncated, and a
+  // menu that says only "Delete" gives no chance to notice you picked the wrong one.
+  menu.innerHTML = `<div class="px-3 py-1.5 text-[11px] text-slate-400 border-b border-slate-700/70 truncate" title="${esc(art.name)}">${esc(art.name)}</div>` +
+                   items.map(it=> fileMenuItemHtml(it)).join('');
+  document.body.appendChild(menu);
+  const r = menu.getBoundingClientRect();
+  menu.style.left = Math.max(4, Math.min(x, window.innerWidth  - r.width  - 8)) + 'px';
+  menu.style.top  = Math.max(4, Math.min(y, window.innerHeight - r.height - 8)) + 'px';
+  for(const it of items){
+    const b = menu.querySelector(`[data-act="${it.act}"]`); if(!b) continue;
+    b.onclick = ()=>{ closeFileMenu(); fileMenuAction(it.act, art); };
+  }
+  // Same deferred outside-close trick as openConvMenu: the opening click's own
+  // mousedown is still dispatching, so attaching now would close it immediately.
+  setTimeout(()=> document.addEventListener('mousedown', _fileMenuAway, true), 0);
+}
+
+function closeFileMenu(){
+  const m = document.getElementById('fileMenu');
+  if(m) m.remove();
+  document.removeEventListener('mousedown', _fileMenuAway, true);
+}
+
+function _fileMenuAway(e){
+  const m = document.getElementById('fileMenu');
+  if(m && !m.contains(e.target) && !e.target.closest('[data-art-menu]')) closeFileMenu();
+}
+
+async function fileMenuAction(act, art){
+  if(act === 'download'){ downloadArtifact(art); return; }
+  if(act === 'attach'){ await stageArtifact(art); return; }
+  if(act === 'preview'){ window.open(art.url, '_blank', 'noopener'); return; }
+  if(act === 'copylink'){ await copyArtifactLink(art); return; }
+  if(act === 'delete'){ await deleteArtifactFromPanel(art); }
+}
+
+// Trigger the download from JS rather than reusing an <a download> click: inside a
+// detached menu that has already been removed, a synthetic anchor click is dropped by
+// some browsers (Safari especially). A real navigation always goes through.
+function downloadArtifact(art){
+  if(!art || !art.url) return;
+  const a = document.createElement('a');
+  a.href = art.url; a.download = art.name || ''; a.rel = 'noopener';
+  document.body.appendChild(a); a.click(); a.remove();
+}
+
+async function copyArtifactLink(art){
+  const url = art.url ? new URL(art.url, location.origin).href : '';
+  try { await navigator.clipboard.writeText(url); flashAttachHint(I18N.t('chat.art_link_copied','Link copied.')); }
+  catch(e){ flashAttachHint(url || I18N.t('chat.art_copy_failed','Could not copy the link.')); }
+}
+
+// Delete = remove the artifact record. The endpoint also deletes the workspace file
+// when the body says `purge:true` (it used to drop only the row, leaving the bytes in
+// the workspace with nothing left to point at them). Destructive, so it asks: plain
+// confirm here, mirroring the conversation ⋮ menu's delete.
+async function deleteArtifactFromPanel(art){
+  if(!confirm(I18N.t('chat.art_delete_confirm','Delete this file? It is removed from your workspace too.'))) return;
+  let ok = false;
+  try {
+    const r = await api(`/api/artifact/${encodeURIComponent(art.id)}/delete`,
+                        {method:'POST', body: JSON.stringify({purge:true})});
+    ok = !!(r && r.ok);
+  } catch(e){ ok = false; }
+  if(!ok) flashAttachHint(I18N.t('chat.art_delete_failed','Could not delete the file.'));
+  await loadArtifacts();
 }
 
 function wireDragDrop(){
@@ -823,6 +1179,136 @@ async function loadSkills(){
   listEl.innerHTML = protocols.map(d=>`<div class="rounded-lg border border-slate-700 bg-slate-800/60 px-3 py-2 text-sm">📜 <b>${esc(d.name)}</b></div>`).join('');
 }
 
+// ---- Attach menu (composer) -----------------------------------------------
+// One 📎 button replaces the old standalone 📎/📷 buttons; its items live in a
+// popup so future actions (project tools, etc.) extend ATTACH_ITEMS instead of
+// growing the input row. The panel is positioned fixed above the button and
+// closes on outside click / Escape / scroll / resize — same pattern as the
+// conversation ⋮ menu (openConvMenu).
+//
+// Each item: label i18n key, optional icon, `checkable` renders a ✓ state box
+// bound to S.uploadToProject, `visible` decides whether it shows at all.
+const ATTACH_ITEMS = [
+  { act: 'files',   icon: '📎', label: 'chat.upload' },
+  // Camera/gallery only makes sense while a project link is active (matches the
+  // previous behavior, where the capture input was only clickable then). Gated
+  // here via visible() instead of by un-hiding the raw <input type=file>.
+  { act: 'camera',  icon: '📷', label: 'chat.am_camera',
+    visible: ()=> !!(S.proj && S.proj.linked) },
+  // Upload destination toggle (DEC-049): shown only when a project folder is
+  // linked. Off = files attach to the chat as always (uploads/). On = files land
+  // in the project copy so they can be applied to the real folder. The server
+  // validates this value against the caller's own link; it is never a path.
+  { act: 'proj_into', icon: '⬥', label: 'chat.am_proj_into', title: 'chat.am_proj_hint',
+    checkable: true, visible: ()=> !!(S.proj && S.proj.linked) },
+];
+
+function attachItemHtml(it){
+  const box = it.checkable
+    ? `<span class="shrink-0 w-4 text-center ${S.uploadToProject ? 'text-emerald-400' : 'text-slate-600'}">${S.uploadToProject ? '✓' : '○'}</span>`
+    : '';
+  return `<button type="button" data-am="${it.act}" class="w-full text-left px-3 py-2 hover:bg-slate-700 flex items-center gap-2">` +
+         `${box}<span class="shrink-0">${it.icon}</span><span data-i18n="${it.label}">${esc(I18N.t(it.label))}</span></button>`;
+}
+
+// Positioning lives in base.css (#attachWrap/#attachMenu anchor the panel to
+// the button in pure CSS). Why not JS coordinates: the vendored Tailwind build
+// compiles styles asynchronously (MutationObserver-driven), so the layout can
+// shift AFTER we measure — a one-shot getBoundingClientRect() then places the
+// popup against a transient position, i.e. off to the side or off-screen
+// ("menu doesn't show"). All that's left here is a horizontal nudge for narrow
+// phones: if the panel overflows the right edge, shift it left by the overlap.
+// It reads only the menu's own rect and runs again after Tailwind settles.
+function clampAttachMenu(){
+  const menu = $('attachMenu');
+  if(!menu || menu.classList.contains('hidden')) return;
+  const mr = menu.getBoundingClientRect();
+  if(!mr.width) return;
+  const overflow = mr.right - (window.innerWidth - 8);
+  if(overflow > 0){
+    // left is CSS `0` against the wrapper; move via a negative margin so the
+    // CSS anchor stays the single source of truth for vertical placement.
+    const cur = parseFloat(menu.style.getPropertyValue('--am-shift')) || 0;
+    menu.style.setProperty('--am-shift', (cur - overflow) + 'px');
+    menu.style.left = 'var(--am-shift, 0px)';
+  }
+}
+
+// Re-render the open panel (check state / project link changed).
+function refreshAttachMenu(){
+  const menu = $('attachMenu');
+  if(!menu || menu.classList.contains('hidden')) return;
+  renderAttachMenu();
+}
+
+// Rebuild the panel from ATTACH_ITEMS. Labels keep data-i18n attributes so a
+// language switch while the menu is open re-translates them via I18N.apply().
+// No per-item handler wiring here — clicks go through wireAttachMenu's
+// delegation on #attachMenu, which survives these innerHTML rebuilds.
+function renderAttachMenu(){
+  const menu = $('attachMenu'); if(!menu) return;
+  menu.innerHTML = ATTACH_ITEMS.filter(it=> !it.visible || it.visible())
+    .map(attachItemHtml).join('');
+  for(const it of ATTACH_ITEMS){
+    const b = menu.querySelector(`[data-am="${it.act}"]`); if(!b) continue;
+    if(it.title) b.setAttribute('title', I18N.t(it.title));
+  }
+}
+
+// Toggle items re-render in place and KEEP the menu open (the checkmark should
+// respond without a reopen). Handlers are wired once at boot (wireAttachMenu)
+// via delegation — rebuilding innerHTML on every render would otherwise drop
+// them, which is exactly what made earlier versions do nothing on click.
+function attachMenuAction(act){
+  if(act === 'proj_into'){ S.uploadToProject = !S.uploadToProject; refreshAttachMenu(); return; }
+  closeAttachMenu();
+  // The hidden pickers do the actual work; programmatic click() works on
+  // display:none inputs, so #cameraInput stays permanently hidden.
+  if(act === 'files'){ const el=$('fileInput'); if(el) el.click(); return; }
+  if(act === 'camera'){ const el=$('cameraInput'); if(el) el.click(); return; }
+}
+
+// One-time wiring (runs at boot, after the menu button exists in the DOM).
+function wireAttachMenu(){
+  const btn = $('attachMenuBtn'), menu = $('attachMenu');
+  if(!btn || !menu) return;
+  btn.onclick = ()=>{
+    if(!menu.classList.contains('hidden')) closeAttachMenu(); else openAttachMenu();
+  };
+  // Delegation: survives every innerHTML rebuild of the panel.
+  menu.addEventListener('click', (e)=>{
+    const b = e.target.closest('[data-am]'); if(!b) return;
+    attachMenuAction(b.getAttribute('data-am'));
+  });
+}
+
+function openAttachMenu(){
+  renderAttachMenu();
+  const btn = $('attachMenuBtn'); if(btn) btn.setAttribute('aria-expanded', 'true');
+  const menu = $('attachMenu'); if(menu){ menu.classList.remove('hidden'); menu.style.left = ''; }
+  clampAttachMenu();
+  // The vendored Tailwind build restyles asynchronously; re-clamp once it has
+  // settled so a late layout shift can't leave the panel hanging off-screen.
+  requestAnimationFrame(()=>clampAttachMenu());
+  setTimeout(()=>{ if(!menu.classList.contains('hidden')) clampAttachMenu(); }, 150);
+  // Defer attaching the outside-close listener by a macrotask: click handlers
+  // dispatch synthetic events, and a same-task addEventListener would let the
+  // opening click's own bubbling mousedown close the menu again immediately.
+  setTimeout(()=> document.addEventListener('mousedown', _attachMenuAway, true), 0);
+}
+
+function closeAttachMenu(){
+  const menu = $('attachMenu'); if(!menu || menu.classList.contains('hidden')) return;
+  menu.classList.add('hidden');
+  const btn = $('attachMenuBtn'); if(btn) btn.setAttribute('aria-expanded', 'false');
+  document.removeEventListener('mousedown', _attachMenuAway, true);
+}
+
+function _attachMenuAway(e){
+  if(e.target.closest('#attachMenuBtn')) return;   // its own handler toggles
+  if(!e.target.closest('#attachMenu')) closeAttachMenu();
+}
+
 // ---- Wire up ----
 $('newChat').onclick = ()=>{ closeSidebar(); newConversation(); };
 $('logoutBtn').onclick = async ()=>{ await api('/auth/logout',{method:'POST'}); location.href='/login'; };
@@ -831,8 +1317,7 @@ if(dbgToggleEl) dbgToggleEl.onchange = (e)=>{ dbgEl.classList.toggle('hidden', !
 $('refreshArtifacts').onclick = loadArtifacts;
 $('abortBtn').onclick = abortTurn;
 $('retryBtn').onclick = retryLastTurn;
-$('attachBtn').onclick = () => $('fileInput').click();
-$('cameraBtn').onclick = () => $('cameraInput').click();
+wireAttachMenu();
 $('fileInput').onchange = (e) => { stageFiles(e.target.files); e.target.value=''; };
 $('cameraInput').onchange = (e) => { stageFiles(e.target.files); e.target.value=''; };
 $('langSel').onchange = (e) => setLanguage(e.target.value);
@@ -884,10 +1369,19 @@ $('composer').addEventListener('submit', async (e)=>{
   const state = {};
   S.abortCtrl = new AbortController();
   await streamPost('/api/chat/stream', payload, (ev)=>handleEvent(ev, state),
-                   {signal: S.abortCtrl.signal, aborted: ()=>state.aborted});
+                   {signal: S.abortCtrl.signal, aborted: ()=>state.aborted,
+                    // A turn is already running here: the server queued this message as
+                    // steering instead of starting a second stream. It answers with JSON, not
+                    // SSE, so streamPost hands it to onQueued rather than the event handler.
+                    onQueued: (j)=>{ state.queued = true; renderSteerQueue(j.queued||[]); }});
   S.abortCtrl = null;
-  loadConversations();
-  loadContextUsage();
+  // Queued means nothing was streamed for THIS message — it will appear as a user bubble at
+  // its delivery seam (the `steered` event). So: no conversation refresh, and Stay busy only
+  // if a turn is genuinely still running (it is — that is why we queued).
+  if(!state.queued){ loadConversations(); loadContextUsage(); }
+  // Refresh the project chip after each turn: the agent may have edited project/, and an
+  // approved sync_apply may already have written. On-demand only (hashes the tree).
+  if(!state.awaiting) loadProjectSummary();
   if(!state.awaiting) setBusy(false);
 });
 
@@ -1011,8 +1505,50 @@ $('convList').addEventListener('contextmenu', (e)=>{
 $('convList').addEventListener('touchend',    ()=> clearTimeout(_pressTimer));
 $('convList').addEventListener('touchmove',   ()=> clearTimeout(_pressTimer));
 $('convList').addEventListener('touchcancel', ()=> clearTimeout(_pressTimer));
+
+// ---- Files panel ⋮ menu wiring --------------------------------------------
+// Delegation on the <ul>: loadArtifacts() rebuilds every row, so per-row handlers
+// would have to be re-attached on each refresh (and were, before, implicitly by
+// innerHTML — which is why an explicit button used to be the only way in).
+const _artList = $('artifactList');
+if(_artList){
+  let artPress = null, artSuppress = false;
+  const artOpen = (id, x, y)=>{ const a = findArtifact(id); if(a) openFileMenu(a, x, y); };
+  _artList.addEventListener('click', (e)=>{
+    const mb = e.target.closest('[data-art-menu]');
+    if(!mb) return;
+    e.preventDefault(); e.stopPropagation();
+    if(artSuppress){ artSuppress = false; return; }   // long-press already opened it
+    const r = mb.getBoundingClientRect();
+    artOpen(mb.getAttribute('data-art-menu'), r.right - 190, r.bottom + 4);
+  });
+  // Right-click the row (not just the ⋮) → same menu.
+  _artList.addEventListener('contextmenu', (e)=>{
+    const mb = e.target.closest('[data-art-menu]'); if(!mb) return;
+    if(e.pointerType === 'touch' || artPress) return;
+    e.preventDefault();
+    artOpen(mb.getAttribute('data-art-menu'), e.clientX, e.clientY);
+  });
+  // Touch: long-press opens the menu and swallows the synthetic click that follows.
+  _artList.addEventListener('touchstart', (e)=>{
+    const mb = e.target.closest('[data-art-menu]'); if(!mb) return;
+    const t = e.touches[0]; const id = mb.getAttribute('data-art-menu');
+    artPress = setTimeout(()=>{
+      artSuppress = true; artOpen(id, t.clientX, t.clientY);
+      setTimeout(()=>{ artSuppress = false; }, 700);
+    }, 550);
+  }, {passive:true});
+  ['touchend','touchmove','touchcancel'].forEach(ev=> _artList.addEventListener(ev, ()=> clearTimeout(artPress)));
+}
+
 document.addEventListener('scroll', closeConvMenu, true);
 window.addEventListener('resize', closeConvMenu);
+document.addEventListener('scroll', closeFileMenu, true);
+window.addEventListener('resize', closeFileMenu);
+// The attach menu is anchored to the composer button, so it must go away with
+// scroll/resize too (same treatment as the conv ⋮ menu).
+document.addEventListener('scroll', closeAttachMenu, true);
+window.addEventListener('resize', closeAttachMenu);
 
 document.querySelectorAll('input[name="artScope"]').forEach(r=> r.onchange = ()=>{ if(r.checked){ S.artScope = r.value; loadArtifacts(); } });
 
@@ -1034,17 +1570,57 @@ $('input').addEventListener('keydown', (e)=>{
 });
 
 // Escape closes overlays, in dismiss-hierarchy order: conversation ⋮ menu first,
-// then the mobile drawer (standard behavior; otherwise a stray Stop fires behind
-// an open overlay).
+// then the composer attach menu, then the mobile drawer (standard behavior;
+// otherwise a stray Stop fires behind an open overlay).
 document.addEventListener('keydown', (e)=>{
   if(e.key !== 'Escape') return;
   if(document.getElementById('convMenu')) return;   // convList's own handler closes it
+  if(document.getElementById('fileMenu')){ closeFileMenu(); return; }
+  const am = $('attachMenu');
+  if(am && !am.classList.contains('hidden')){ closeAttachMenu(); return; }
   const sb = $('sidebar');
   if(sb && sb.classList.contains('open')){ closeSidebar(); return; }
   if(S.busy){ e.preventDefault(); abortTurn(); }
 });
 
-// Keep the Stop button honest after a reload / tab wake / dropped connection: the
+// ---- Steering queue (messages sent while a turn owns the transcript) -------
+// The server holds the queue; this only displays it and offers Withdraw. Rows are
+// re-fetched rather than trusted from local state, because delivery happens server-side at
+// the between-rounds seam and the page cannot know when that was.
+function renderSteerQueue(items){
+  const wrap = $('steerWrap'), list = $('steerList');
+  if(!wrap || !list) return;
+  list.innerHTML = '';
+  if(!items || !items.length){ wrap.classList.add('hidden'); return; }
+  wrap.classList.remove('hidden');
+  items.forEach((txt, i)=>{
+    const li = document.createElement('li');
+    li.className = 'flex items-start gap-2';
+    const span = document.createElement('span');
+    span.className = 'flex-1 text-slate-300 break-words';
+    span.textContent = txt;                       // textContent, never innerHTML
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'shrink-0 text-[10px] uppercase tracking-wide text-slate-400 hover:text-red-300';
+    btn.textContent = I18N.t('chat.steer_withdraw', 'Withdraw');
+    btn.onclick = async ()=>{
+      await api('/api/chat/steer/withdraw', {method:'POST',
+        body: JSON.stringify({conversation_id:S.convId, index:i})});
+      loadSteerQueue();
+    };
+    li.appendChild(span); li.appendChild(btn); list.appendChild(li);
+  });
+}
+
+async function loadSteerQueue(){
+  if(!S.convId){ renderSteerQueue([]); return; }
+  let d = null;
+  try { const r = await api(`/api/chat/steer?conversation_id=${S.convId}`); if(r && r.ok) d = await r.json(); }
+  catch(e){ return; }
+  if(d && d.ok) renderSteerQueue(d.queued || []);
+}
+
+
 // server knows whether this conversation still has a turn streaming.
 async function syncRunningState(){
   if(!S.convId) return;
@@ -1057,6 +1633,9 @@ async function syncRunningState(){
   }
 }
 document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) syncRunningState(); });
+// The queue lives server-side, so a reload or tab wake must re-read it (a message queued in
+// another tab is otherwise invisible here).
+document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) loadSteerQueue(); });
 
 // ---- Mobile viewport height -------------------------------------------------
 // The layout is h-full; on mobile browsers the URL bar makes 100vh taller than
@@ -1091,6 +1670,9 @@ window.matchMedia('(min-width: 768px)').addEventListener('change', (e)=>{
   if(list.children.length===0){ await newConversation(); } else { list.firstChild.click(); }
   // model badge — passive probe only; never triggers a model launch (DEC-048)
   renderModelBadge();
+  // Linked project chip (DEC-049): one cheap status call at boot, then on-demand summaries.
+  loadProjectStatus();
+  const pchip = $('projChip'); if(pchip) pchip.onclick = projectChipClicked;
   showPanel('chats');   // mark the rail; prompt/skills load lazily on first click
 })();
 
@@ -1130,4 +1712,130 @@ function renderTimestamps(){
     if(PREFS.show_timestamps) stampTime(bubble, parseInt(w.getAttribute('data-ts'),10));
     else { const c = bubble.querySelector('.ts-chip'); if(c) c.remove(); }
   });
+}
+
+// ---- Linked project chip (DEC-049) -----------------------------------------
+// The chat-side half of the linked-folder feature. Deliberately on-demand: /api/project/summary
+// hashes the whole copy and every baseline target, so it is called at turn end, on manual
+// refresh, and right before an apply — never from a poll timer.
+let PROJ = { linked:false };
+
+async function loadProjectStatus(){
+  try {
+    const d = await (await api('/api/project/status')).json();
+    PROJ = d || {linked:false};
+    S.proj = PROJ;
+    // Camera availability is driven by PROJ.linked through the attach menu's
+    // visible() predicate — never by toggling `hidden` on #cameraInput. That
+    // class is display control only, and removing it exposed Firefox's native
+    // file-picker chrome ("Durchsuchen… Keine Datei ausgewählt") in the composer.
+    if(!PROJ.linked){
+      $('projWrap') && $('projWrap').classList.add('hidden'); return;
+    }
+    $('projWrap') && $('projWrap').classList.remove('hidden');
+    $('projWrap') && $('projWrap').classList.add('flex');
+    setProjChip({state:'linked'});
+    await loadProjectSummary();
+  } catch(e){ /* no chip is better than a wrong one */ }
+}
+
+async function loadProjectSummary(){
+  if(!PROJ.linked) return;
+  const btn = $('projChip'); if(btn) btn.disabled = true;
+  try {
+    const d = await (await api('/api/project/summary')).json();
+    PROJ.summary = d; S.proj = PROJ;
+    setProjChip(d);
+  } catch(e){
+    setProjChip({state:'error'});
+  } finally { if(btn) btn.disabled = false; }
+}
+
+function setProjChip(d){
+  const el = $('projChip'); if(!el) return;
+  const T = (k,fb)=> (window.I18N && I18N.t(k)) || fb;
+  if(d.state === 'error'){
+    el.textContent = '⚠ project'; el.className = 'shrink-0 rounded-lg px-2 py-1 text-xs bg-red-900/40 text-red-300 hover:bg-red-900/60';
+    el.title = T('chat.proj_err','Could not read the linked project'); return;
+  }
+  if(!d.added && !d.modified && !(d.conflicts||[]).length){
+    el.textContent = '⬥ project';
+    el.className = 'shrink-0 rounded-lg px-2 py-1 text-xs bg-slate-800 text-slate-400 hover:bg-slate-700';
+    el.title = T('chat.proj_clean','Linked project: no pending changes (click to refresh)');
+    return;
+  }
+  const bits = [];
+  if(d.added) bits.push(`+${d.added}`);
+  if(d.modified) bits.push(`~${d.modified}`);
+  if((d.conflicts||[]).length) bits.push(`!${(d.conflicts||[]).length}`);
+  const conflict = (d.conflicts||[]).length > 0;
+  el.textContent = `⬥ project ${bits.join(' ')}`;
+  el.className = 'shrink-0 rounded-lg px-2 py-1 text-xs ' +
+    (conflict ? 'bg-amber-900/50 text-amber-300 hover:bg-amber-900/70'
+              : 'bg-emerald-900/50 text-emerald-300 hover:bg-emerald-900/70');
+  el.title = conflict
+    ? T('chat.proj_conflict','Changes are blocked: files changed in the real folder since import. Re-import or discard your edits (Admin → Project).')
+    : T('chat.proj_pending','Pending project changes — click to review and apply');
+}
+
+// Clicking the chip opens a review card rather than applying straight away, so the user
+// always sees the file list before anything is written outside their workspace.
+async function projectChipClicked(){
+  const msgs = document.getElementById('messages');
+  if(!msgs) return;
+  await loadProjectSummary();
+  const d = PROJ.summary || {};
+  const T = (k,fb)=> (window.I18N && I18N.t(k)) || fb;
+  const card = document.createElement('div');
+  card.className = 'bg-slate-800/60 border border-slate-600 rounded-xl p-4 max-w-[85%] text-sm space-y-2';
+
+  if(!d.linked){ card.remove(); return; }
+  const conflicts = d.conflicts || [];
+  const will = d.will_write || [];
+  let inner = `<div class="font-medium">${esc(T('chat.proj_review','Project changes'))} · ${esc(d.prefix||'project')}/</div>`;
+  inner += `<div class="text-xs text-slate-300">+${d.added||0} new · ~${d.modified||0} modified · ${conflicts.length} conflict(s) · ${d.unchanged||0} unchanged</div>`;
+  if(will.length){
+    inner += `<ul class="text-xs text-slate-400 max-h-40 overflow-auto list-disc pl-4">` +
+             will.slice(0,60).map(p=>`<li><code>${esc(p)}</code></li>`).join('') +
+             (will.length>60?`<li>… ${will.length-60} more</li>`:'') + `</ul>`;
+  }
+  if(conflicts.length){
+    inner += `<div class="text-xs text-amber-300">${esc(T('chat.proj_blocked','Blocked — these changed in the real folder since import:'))}<ul class="list-disc pl-4 mt-1">`+
+             conflicts.slice(0,12).map(c=>`<li>${esc(c)}</li>`).join('')+`</ul>
+             <div class="mt-1 text-slate-400">${esc(T('chat.proj_blocked_hint','Re-import (Admin → Project) to adopt the folder’s version, or undo your edits. Nothing can be applied while a conflict exists.'))}</div></div>`;
+  }
+  if(!d.apply_enabled){
+    inner += `<div class="text-xs text-amber-300">${esc(T('chat.proj_disabled','Apply is unavailable on this system (no write backend, or workspace encryption at rest is on).'))}</div>`;
+  }
+  if(!will.length && !conflicts.length){
+    inner += `<div class="text-xs text-slate-400">${esc(T('chat.proj_nothing','Nothing to apply.'))}</div>`;
+  }
+  inner += `<div class="flex gap-2 pt-1">
+      <button data-papply class="rounded-lg bg-emerald-600 px-3 py-1.5 text-xs ${((!will.length||!d.apply_enabled)?'opacity-50 pointer-events-none':'')}">${esc(T('chat.proj_apply','Apply to folder'))}</button>
+      <button data-pclose class="rounded-lg bg-slate-700 px-3 py-1.5 text-xs">${esc(T('chat.dismiss','Dismiss'))}</button></div>`;
+  card.innerHTML = inner;
+  msgs.appendChild(card); msgs.scrollTop = msgs.scrollHeight;
+
+  card.querySelector('[data-pclose]').onclick = ()=>card.remove();
+  card.querySelector('[data-papply]').onclick = async (ev)=>{
+    const b = ev.currentTarget;
+    if(!confirm(`${T('chat.proj_confirm','Write these changes to the real folder?')} `+
+                `${d.added||0} new, ${d.modified||0} modified. ${T('chat.proj_confirm2','Overwritten files are backed up first.')}`)) return;
+    b.disabled = true; b.textContent = T('chat.proj_writing','Writing…');
+    try {
+      const r = await api('/api/project/apply', {method:'POST', body:'{}'});
+      const res = await r.json();
+      const line = document.createElement('div');
+      line.className = 'text-xs ' + (res.ok ? 'text-emerald-400' : 'text-red-400');
+      line.textContent = (res.note || (res.detail || 'Failed')) +
+        (res.backup_id ? ` — ${T('chat.proj_backup','backup')}: ${res.backup_id}` : '');
+      card.appendChild(line);
+      await loadProjectSummary();
+      b.remove();
+    } catch(e){
+      b.disabled=false; b.textContent = T('chat.proj_apply','Apply to folder');
+      const line=document.createElement('div'); line.className='text-xs text-red-400';
+      line.textContent = T('chat.proj_failed','Apply failed.'); card.appendChild(line);
+    }
+  };
 }

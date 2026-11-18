@@ -11,15 +11,27 @@
   POST /api/admin/model/reload          re-resolve provider (applies model settings)
   POST /api/admin/model/start           launch llama-server {restart?: bool}
   POST /api/admin/model/stop            stop a Hearth-launched llama-server
+  GET  /api/admin/captioner/test         caption a generated 2 s tone — end-to-end wiring check
+  GET  /api/admin/diffusion/status       stable-diffusion.cpp binary/model presence + why not
+  GET  /api/admin/diffusion/command      the exact `sd-cli …` command, shell-quoted
+  POST /api/admin/diffusion/test         draw one tiny test image (nothing stored)
   GET  /api/admin/docs                  list protocols + system prompts
   POST /api/admin/docs                  upsert doc {kind,name,content,is_default}
   POST /api/admin/docs/{id}/delete      delete doc
   GET  /api/admin/audit                 recent audit log (admin view)
+  GET  /api/admin/project               linked-folder status: target, diff counts, backups
+  POST /api/admin/project/link          link a server-side folder {target}
+  POST /api/admin/project/unlink        unlink (optionally delete the workspace copy)
+  POST /api/admin/project/import        (re)copy the folder into project/ + refresh baseline
+  POST /api/admin/project/revert        restore files from an apply backup {backup_id}
 
 Changing model.* settings flags that a reload is required.
 """
 from __future__ import annotations
+import asyncio
 import json
+import os
+import time
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -31,6 +43,9 @@ from .security import hash_password
 from . import runtime_settings as rs
 from .manager import get_manager
 from . import audit
+from . import project_link as pl
+from . import project_apply as pa
+from . import crypto
 
 router = APIRouter()
 
@@ -185,6 +200,189 @@ async def model_command(_: User = Depends(require_admin)):
     return JSONResponse(get_manager().launch_command_preview())
 
 
+@router.get("/api/admin/models")
+async def all_models(_: User = Depends(require_admin)):
+    """Every model Hearth knows about, in one call: chat model + audio captioner.
+
+    The admin UI's "loaded models" view uses this so a second backend cannot drift out of
+    the picture — each entry reports what is CONFIGURED and what is actually RUNNING, with
+    separate hints. Read-only and defensive: if the captioner probe fails, its entry says so
+    rather than taking the whole listing (and therefore the Model panel) down with it.
+    """
+    from .captioner import get_captioner
+    models = [{"id": "chat", "role": "Main chat model", "kind": "llm"}]
+    try:
+        st = await get_manager().status()
+    except Exception as e:  # noqa: BLE001 — a status probe must never break the panel
+        st = {"hint": f"status unavailable: {type(e).__name__}: {str(e)[:120]}"}
+    models[0].update(st)
+
+    try:
+        cap_st = await get_captioner().status()
+    except Exception as e:  # noqa: BLE001
+        cap_st = {"enabled": False, "reachable": False, "configured": False,
+                  "hint": f"captioner status unavailable: {type(e).__name__}: {str(e)[:120]}"}
+    models.append({"id": "captioner", "role": "Audio captioner", "kind": "audio", **cap_st})
+
+    # The third model kind has no server to reach, so its row is about files on disk rather
+    # than a live port. Same defensive rule: a broken probe degrades to a hint, never takes
+    # the listing (and therefore the Model panel) down with it. `status()` is synchronous and
+    # only stats files, so it needs no await (unlike the captioner's network probe).
+    try:
+        from .diffusion import get_diffusion
+        dif_st = get_diffusion().status()
+    except Exception as e:  # noqa: BLE001
+        dif_st = {"enabled": False, "reachable": False, "configured": False,
+                  "hint": f"image generation status unavailable: {type(e).__name__}: "
+                          f"{str(e)[:120]}"}
+    models.append({"id": "diffusion", "role": "Image generator", "kind": "diffusion", **dif_st})
+    return JSONResponse({"models": models})
+
+
+@router.post("/api/admin/captioner/start")
+async def captioner_start(request: Request, admin: User = Depends(require_admin),
+                          _: None = Depends(check_csrf)):
+    """Start (or restart, with {restart:true}) the captioner's own llama-server.
+
+    Independent of the chat model: this never touches the server chats are using. Weights
+    can take minutes to load, so the response carries the real reason when it fails rather
+    than a bare not-running flag.
+    """
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001 — no body means plain start
+        pass
+    from .captioner import get_captioner
+    audit.log(admin.id, "captioner_restart" if body.get("restart") else "captioner_start")
+    return JSONResponse(await get_captioner().start(force=bool(body.get("restart"))))
+
+
+@router.post("/api/admin/captioner/stop")
+async def captioner_stop(admin: User = Depends(require_admin), _: None = Depends(check_csrf)):
+    """Stop a captioner server Hearth launched (an external one is left alone)."""
+    from .captioner import get_captioner
+    audit.log(admin.id, "captioner_stop")
+    return JSONResponse(await get_captioner().stop_server())
+
+
+@router.get("/api/admin/captioner/test")
+async def captioner_test(q: str = "", _: User = Depends(require_admin)):
+    """Caption a short synthetic tone so an admin can verify the wiring end to end.
+
+    Why generate rather than ship a sample file: it proves the whole chain — ffmpeg (or its
+    absence), the server request, the audio encoder, and a non-empty answer — without any
+    user's recording touching the test. A quiet sine wave is also an honest probe: a model
+    that confidently describes music over a beep is telling you something worth knowing.
+    """
+    from .captioner import get_captioner, CaptionError
+    import math
+    import struct as _struct
+    import tempfile as _tempfile
+    import wave as _wave
+
+    settings = rs.get_all()
+    cap = get_captioner()
+    t0 = time.time()
+    try:
+        with _tempfile.TemporaryDirectory(prefix="hearth-captest-") as tmp:
+            path = os.path.join(tmp, "probe.wav")
+            rate, secs = 16000, 2
+            with _wave.open(path, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(rate)
+                for i in range(rate * secs):
+                    wf.writeframes(_struct.pack("<h", int(9000 * math.sin(2 * math.pi * 440.0
+                                                                            * i / rate))))
+            res = await asyncio.to_thread(cap.caption_sync, path, settings)
+    except CaptionError as e:
+        return JSONResponse({"ok": False, "seconds": round(time.time() - t0, 1),
+                             "note": str(e)})
+    except Exception as e:  # noqa: BLE001 — a test endpoint must not 500
+        return JSONResponse({"ok": False, "seconds": round(time.time() - t0, 1),
+                             "note": f"{type(e).__name__}: {str(e)[:200]}"})
+    caption = str(res.get("caption") or "")
+    return JSONResponse({"ok": True, "seconds": round(time.time() - t0, 1),
+                         "backend": res.get("backend"), "chunks": res.get("chunks"),
+                         "caption": caption[:1200],
+                         "note": ("the probe is a 2-second 440 Hz sine tone — if the "
+                                  "description below claims speech or lyrics, the model is "
+                                  "hallucinating and its prompt needs tightening"
+                                  if caption else "empty description returned")})
+
+
+@router.get("/api/admin/captioner/command")
+async def captioner_command(_: User = Depends(require_admin)):
+    """The exact captioner llama-server command, shell-quoted, for copying out."""
+    from .captioner import launch_command_preview
+    return JSONResponse(launch_command_preview(rs.get_all()))
+
+
+# ---- image generation (stable-diffusion.cpp) --------------------------------
+@router.get("/api/admin/diffusion/status")
+async def diffusion_status(_: User = Depends(require_admin)):
+    """Binary/model presence and the reason generation cannot run, if any.
+
+    Cheap and synchronous by design — nothing is launched, so this can be called on every
+    render of the Images tab.
+    """
+    from .diffusion import get_diffusion
+    return JSONResponse(get_diffusion().status())
+
+
+@router.get("/api/admin/diffusion/command")
+async def diffusion_command(_: User = Depends(require_admin)):
+    """The exact `sd-cli` command Hearth would build, shell-quoted, for copying out."""
+    from .diffusion import launch_command_preview
+    return JSONResponse(launch_command_preview(rs.get_all()))
+
+
+@router.post("/api/admin/diffusion/test")
+async def diffusion_test(request: Request, admin: User = Depends(require_admin),
+                         _: None = Depends(check_csrf)):
+    """Draw one tiny test picture to prove the whole chain end to end.
+
+    Why Hearth generates rather than trusting config: it is the only check that a given
+    binary + model (+ encoders) combination actually produces a PNG. A missing t5xxl for
+    Flux looks exactly like a working setup right up until sd-cli is asked to draw, and
+    this is where an admin wants to find out — not from their family's chat.
+
+    Body: `{prompt?: str}`. The image is discarded; the point is the exit code and whether
+    bytes appeared, so nothing is written into any workspace.
+    """
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001 — no body means the default probe
+        pass
+    from .diffusion import get_diffusion, DiffusionError
+    prompt = str(body.get("prompt") or "a red circle on a white background, simple, flat")[:300]
+    settings = rs.get_all()
+    dif = get_diffusion()
+    t0 = time.time()
+    try:
+        # Small and short on purpose: this verifies wiring, not quality.
+        res = await asyncio.to_thread(
+            dif.generate_sync, settings, prompt, width=256, height=256, steps=4, batch=1)
+    except DiffusionError as e:
+        return JSONResponse({"ok": False, "seconds": round(time.time() - t0, 1),
+                             "note": str(e)})
+    except Exception as e:  # noqa: BLE001 — a test endpoint must not 500
+        return JSONResponse({"ok": False, "seconds": round(time.time() - t0, 1),
+                             "note": f"{type(e).__name__}: {str(e)[:200]}"})
+    images = res.get("images") or []
+    audit.log(admin.id, "diffusion_test", {"ok": bool(images), "seconds": res.get("seconds")})
+    return JSONResponse({"ok": bool(images), "seconds": res.get("seconds"),
+                         "images": len(images),
+                         "bytes": [len(d) for _, d in images],
+                         "seed": res.get("seed"),
+                         "command": " ".join(str(a) for a in (res.get("argv") or [])[:14]),
+                         "note": ""if images else "the CLI succeeded but produced no file"})
+
+
+
+
 # ---- docs (protocols + system prompts) --------------------------------------
 @router.get("/api/admin/docs")
 async def list_docs(_: User = Depends(require_admin)):
@@ -239,3 +437,89 @@ async def get_audit(limit: int = 100, _: User = Depends(require_admin)):
         rows = s.query(AuditLog).order_by(AuditLog.ts.desc()).limit(min(limit, 500)).all()
     return JSONResponse([{"ts": a.ts, "user_id": a.user_id, "action": a.action, "detail": a.detail}
                          for a in rows])
+
+
+# ---- linked project folder (DEC-049) ----------------------------------------
+# Linking is admin-driven (the target is an absolute path on the SERVER's filesystem, so a
+# non-admin picking one would be handing them a read of arbitrary server paths). The agent
+# only ever sees the resulting copy under project/ inside its own jail.
+@router.get("/api/admin/project")
+async def project_status(user: User = Depends(require_admin), _=Depends(check_csrf)):
+    return JSONResponse(_project_view(user))
+
+
+def _project_view(user: User) -> dict:
+    link = pl.get_link(user.id)
+    if not link:
+        return {"linked": False, "backend": pa.detect_backend("auto"),
+                "encryption_blocks_apply": crypto.encryption_enabled()}
+    info = {"linked": True, "target_abs": link["target_abs"], "prefix": link["rel_prefix"],
+            "imported_at": link["imported_at"], "backend": pa.detect_backend("auto"),
+            "encryption_blocks_apply": crypto.encryption_enabled()}
+    try:
+        info["exists"] = pl.target_root(link).is_dir()
+    except pl.LinkError:
+        info["exists"] = False
+    mf = pl.load_manifest(user.id, link)
+    info["files"] = len(mf.get("files") or {})
+    try:
+        cs = pl.diff_project(user.id, link)
+        info.update({"added": len(cs.added), "modified": len(cs.modified),
+                     "conflicts": len(cs.conflicts), "unchanged": cs.unchanged})
+    except pl.LinkError as e:
+        info["diff_error"] = str(e)
+    info["backups"] = pa.list_backups(user.id, link)
+    return info
+
+
+@router.post("/api/admin/project/link")
+async def project_link(request: Request, user: User = Depends(require_admin),
+                       _=Depends(check_csrf)):
+    body = await request.json()
+    try:
+        link = pl.set_link(user.id, str(body.get("target", "")))
+    except pl.LinkError as e:
+        raise HTTPException(400, str(e))
+    audit.log(user.id, "project_link", {"target": link["target_abs"]})
+    return JSONResponse({"ok": True, **_project_view(user)})
+
+
+@router.post("/api/admin/project/unlink")
+async def project_unlink(request: Request, user: User = Depends(require_admin),
+                         _=Depends(check_csrf)):
+    body = await request.json()
+    link = pl.get_link(user.id)
+    cleared = pl.clear_link(user.id, delete_copy=bool(body.get("delete_copy")))
+    audit.log(user.id, "project_unlink", {"target": (link or {}).get("target_abs", ""),
+                                          "deleted_copy": bool(body.get("delete_copy"))})
+    return JSONResponse({"ok": cleared})
+
+
+@router.post("/api/admin/project/import")
+async def project_import(user: User = Depends(require_admin), _=Depends(check_csrf)):
+    link = pl.get_link(user.id)
+    if not link:
+        raise HTTPException(400, "link a folder first")
+    try:
+        res = pl.import_project(user.id, rs.get_all(), link)
+    except pl.LinkError as e:
+        raise HTTPException(400, str(e))
+    audit.log(user.id, "project_import", {"target": res["target_abs"], "files": res["files"],
+                                          "copied": res["copied"], "truncated": res["truncated"]})
+    return JSONResponse({"ok": True, **res, **_project_view(user)})
+
+
+@router.post("/api/admin/project/revert")
+async def project_revert(request: Request, user: User = Depends(require_admin),
+                         _=Depends(check_csrf)):
+    body = await request.json()
+    backup_id = str(body.get("backup_id") or "")
+    try:
+        res = pa.revert(user.id, backup_id)
+    except pl.LinkError as e:
+        raise HTTPException(400, str(e))
+    audit.log(user.id, "project_revert", {"backup_id": backup_id, "restored": res.written[:40],
+                                          "refused": res.refused[:20]})
+    if not res.ok:
+        raise HTTPException(400, res.note + ("; " + "; ".join(res.refused[:3]) if res.refused else ""))
+    return JSONResponse({"ok": True, "note": res.note, "restored": res.written})

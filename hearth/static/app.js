@@ -32,6 +32,16 @@ async function streamPost(path, body, onEvent, opts = {}) {
     return;
   }
   if (!r.ok || !r.body) {
+    // A JSON body with queued:true is NOT an error: a turn owns this conversation, so the
+    // server accepted the message as steering to deliver between tool rounds. Only that exact
+    // shape is treated as accepted — anything else still reports as a failure, so a real 4xx
+    // can never be mistaken for "queued".
+    if (opts.onQueued) {
+      try {
+        const j = await r.json();
+        if (j && j.queued) { opts.onQueued(j); return; }
+      } catch (e) {}
+    }
     let msg = 'Request failed';
     try { const j = await r.json(); msg = j.error || j.detail || msg; } catch (e) {}
     onEvent({type: 'error', text: msg});

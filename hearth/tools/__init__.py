@@ -13,7 +13,7 @@ tools.fs_read), and approval falls back to the tool's hardcoded `gated` flag.
 from __future__ import annotations
 import time
 
-from .base import Tool, ToolResult  # noqa: F401
+from .base import Tool, ToolResult, DeltaThrottle  # noqa: F401
 from .fs_tools import (FsReadTool, FsListTool, FsWriteTool, FsAppendTool, FsEditTool,
                        FsDeleteTool, FsMoveTool, FsSearchTool, UploadTool, ZipPackTool)
 from .exec_tool import ExecTool
@@ -21,7 +21,34 @@ from .ask_user_tool import AskUserTool
 from .web_search import WebSearchTool
 from .web_fetch import WebFetchTool
 from .time_tool import DateTimeTool
+from .media_tools import PdfInfoTool, PdfReadTool, VideoInfoTool, ViewVideoTool
+from .audio_tools import AudioInfoTool, DescribeAudioTool
+from .image_tools import GenerateImageTool
+from .context_tool import ContextUsageTool
 from .device_tools import DeviceListTool, DeviceScreenshotTool
+from .sync_tools import SyncPreviewTool, SyncApplyTool
+
+
+class _CancelAdapter:
+    """Expose a CancelHandle through the `threading.Event.is_set()` interface.
+
+    caption_sync expects something with `.is_set()` (checked from a worker thread), while the
+    turn's handle is an asyncio-based CancelHandle with `.cancelled`. This bridges the two so
+    neither module has to import the other, and it is safe to poll from any thread because
+    `asyncio.Event.is_set()` only reads a flag.
+    """
+
+    __slots__ = ("_handle",)
+
+    def __init__(self, handle):
+        self._handle = handle
+
+    def is_set(self) -> bool:
+        try:
+            return bool(self._handle.cancelled)
+        except Exception:  # noqa: BLE001 — a dead handle reads as "not cancelled"
+            return False
+
 
 
 class ToolContext:
@@ -30,6 +57,50 @@ class ToolContext:
         self.conversation_id = conversation_id or ""
         self._settings = settings
         self._download_store = download_store or {}
+        # The turn's CancelHandle, attached by orchestrator.run_turn (see attach_cancel).
+        # Tools that can block for a long time (describe_audio) poll it so a Stop abandons
+        # them instead of running to completion. None when no cancellation is wired.
+        self._cancel = None
+        # Optional progress sink for tools that take minutes (see report_progress). Set by
+        # the agent loop right before each tool runs, because the generator is the only way
+        # to reach the client and it must own the yield.
+        self._progress = None
+
+    def attach_progress(self, fn) -> None:
+        """Attach this turn's progress sink (a callable taking an event dict), or None."""
+        self._progress = fn
+
+    def report_progress(self, **ev) -> None:
+        """Tell the UI something while a long tool runs — never raise, never block.
+
+        The event is queued by the agent loop and drained into the SSE stream while the tool
+        is still executing (DEC-061). Safe to call from a worker thread: the sink only
+        appends to a list. Losing a progress line must never affect the tool's result, so
+        every failure here is swallowed on purpose.
+        """
+        fn = self._progress
+        if fn is None or not ev:
+            return
+        try:
+            fn(dict(ev))
+        except Exception:  # noqa: BLE001 — progress is never worth failing a tool over
+            pass
+
+    def attach_cancel(self, handle) -> None:
+        """Attach the turn's CancelHandle (or None). Called once by run_turn."""
+        self._cancel = handle
+
+    def cancel_event(self):
+        """The turn's cancel object with `.is_set()`, or None if not cancellable.
+
+        Returns an adapter rather than the CancelHandle itself so tools depend only on the
+        `threading.Event` interface caption_sync expects (`.is_set()`), and a handle that is
+        absent reads as 'cannot be aborted' rather than raising.
+        """
+        h = self._cancel
+        if h is None:
+            return None
+        return _CancelAdapter(h)
 
     def workspace_root(self):
         from .. import workspaces as ws
@@ -90,7 +161,12 @@ _ALL_TOOLS: list[Tool] = [
     FsReadTool(), FsListTool(), FsSearchTool(),
     FsWriteTool(), FsAppendTool(), FsEditTool(), FsDeleteTool(), FsMoveTool(),
     ZipPackTool(), UploadTool(),
+    SyncPreviewTool(), SyncApplyTool(),
     ExecTool(), AskUserTool(), WebSearchTool(), WebFetchTool(), DateTimeTool(),
+    PdfInfoTool(), PdfReadTool(), VideoInfoTool(), ViewVideoTool(),
+    AudioInfoTool(), DescribeAudioTool(),
+    GenerateImageTool(),
+    ContextUsageTool(),
     DeviceListTool(), DeviceScreenshotTool(),
 ]
 

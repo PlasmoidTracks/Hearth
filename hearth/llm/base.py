@@ -23,10 +23,25 @@ class ToolRequest:
 
 @dataclass
 class StreamEvent:
-    type: str                       # token | tool_request | tool_progress | progress | usage | error | done
-    text: str = ""                  # for token/error
+    type: str                       # token | reasoning | tool_request | tool_progress | progress | usage | error | done
+    text: str = ""                  # for token/error/reasoning
     tool: ToolRequest | None = None  # for tool_request
     data: dict = field(default_factory=dict)  # progress/usage payloads
+
+    @staticmethod
+    def reasoning(text: str) -> "StreamEvent":
+        """A chunk of the model's INTERNAL reasoning, separated from the answer.
+
+        Two shapes reach Hearth and both are handled in ``llm/llama_server.py``: llama.cpp
+        with ``--reasoning`` streams it as ``delta.reasoning_content`` (already separate),
+        and a chat template that emits inline ``<think>…</think>`` gets parsed out of the
+        content. It is a distinct event type rather than folded into ``token`` because the
+        UI must render it differently (dimmed, collapsible) and the retention policy must be
+        able to drop it from history — neither is possible once it is mixed into the answer
+        stream. Never re-emitted as ``token``: a model that sees its own thinking presented
+        as its answer starts imitating it in prose.
+        """
+        return StreamEvent("reasoning", text=text)
 
     @staticmethod
     def tool_progress(name: str, args_so_far: str, first_name: str = "") -> "StreamEvent":

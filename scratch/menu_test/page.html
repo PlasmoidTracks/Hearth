@@ -1,0 +1,253 @@
+<!doctype html><html><head><meta charset="utf-8">
+<link rel="stylesheet" href="base.css">
+<style>
+.hidden { display: none !important; }
+.fixed { position: fixed; }
+.flex { display: flex; }
+body { margin:0; height:600px; background:#020617; color:#eee; }
+main { display:flex; flex-direction:column; height:100%; }
+#messages { flex:1; overflow:auto; }
+form#composer { display:flex; gap:8px; align-items:flex-end; }
+</style></head><body>
+
+<div class="h-full flex flex-col md:flex-row">
+  <!-- Sidebar: a slide-over drawer on mobile (toggled via #menuBtn / #scrim),
+       a fixed column from md: up. Hidden by default below md so the chat gets
+       the whole viewport; the header's ☰ button opens it.
+
+       Layout: a narrow icon RAIL (#rail) picks the active panel — Chats, Files,
+       Prompt, Skills, Settings — and #panelHost swaps the panel body below it.
+       One panel is visible at a time, so each gets the full sidebar height
+       instead of everything competing for a few rows. -->
+  <aside id="sidebar" class="fixed inset-y-0 left-0 z-40 w-[85vw] max-w-xs -translate-x-full transition-transform duration-200 ease-out md:static md:w-72 md:max-w-none md:translate-x-0 md:transition-none border-r border-slate-800 bg-slate-900 md:bg-slate-900/50 flex flex-col overflow-hidden">
+    <div class="shrink-0 p-3 pb-1 flex items-center justify-between">
+      <span class="font-semibold" data-i18n="app.name">Hearth</span>
+      <!-- Username + admin marker: abbreviated on narrow phones so the close (✕)
+           button never gets pushed out; the full text shows from 30rem up. -->
+      <span class="text-xs text-slate-400 max-sm:hidden">x · admin</span>
+      <span class="text-xs text-slate-400 sm:hidden" title="x">x★</span>
+      <button id="closeSidebar" aria-label="Close menu" title="Close menu" data-i18n-title="chat.close_menu" class="md:hidden rounded-lg px-2.5 py-1.5 text-slate-400 hover:text-white text-lg leading-none">✕</button>
+    </div>
+
+    <!-- Icon rail: category switcher for the panel host below. -->
+    <nav id="rail" class="shrink-0 flex items-stretch gap-1 px-2 py-1 border-b border-slate-800" aria-label="Sections">
+      <button data-panel="chats" title="Chats" data-i18n-title="nav.chats" class="flex-1 rounded-lg py-1.5 text-base text-slate-400 hover:bg-slate-800 hover:text-white"><span aria-hidden="true">💬</span><span class="block text-[9px] leading-none mt-0.5" data-i18n="nav.chats_short">Chats</span></button>
+      <button data-panel="files" title="Files" data-i18n-title="nav.files" class="flex-1 rounded-lg py-1.5 text-base text-slate-400 hover:bg-slate-800 hover:text-white"><span aria-hidden="true">📁</span><span class="block text-[9px] leading-none mt-0.5" data-i18n="nav.files_short">Files</span></button>
+      <button data-panel="prompt" title="System prompt" data-i18n-title="nav.prompt" class="flex-1 rounded-lg py-1.5 text-base text-slate-400 hover:bg-slate-800 hover:text-white"><span aria-hidden="true">✎</span><span class="block text-[9px] leading-none mt-0.5" data-i18n="nav.prompt_short">Prompt</span></button>
+      <button data-panel="skills" title="Skills" data-i18n-title="nav.skills" class="flex-1 rounded-lg py-1.5 text-base text-slate-400 hover:bg-slate-800 hover:text-white"><span aria-hidden="true">📜</span><span class="block text-[9px] leading-none mt-0.5" data-i18n="nav.skills_short">Skills</span></button>
+      <button data-panel="settings" title="Settings" data-i18n-title="settings.title" class="flex-1 rounded-lg py-1.5 text-base text-slate-400 hover:bg-slate-800 hover:text-white"><span aria-hidden="true">⚙</span><span class="block text-[9px] leading-none mt-0.5" data-i18n="nav.settings_short">Setup</span></button>
+    </nav>
+
+    <div id="panelHost" class="flex-1 min-h-0 flex flex-col overflow-hidden">
+
+      <!-- Panel: Chats -->
+      <section data-panel="chats" class="hidden flex-1 min-h-0 flex-col">
+        <div class="shrink-0 px-3 pt-2 pb-2 flex gap-2">
+          <button id="newChat" data-i18n="chat.new" class="flex-1 text-sm rounded-lg bg-sky-600 hover:bg-sky-500 py-2.5 md:py-1.5">+ New chat</button>
+        </div>
+        <div class="shrink-0 px-3 pb-2">
+          <input id="searchBox" type="search" placeholder="Search chats…" data-i18n-placeholder="chat.search"
+                 class="w-full text-sm rounded-lg bg-slate-800 border border-slate-700 px-3 py-1.5 outline-none focus:border-sky-500"/>
+        </div>
+        <nav id="convList" class="px-2 pb-3 flex-1 min-h-0 overflow-auto"></nav>
+      </section>
+
+      <!-- Panel: Files (artifacts) -->
+      <section data-panel="files" class="hidden flex-1 min-h-0 flex-col">
+        <div class="shrink-0 px-3 pt-2 pb-1 flex items-center justify-between">
+          <span class="text-xs font-medium text-slate-300" data-i18n="chat.artifacts">Artifacts</span>
+          <div class="flex items-center gap-2 text-[11px]">
+            <label class="flex items-center gap-1"><input type="radio" name="artScope" value="conv" checked/> <span data-i18n="chat.art_this">this chat</span></label>
+            <label class="flex items-center gap-1"><input type="radio" name="artScope" value="all"/> <span data-i18n="chat.art_all">all</span></label>
+            <button id="refreshArtifacts" title="Refresh" class="text-slate-400 hover:text-white">↻</button>
+          </div>
+        </div>
+        <ul id="artifactList" class="px-3 flex-1 min-h-0 overflow-auto space-y-1 text-sm">
+          <!-- Rows are rendered by loadArtifacts() with an explicit ⬇ button: a bare
+               filename link is easy to miss on touch, and "tap the name" is not obvious. -->
+        </ul>
+      </section>
+
+      <!-- Panel: Prompt (system prompt editor). The text here IS the system prompt
+           sent to the model (nothing is prepended on top); clearing it falls back
+           to the admin default doc / built-in persona. -->
+      <section data-panel="prompt" class="hidden flex-1 min-h-0 flex-col">
+        <div class="shrink-0 px-3 pt-2 pb-1 flex items-center justify-between">
+          <span class="text-xs font-medium text-slate-300" data-i18n="prompt.title">System prompt</span>
+          <button id="spReset" title="Restore built-in persona" data-i18n-title="prompt.reset_title"
+                  class="text-[11px] text-slate-400 hover:text-white underline" data-i18n="prompt.reset">Clear</button>
+        </div>
+        <p class="shrink-0 px-3 pb-2 text-[11px] text-slate-500 leading-relaxed" data-i18n="prompt.hint">The system prompt sent with every chat, from the next message on. Edit it directly.</p>
+        <textarea id="spText" rows="10" spellcheck="false" placeholder="e.g. Answer in German. Be brief."
+                  class="mx-3 flex-1 min-h-0 resize-none rounded-lg bg-slate-800 border border-slate-700 px-3 py-2 text-sm font-mono outline-none focus:border-sky-500"></textarea>
+        <div class="shrink-0 px-3 py-2 flex items-center gap-2">
+          <button id="spSave" data-i18n="prompt.save" class="rounded-lg bg-sky-600 hover:bg-sky-500 px-4 py-1.5 text-sm">Save</button>
+          <span id="spStatus" class="text-[11px] text-emerald-400"></span>
+        </div>
+      </section>
+
+      <!-- Panel: Skills (admin-managed protocols, read-only here). The old
+           per-message "attach protocol" flow was removed from the composer. -->
+      <section data-panel="skills" class="hidden flex-1 min-h-0 flex-col">
+        <div class="shrink-0 px-3 pt-2 pb-1">
+          <span class="text-xs font-medium text-slate-300" data-i18n="skills.title">Skills</span>
+        </div>
+        <p class="shrink-0 px-3 pb-2 text-[11px] text-slate-500 leading-relaxed" data-i18n="skills.hint">Reusable instruction formats an admin provides.</p>
+        <div id="skillList" class="px-3 flex-1 min-h-0 overflow-auto space-y-2"></div>
+      </section>
+
+      <!-- Panel: Settings (behavioral prefs + language). Replaces the header ⚙ modal. -->
+      <section data-panel="settings" class="hidden flex-1 min-h-0 flex-col">
+        <div class="shrink-0 px-3 pt-2 pb-2">
+          <span class="text-xs font-medium text-slate-300" data-i18n="settings.title">Settings</span>
+        </div>
+        <div class="px-3 flex-1 min-h-0 overflow-auto space-y-3 text-sm">
+          <label class="flex items-start gap-3 py-1 cursor-pointer">
+            <input type="checkbox" id="prefEnterSends" class="mt-1 accent-sky-500"/>
+            <span><span class="block" data-i18n="settings.enter_sends">Enter sends the message</span>
+              <span class="block text-[11px] text-slate-400 leading-relaxed" data-i18n="settings.enter_sends_hint">On: Enter = send, Shift+Enter = new line. Off: Enter = new line, use the Send button.</span></span>
+          </label>
+          <label class="flex items-start gap-3 py-1 cursor-pointer">
+            <input type="checkbox" id="prefAutoScroll" class="mt-1 accent-sky-500"/>
+            <span><span class="block" data-i18n="settings.auto_scroll">Auto-scroll to the newest message</span>
+              <span class="block text-[11px] text-slate-400 leading-relaxed" data-i18n="settings.auto_scroll_hint">On: the transcript follows output as it streams. Off: it stays where you left it.</span></span>
+          </label>
+          <label class="flex items-start gap-3 py-1 cursor-pointer">
+            <input type="checkbox" id="prefTimestamps" class="mt-1 accent-sky-500"/>
+            <span><span class="block" data-i18n="settings.timestamps">Show message timestamps</span>
+              <span class="block text-[11px] text-slate-400 leading-relaxed" data-i18n="settings.timestamps_hint">Small time chips on each bubble (browser local time).</span></span>
+          </label>
+          <div class="pt-1 border-t border-slate-800">
+            <label class="block text-xs text-slate-400 mb-1" data-i18n="common.language">Language</label>
+            <select id="langSel" title="Language" class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-xs">
+              <option value="en">English</option><option value="de">Deutsch</option>
+            </select>
+          </div>
+          <label class="flex items-start gap-3 py-1 cursor-pointer border-t border-slate-800">
+            <input type="checkbox" id="dbgToggle" class="mt-1 accent-sky-500"/>
+            <span><span class="block" data-i18n="chat.debug">Debug</span>
+              <span class="block text-[11px] text-slate-400 leading-relaxed" data-i18n="settings.debug_hint">Show the raw event log panel under the chat.</span></span>
+          </label>
+          <!-- Device access is only mentioned when it can actually matter: a paired
+               helper plus an un-granted chat. Otherwise this stays hidden entirely. -->
+          <div id="deviceHint" class="hidden pt-1 border-t border-slate-800 text-[11px] text-slate-400 leading-relaxed"></div>
+        </div>
+      </section>
+
+    </div>
+
+    <div class="shrink-0 p-3 border-t border-slate-800 flex items-center gap-3 md:gap-2 text-sm">
+      <a href="/admin" data-i18n="chat.admin" class="py-1.5 text-sky-400 hover:underline">Admin</a>
+      <button id="logoutBtn" data-i18n="chat.signout" class="ml-auto py-1.5 text-slate-400 hover:text-white">Sign out</button>
+    </div>
+  </aside>
+
+  <!-- Main -->
+  <main class="flex-1 flex flex-col min-h-0">
+    <!-- Mobile conversation switcher: the sidebar is an off-canvas drawer on
+         phones, so the header carries the active chat's name (tapping it opens
+         the drawer where chats are listed/switched). Hidden on md+ where the
+         conversation list is always visible. -->
+    <header class="px-2 sm:px-4 py-2 border-b border-slate-800 flex items-center gap-2 sm:gap-3 text-xs text-slate-400">
+      <!-- Hamburger: opens the sidebar drawer on mobile, hidden on desktop. -->
+      <button id="menuBtn" aria-label="Menu" title="Menu" data-i18n-title="chat.menu" class="md:hidden shrink-0 rounded-lg px-2.5 py-1.5 text-base text-slate-300 hover:bg-slate-800">☰</button>
+      <button id="convTitleBtn" class="md:hidden shrink-0 min-w-0 max-w-[34vw] flex items-center gap-1 rounded-lg px-2 py-1.5 text-xs text-slate-200 hover:bg-slate-800" title="Switch chat">
+        <span id="convTitleLabel" class="truncate">Hearth</span>
+        <span class="text-slate-500">▾</span>
+      </button>
+      <!-- Model badge: abbreviated on mobile (title attr carries the full usage JSON). -->
+      <span id="modelBadge" title="Active model backend" class="shrink-0 max-[479px]:hidden">model: …</span>
+      <span id="modelBadgeShort" title="Active model backend" class="shrink-0 hidden max-[479px]:inline">⚙</span>
+
+      <!-- Linked project chip (DEC-049). Hidden unless the user has a link. Shows pending
+           change counts and offers Apply; refreshed on turn end / manual click, never on a
+           timer — the summary endpoint hashes the tree, so polling it would be wasteful. -->
+      <span id="projWrap" class="hidden items-center gap-1 shrink-0">
+        <button id="projChip" title="Linked project folder"
+                class="shrink-0 rounded-lg px-2 py-1 text-xs bg-slate-800 hover:bg-slate-700 text-slate-300"></button>
+      </span>
+
+      <!-- Context-window usage for THIS chat (what the model receives next turn).
+           `shrink-0` matters: without it the bar collapses to 0 width inside the
+           flex header and looks like the feature is missing. It lives at the far
+           right of an otherwise-empty bar — no separate settings button up here
+           anymore (Settings is a sidebar panel now). -->
+      <span id="ctxWrap" class="flex items-center gap-1.5 shrink-0 ml-auto" title="Context window usage">
+        <span id="ctxLabel" class="tabular-nums text-slate-500 max-[479px]:hidden">—</span>
+        <span class="block w-16 sm:w-24 h-1.5 rounded bg-slate-800 overflow-hidden shrink-0">
+          <span id="ctxBar" class="block h-full bg-emerald-500" style="width:0%"></span>
+        </span>
+      </span>
+    </header>
+
+    <!-- Backdrop for the mobile drawer only (pointer-events follow the open state). -->
+    <div id="scrim" class="hidden fixed inset-0 z-30 bg-black/50 md:hidden" aria-hidden="true"></div>
+
+    <div id="messages" class="flex-1 overflow-auto overscroll-contain p-3 sm:p-4 space-y-3 prose-msg">
+      <!-- First-run hint: explains the file/download flow, because "where do my files
+           go?" is the first question a new user has. Dismissed per browser (localStorage). -->
+      <div id="introNote" class="hidden text-[12px] leading-relaxed text-slate-400 bg-slate-900/60 border border-slate-800 rounded-xl px-4 py-3 max-w-prose">
+        <span data-i18n="chat.intro_head">How files work here:</span>
+        <span data-i18n="chat.intro_body">Ask for a file and the assistant writes it into your own workspace — every file is listed under Artifacts (this chat / all), where you can download it. You get an explicit ⬇ download button in the conversation only when you ask for one. Writing shows live progress while it happens.</span>
+      </div>
+    </div>
+
+    <!-- Debug panel -->
+    <div id="debugPanel" class="hidden border-t border-slate-800 bg-black/40 text-[11px] font-mono p-2 max-h-32 overflow-auto whitespace-pre-wrap"></div>
+
+    <!-- Composer + dropzone. pb uses env(safe-area-inset-bottom) so the input row
+         clears the iOS home-indicator / Android gesture bar (viewport-fit=cover). -->
+    <div class="p-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] border-t border-slate-800 bg-slate-950/80 backdrop-blur">
+      <div id="progressWrap" class="hidden mb-2">
+        <div class="text-[11px] text-slate-400 mb-1" id="progressLabel">prefill…</div>
+        <div class="h-1.5 rounded bg-slate-800"><div id="progressBar" class="h-1.5 rounded bg-sky-500"></div></div>
+      </div>
+
+      <!-- Staged attachments (uploaded, sent with next message) -->
+      <div id="attachStrip" class="hidden flex-wrap gap-2 mb-2"></div>
+
+      <div id="dropzone" class="hidden mb-2 border-2 border-dashed border-sky-600 rounded-xl p-4 text-center text-sm text-sky-300 bg-sky-950/30">
+        <span data-i18n="chat.drop_here">Drop files to attach</span>
+      </div>
+
+      <form id="composer" class="flex gap-2 items-end">
+        <input type="file" id="fileInput" multiple class="hidden"/>
+        <input type="file" id="cameraInput" accept="image/*" capture="environment" class="hidden"/>
+        <!-- Attach menu: one button replaces the old 📎/📷 row (and later, more).
+             The panel is positioned by chat.js (fixed, above the button) and closes
+             on outside click / Escape / scroll / resize, like the conv ⋮ menu.
+             Menu items carry data-i18n so I18N.apply() re-translates them live when
+             the language changes while the menu happens to be open. -->
+        <div class="relative shrink-0">
+          <button type="button" id="attachMenuBtn" title="Attach" data-i18n-title="chat.attach_menu" aria-haspopup="true" aria-expanded="false"
+                  class="rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 px-3 py-2.5 md:py-2 text-lg leading-none">📎<span class="text-[9px] align-middle text-slate-400 ml-0.5">▾</span></button>
+          <div id="attachMenu" class="hidden fixed z-50 min-w-[190px] rounded-xl border border-slate-700 bg-slate-800 shadow-xl py-1 text-sm"></div>
+        </div>
+        <textarea id="input" rows="1" placeholder="Message Hearth…" data-i18n-placeholder="chat.placeholder"
+          class="flex-1 resize-none rounded-xl bg-slate-800 border border-slate-700 px-3 py-2.5 md:py-2 outline-none focus:border-sky-500 max-h-40 text-base md:text-sm"></textarea>
+        <!-- Send becomes Stop while a turn is running (same slot, always reachable). -->
+        <button id="sendBtn" data-i18n="chat.send" class="rounded-xl bg-sky-600 hover:bg-sky-500 px-4 py-2.5 md:py-2 font-medium">Send</button>
+        <!-- Stop lives INSIDE the form so it works on mobile keyboards too: while a
+             turn runs, Enter routes here instead of submitting (see chat.js). -->
+        <button id="abortBtn" data-i18n="chat.abort" title="Stop this turn"
+                class="hidden rounded-xl bg-red-700 hover:bg-red-600 px-4 py-2.5 md:py-2 font-medium">Stop</button>
+      </form>
+
+      <!-- Turn controls: re-run the last reply. (Agent mode / Force respond were
+           removed — tools are always available; gated ones still ask.) -->
+      <div id="turnControls" class="flex flex-wrap items-center gap-2 mt-2 text-[11px]">
+        <button id="retryBtn" data-i18n="chat.retry" title="Discard the last reply and generate it again"
+                class="rounded-lg px-2 py-1 border border-slate-700 bg-slate-800 hover:bg-slate-700 text-slate-200">↻ Retry</button>
+        <span id="turnHint" class="text-slate-500 ml-auto"></span>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script>
+async function api(){ return {ok:false,status:200,json:async()=>({})}; }
+window.I18N = {lang:'en',strings:{},load:async()=>{},apply:()=>{},t:k=>k};
+</script>
+<script src="app.js"></script>
+<script src="chat.js"></script>
+</body></html>

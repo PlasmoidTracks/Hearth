@@ -1,0 +1,7 @@
+#!/bin/sh
+# Grandchild-holder used by scratch/diffusion_runtime_probe.py: Hearth must kill BOTH this
+# shell and the sleep below it. A plain terminate() of the direct child leaves the sleep
+# running, which is exactly the orphan bug _kill_tree() exists to prevent.
+echo "wrapper pid $$ starting"
+sleep 60 &
+wait

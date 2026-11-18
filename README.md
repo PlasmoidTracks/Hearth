@@ -48,7 +48,6 @@ Context defaults to the full **262144**. If you hit OOM, lower `n_ctx` or use Ro
 (`linear`/`yarn`) — each setting has inline help explaining what it does and its safe range.
 
 ### Vision (multimodal / mmproj)
-
 To have Hearth *see* image attachments, pair a vision-capable model with its **mmproj**
 projector file (from the same model repo, e.g. `mmproj-Qwen2.5-VL-7B-Instruct-f16.gguf`).
 Set it in **Admin → Model → "Vision projector (mmproj) path"** (or `HEARTH_LLAMA_MMPROJ_PATH`
@@ -56,6 +55,33 @@ as the env fallback), then **Restart llama-server** — Hearth passes `--mmproj`
 shows a **Vision: mmproj set** badge once configured. Leave it blank for text-only models;
 image parts are then ignored by the model rather than sent as raw bytes. The projector must
 match the main model — a mismatched one fails to load (see `runtime/llama-server.log`).
+
+### Audio: a second model that listens (optional)
+
+Hearth can run a **second llama.cpp model** whose only job is to describe audio, and hand that
+description to the chat model as text. Useful for an Omni-class GGUF (Qwen-Omni), which reports
+voices, timbre, emotion, music and ambience — not just words — so even a text-only chat model can
+reason about a recording.
+
+1. **Admin → Audio** → enable *the audio captioner*.
+2. Set **Captioner model (.gguf)** and its matching **mmproj** (same repo as the audio model).
+3. Leave **GPU layers** at `0` (CPU only) — the default, chosen for MoE models: they want RAM, and
+   partial VRAM residency thrashes while starving the chat model. Set `all` if it fits in VRAM.
+4. Keep **port 8091** distinct from the chat model's, then **Start captioner** (weights can take
+   minutes; log at `runtime/captioner.log`).
+5. **Test with a tone** captions a generated 2-second beep to verify ffmpeg → request → audio encoder
+   → description in one click. If it describes speech over a beep, the model or prompt is wrong.
+
+Audio attachments are then described automatically as you send them (toggle in Admin → Audio), and the
+assistant can call `describe_audio` on any workspace file itself. Long recordings are split into timed
+chunks (`captioner.chunk_seconds`, needs `ffmpeg`) so it can say "at 1:30 she laughs". Both backends —
+`server` (weights stay loaded) and `cli` (`llama-mtmd-cli`, frees memory when idle) — are selectable;
+`server` falls back to `cli` mid-caption if its process dies.
+
+**Admin → Model → Loaded models** lists the chat model *and* the captioner with real running/configured
+state, and each can be started or stopped without disturbing the other. Env fallbacks:
+`HEARTH_CAPTIONER_MODEL_PATH`, `_MMPROJ_PATH`, `_SERVER_BIN`, `_CLI_BIN`, `_BASE_URL` (an externally
+run captioner server Hearth will use but never launch or kill). See docs/FEATURES.md and DEC-056.
 
 ## Sandboxed command execution (gated)
 
@@ -123,6 +149,7 @@ hearth/            application package
   i18n.py          German/English UI strings + per-user language preference
   orchestrator.py  per-turn agent loop   prompt.py     system prompt assembly
   manager.py       llama-server lifecycle provider selection (llm/)
+  captioner.py     SECOND model: audio description (own server/port/log; see DEC-056)
   tools/           fs(read/write/list/upload), exec, ask_user, web_search, device
   routes_auth/chat/admin.py               templates/ static/  UI (Jinja2 + vendored Tailwind)
 docs/              CONTRACT DECISIONS ARCHITECTURE SECURITY OPERATIONS FEATURES DELIVERY_RECORD

@@ -34,6 +34,22 @@ class CancelHandle:
     def cancelled(self) -> bool:
         return self.event.is_set()
 
+    def is_set(self) -> bool:
+        """`threading.Event`-compatible spelling of :attr:`cancelled`.
+
+        Two cancel interfaces coexist in this codebase: asyncio callers use ``.cancelled``,
+        while worker-thread code that was written against a plain threading.Event polls
+        ``.is_set()`` — the captioner's chunk loop and its streamed HTTP read (see
+        captioner._cancel_requested). Callers that hand THIS handle straight to such a helper
+        — orchestrator.prepare_captions does exactly that for a directly-attached recording,
+        whereas the describe_audio tool passes a ToolContext adapter instead — need the method
+        to exist, or the caption dies with AttributeError before describing anything.
+
+        Safe to poll from any thread: asyncio.Event.is_set() only inspects state and never
+        touches the loop.
+        """
+        return self.event.is_set()
+
     async def wait_cancelled(self) -> None:
         """Await until cancel() is called.
 
@@ -70,7 +86,27 @@ def abort_conversation(conversation_id: str, user_id: str) -> bool:
     if not h or h.user_id != user_id:
         return False
     h.cancel()
+    # Cooperative cancel cannot interrupt a blocking subprocess, and two tools sit in one
+    # for minutes (the captioner's llama-mtmd-cli / HTTP read, sd-cli's generation). Setting
+    # the handle alone would leave the machine busy after the user pressed Stop — so each
+    # runner is asked to terminate its own child. Best-effort and never fatal: a failure
+    # here must not stop the chat turn from aborting.
+    for label, killer in (("captioner", _stop_captioner), ("diffusion", _stop_diffusion)):
+        try:
+            killer()
+        except Exception:  # noqa: BLE001 — teardown of a helper model never blocks the abort
+            pass
     return True
+
+
+def _stop_captioner() -> None:
+    from .captioner import get_captioner
+    get_captioner().stop_active()
+
+
+def _stop_diffusion() -> None:
+    from .diffusion import get_diffusion
+    get_diffusion().stop_active()
 
 
 def is_running(conversation_id: str, user_id: str) -> bool:

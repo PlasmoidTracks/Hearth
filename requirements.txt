@@ -17,3 +17,22 @@ httpx>=0.27,<1.0
 #   argon2-cffi  -> stronger password hashing than stdlib scrypt
 #   qrcode       -> render TOTP provisioning QR codes in the UI
 #   cryptography -> REQUIRED if you enable HEARTH_WORKSPACE_ENCRYPTION (at-rest files)
+#
+# Optional media tools (see docs/FEATURES.md "Media: PDFs and video"). The tools
+# degrade gracefully and report which package is missing, so none of these are required:
+#   pymupdf  -> in-process PDF page rendering (best option; no external binaries needed)
+#   Pillow   -> downscale rendered pages & frames before they cost context tokens
+#              (media.max_image_edge). Colour is preserved. Without it images go at
+#              full render resolution.
+# System packages, not pip: poppler-utils (pdftoppm/pdfinfo), ghostscript, or mupdf-tools
+# are used as PDF fallbacks when pymupdf is absent; ffmpeg (ffprobe) reads video metadata
+# and decodes frames for view_video, with opencv-python as its fallback.
+#
+# Optional audio captioner (see docs/FEATURES.md "Audio" + DEC-056). Nothing extra to
+# pip install — it drives a second llama-server / llama-mtmd-cli process:
+#   ffmpeg -> converts recordings to 16 kHz mono and splits long ones into timed chunks;
+#             without it files are sent unmodified (audio_info reports duration as unknown)
+#   ffprobe-> audio_info tool: duration, codec, sample rate, and whether a video file has
+#             an audio track at all
+#   llama-mtmd-cli (from your llama.cpp build) -> the 'cli' backend and the fallback used
+#             when the captioner server cannot answer

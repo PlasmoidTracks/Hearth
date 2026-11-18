@@ -22,6 +22,20 @@ button, [role="button"], a { touch-action: manipulation; -webkit-tap-highlight-c
    .open on #sidebar); md: utilities in the template reset it on desktop. */
 #sidebar.open { transform: translateX(0); }
 
+/* Hidden native file pickers must never render their browser-provided button or
+   "Keine Datei ausgewählt" status. The 📎 menu invokes them programmatically.
+   This rule is also a safeguard against the async Tailwind build loading later. */
+input[type="file"].hidden { display: none !important; }
+
+/* Attach menu (composer 📎): anchored to its wrapper in CSS, NOT via JS —
+   the vendored Tailwind build compiles asynchronously, so a one-shot JS
+   measurement can read a transient layout and place the popup far off-screen.
+   bottom:100% opens it above the composer; left-aligns with the 📎 button.
+   If it would overflow the right edge on a narrow phone, chat.js nudges it
+   back (clampAttachMenu) using only the menu's own rect — no timing games. */
+#attachWrap { position: relative; }
+#attachMenu { position: absolute; bottom: calc(100% + 6px); left: 0; }
+
 /* Sidebar panels (#panelHost > section): chat.js toggles `hidden` per panel.
    A plain flex display rule would beat Tailwind's `.hidden` (both are 0-1-0,
    later wins), so the visible state is scoped to `:not(.hidden)` and hiding
@@ -77,6 +91,41 @@ button:disabled, [role="button"]:disabled { opacity: .5; cursor: not-allowed; }
 }
 
 
+
+/* ---- Transcript bubbles: fixed maximum height + collapse ------------------
+   Tool chips, reasoning blocks and audio-caption blocks are all <details>, so
+   one header click collapses them (the UI-cleanup affordance). Their *body* is
+   capped here at ~10 lines and scrolls inside — never clipped without a way to
+   read the rest.
+
+   Why raw CSS instead of Tailwind utilities: the vendored build compiles
+   classes it has seen in the DOM, so dynamically inserted ones can arrive
+   before compilation (and `--spacing`-derived rem values depend on whether the
+   JIT's base layer has set it yet). Raw CSS in this file is available from the
+   first paint and identical for the live builders and the history re-render.
+   The utilities are also deliberately left OFF the chips so nothing overrides
+   these rules by loading order. */
+#messages .bubble-body,
+#messages details > :not(summary) {
+  max-height: var(--bubble-max-h, 15rem);   /* ≈10 lines of chip text (11px/1.5) */
+  overflow-y: auto;
+}
+
+/* Tool chips: the whole bubble is a <details> (chat.js → toolChip), so its own padding
+   would sit outside the scroll window and the clipped last line would overlap the frame.
+   The header row carries the horizontal padding; the vertical padding belongs to the
+   scrollable body wrapper. */
+#messages details.tool-chip { padding-left: 0; padding-right: 0; }
+#messages details.tool-chip > summary { padding: .5rem .75rem; }
+#messages details.tool-chip > .bubble-body { padding: .25rem .75rem .5rem; }
+/* `overflow-x: hidden` on top of the base rule: a long unbreakable token in a tool
+   result would otherwise add a second, horizontal scrollbar inside the chip. */
+#messages details.tool-chip > .bubble-body { overflow-x: hidden; }
+
+/* Transient chips (a call that is running / composing its arguments) carry only a
+   one-line summary, but the server can send a long `path_hint`. Cap them at the same
+   height so nothing here can grow past the transcript's bubble budget either. */
+#messages .chip-transient { max-height: var(--bubble-max-h, 15rem); overflow-y: auto; }
 
 /* Web-tool source links under a tool chip (chat.js → webSourcesHtml).
    line-clamp is applied by hand: the vendored Tailwind build may not ship the
