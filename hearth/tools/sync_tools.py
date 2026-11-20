@@ -31,6 +31,7 @@ def _fmt_paths(paths: list[str], limit: int = 25) -> str:
 
 class SyncPreviewTool(Tool):
     name = "sync_preview"
+    label = "Project sync: preview"
     description = ("Show how the workspace copy of the linked project (under project/) differs "
                    "from the real folder on disk: which files would be added, which modified, and "
                    "which are CONFLICTED because the user changed them in the real folder since "
@@ -77,6 +78,7 @@ class SyncPreviewTool(Tool):
 
 class SyncApplyTool(Tool):
     name = "sync_apply"
+    label = "Project sync: apply to folder"
     description = ("Write the workspace copy's changes back to the user's real linked folder. "
                    "This is the ONLY action that modifies files outside the workspace, so it "
                    "always requires the user to approve this specific call. Call sync_preview "

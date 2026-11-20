@@ -75,3 +75,14 @@ class Provider(ABC):
 
     async def health(self) -> dict:
         return {"ok": True, "provider": self.name}
+
+    def capabilities(self) -> dict:
+        """What this backend can actually do, as data rather than by name-matching.
+
+        Callers used to sniff `getattr(provider, "name", "") == "llama-server"` to decide
+        whether to tail a server log for prefill progress — a capability test written as
+        string equality, which silently does nothing for any backend whose name differs
+        (AUDIT Part B, "LLM provider abstraction"). Declare the capability here instead:
+        `exposes_log_progress` is True only for a llama-server Hearth itself can read.
+        """
+        return {"measured_usage": False, "exposes_log_progress": False, "is_stub": False}

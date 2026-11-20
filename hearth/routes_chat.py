@@ -23,6 +23,7 @@ The download store lives in app state so tokens are process-scoped & ephemeral.
 """
 from __future__ import annotations
 import asyncio
+import hashlib
 import json
 import mimetypes
 import os
@@ -44,8 +45,22 @@ from . import project_link as pl
 from . import project_apply as pa
 from . import crypto
 
-# Max bytes per uploaded file (defense against trivial DoS). Configurable later.
+# Max bytes per uploaded file (defense against trivial DoS). The value is an admin
+# setting — uploads.max_bytes — and this constant is only the fallback when settings are
+# unreadable, plus the number the client is told before any setting exists. It used to be
+# a literal with a "Configurable later" comment above it, duplicated in chat.js, so raising
+# it meant patching source in two places (finding #8).
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+
+
+def upload_limit_bytes() -> int:
+    """The per-file upload cap in force right now (Admin → Uploads → Max upload size)."""
+    try:
+        v = int(rs.get("uploads.max_bytes") or 0)
+    except (TypeError, ValueError):
+        return MAX_UPLOAD_BYTES
+    return v if v > 0 else MAX_UPLOAD_BYTES
+
 
 router = APIRouter()
 
@@ -598,10 +613,17 @@ async def _stream_turn(user_id: str, conv_id: str, provider, settings: dict,
 
     `captions` carries audio descriptions prepared before the turn (see
     orch.prepare_captions) so attachments arrive described rather than mute.
+
+    First event may be a `provider_fallback` notice: when Admin set a real backend but it
+    is not answering, the turn runs on the stub model. That used to be invisible — canned
+    replies simply looked like answers (AUDIT #7).
     """
     from . import cancel as cancel_mod
+    note = getattr(get_manager(), "last_fallback_note", "") or ""
     handle = cancel_mod.begin(conv_id, user_id)
     try:
+        if note:
+            yield {"type": "notice", "kind": "provider_fallback", "text": note}
         async for ev in orch.run_turn(user_id, conv_id, provider, settings, store,
                                       pending_resume=pending_resume, gen=gen, cancel=handle,
                                       captions=captions):
@@ -920,7 +942,10 @@ async def chat_resolve(request: Request, user=Depends(require_user), _=Depends(c
         resume = {"id": pa.id, "kind": pa.kind, "tool_name": pa.tool_name,
                   "call_id": pa.call_id or "",
                   "conversation_id": pa.conversation_id, "user_id": pa.user_id,
-                  "payload": payload_json, "approved": approved}
+                  "payload": payload_json, "approved": approved,
+                  # Carried so _resume_pending can tell a fresh approval from one left
+                  # sitting for hours against a workspace that has since moved on (#4).
+                  "created_at": pa.created_at}
         audit.log(user.id, f"resolve_{pa.status}", {"tool": pa.tool_name})
 
     settings = _with_device_grant(rs.get_all(), resume["conversation_id"])
@@ -990,6 +1015,13 @@ async def upload_files(request: Request, conversation_id: str = Form(""),
     still reduced to a bare basename by _safe_filename — so there is no traversal surface.
     Uploading into the project copy stages files for sync_apply; nothing reaches the real
     folder until an approved apply (DEC-049).
+
+    Re-uploading a name that already exists REPLACES it, and always did. What used to be
+    silent is now reported: each artifact carries `replaced` (a path existed) and
+    `replaced_different_content` (those bytes differed), so neither the client nor the
+    model is ever told "uploaded" about what was actually a destructive overwrite. See
+    finding #2 — DEC-040 §2 justified replacing by "each message's attachment stays
+    fetchable", which only holds while the bytes are identical.
     """
     if not files:
         raise HTTPException(400, "no files")
@@ -1000,11 +1032,18 @@ async def upload_files(request: Request, conversation_id: str = Form(""),
             raise HTTPException(400, f"cannot upload to '{target_prefix}' — no such "
                                      f"destination is linked to your workspace")
     created = []
+    limit = upload_limit_bytes()
     for f in files:
         safe_name = _safe_filename(f.filename or "upload.bin")
         rel_target = os.path.join(target_prefix, safe_name)
         dest = ws.resolve_in_jail(user.id, rel_target)
         dest.parent.mkdir(parents=True, exist_ok=True)
+        # Before anything is written: does this name already hold something, and will the
+        # bytes we are about to stream change it? Hashing the EXISTING file (never the
+        # incoming one, which is streamed) keeps this cheap and lets the reply say whether
+        # a replacement destroyed different content rather than rewriting identical bytes.
+        had_path = dest.exists()
+        prior_sha = _sha_of_existing(user.id, rel_target) if had_path else None
         written = 0
         too_big = False
         try:
@@ -1018,13 +1057,16 @@ async def upload_files(request: Request, conversation_id: str = Form(""),
                         if not chunk:
                             break
                         written += len(chunk)
-                        if written > MAX_UPLOAD_BYTES:
+                        if written > limit:
                             too_big = True
                             break
                         out.write(chunk)
+                new_sha = None
                 if not too_big:
                     with open(tmp, "rb") as rd:
-                        ws.seal_bytes(dest, rd.read())   # encrypts when enabled
+                        blob = rd.read()
+                    new_sha = hashlib.sha256(blob).hexdigest()
+                    ws.seal_bytes(dest, blob)   # encrypts when enabled
             finally:
                 try: os.remove(tmp)
                 except OSError: pass
@@ -1033,14 +1075,39 @@ async def upload_files(request: Request, conversation_id: str = Form(""),
         if too_big:
             try: os.remove(dest)
             except OSError: pass
-            mb = MAX_UPLOAD_BYTES // (1024 * 1024)
+            mb = limit // (1024 * 1024)
             raise HTTPException(413, f"'{safe_name}' is too large (over {mb} MB limit)")
+        replaced = had_path and (prior_sha is None or prior_sha != new_sha)
         art = artifacts.record(user.id, ws.rel_from_jail(user.id, dest),
                                conversation_id=conversation_id, kind="uploaded",
                                filename=safe_name, plain_size=written, new_row=True)
+        art["replaced"] = had_path
+        art["replaced_different_content"] = replaced
+        if replaced:
+            # The one audit line that distinguishes "attached report.pdf again" from
+            # "overwrote report.pdf with different bytes" — invisible in the chat before.
+            audit.log(user.id, "upload_replaced", {"path": art["rel_path"],
+                                                   "prior_sha256": (prior_sha or "")[:16],
+                                                   "new_sha256": (new_sha or "")[:16]})
         created.append(art)
     audit.log(user.id, "upload", {"count": len(created)})
-    return JSONResponse({"ok": True, "artifacts": created})
+    return JSONResponse({"ok": True, "artifacts": created,
+                         "max_bytes": limit,
+                         # Surfaced so the client never has to hard-code a second copy of
+                         # the limit (finding #8): chat.js reads this instead.
+                         "replaced_any": any(a.get("replaced_different_content") for a in created)})
+
+
+def _sha_of_existing(user_id: str, rel_target: str) -> str | None:
+    """sha256 of an existing jailed file's PLAINTEXT, or None if it cannot be read.
+
+    Returns None rather than raising so an unreadable pre-existing file degrades to "we
+    could not compare", never to a false claim that content was preserved.
+    """
+    try:
+        return hashlib.sha256(ws.read_bytes(user_id, rel_target)).hexdigest()
+    except Exception:  # noqa: BLE001 — comparison is best-effort; the upload itself stands
+        return None
 
 
 def _safe_filename(name: str) -> str:

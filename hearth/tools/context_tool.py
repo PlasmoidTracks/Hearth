@@ -19,6 +19,7 @@ from .base import Tool, ToolResult
 
 class ContextUsageTool(Tool):
     name = "context_usage"
+    label = "Context-window usage (meta)"
     description = ("Report this conversation's CONTEXT-WINDOW usage: tokens used so far, the total "
                    "window (n_ctx), the percentage, and how many tokens are left — plus whether the "
                    "figure was measured by the model server or estimated. Call it before starting a "

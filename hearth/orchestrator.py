@@ -85,21 +85,62 @@ def _captioner_hint(settings: dict) -> str:
             "run `describe_audio` on that path rather than speaking from imagination.")
 
 
-def _workspace_context(user_id: str) -> str:
-    """A compact list of files in the user's workspace so the model knows what exists."""
+def _workspace_context(user_id: str, settings: dict | None = None) -> tuple[str, bool]:
+    """A compact list of files in the user's workspace so the model knows what exists.
+
+    Returns (prompt_section, capped). `capped` is True when the listing hit the entry
+    limit, which build_messages() forwards to prompt.assemble() so the preamble's claim
+    about the listing matches what is actually in it (finding #1/B3).
+
+    Two silences used to live here, both worse than an error:
+      * The cap was hard-coded at 80 with no marker, so a workspace of 312 files was
+        presented as a complete "ls -l equivalent". It now reads the admin setting and
+        appends prompt.listing_truncation_note() naming how many entries were left out.
+      * Any failure (jail error, DB fault) returned "", which the model read as "no
+        files" — indistinguishable from a genuinely empty workspace, so it told the user
+        their files were gone. It now says the listing FAILED and to call fs_list, and
+        audit-logs the real exception (finding #5).
+    """
+    settings = settings if settings is not None else rs.get_all()
     try:
-        entries = workspaces.list_tree(user_id, ".", max_entries=80)
-    except Exception:  # noqa: BLE001
-        return ""
+        cap = int(settings.get("agent.workspace_listing_entries") or 80)
+    except (TypeError, ValueError):
+        cap = 80
+    cap = max(1, cap)
+    try:
+        probe = workspaces.list_tree(user_id, ".", max_entries=cap)
+    except Exception as e:  # noqa: BLE001 — must not break prompt assembly, but must not lie
+        _audit_listing_failure(user_id, e)
+        return ("\n\n# Workspace files\n(listing FAILED — do NOT conclude the workspace is "
+                "empty; use fs_list with '.' to try again)", False)
+    entries = probe
+    # Whether anything was left out comes from list_tree itself (`.truncated`), not from
+    # counting: a capped read cannot report a total, which is exactly why the old listing
+    # could only ever say nothing at all about the files it omitted.
+    capped = bool(getattr(probe, "truncated", False))
     if not entries:
-        return "\n\n# Workspace files\n(your workspace is currently empty)"
+        return "\n\n# Workspace files\n(your workspace is currently empty)", False
     lines = []
     for e in entries:
         size = f" ({e['size']} B)" if (not e["is_dir"] and e.get("size") is not None) else ""
         lines.append(f"- {'[dir] ' if e['is_dir'] else ''}{e['name']}{size}")
+    tail = ("\n" + prompt_mod.listing_truncation_note()) if capped else ""
     return ("\n\n# Workspace files (ls -l equivalent; read with fs_read, list a folder with fs_list)\n"
             "Files under uploads/ are ones the user attached to this chat.\n"
-            + "\n".join(lines))
+            + "\n".join(lines) + tail, capped)
+
+
+def _audit_listing_failure(user_id: str, exc: Exception) -> None:
+    """Best-effort audit trail for a workspace listing that could not be produced.
+
+    Never raises: an audit failure must not turn a degraded prompt into a failed turn.
+    """
+    try:
+        from . import audit
+        audit.log(user_id or "?", "workspace_listing_failed",
+                  {"error": f"{type(exc).__name__}: {str(exc)[:200]}"})
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _project_context(user_id: str) -> str:
@@ -137,8 +178,23 @@ def _project_context(user_id: str) -> str:
             f"Before applying, run sync_preview and tell the user what will change. Do not delete "
             f"files expecting them to disappear from the real folder — deletions are never applied."
         )
-    except Exception:  # noqa: BLE001 — a broken link must never break prompt building
-        return ""
+    except Exception as e:  # noqa: BLE001 — a broken link must never break prompt building
+        # But it must not vanish either: an absent section reads as "no project is linked",
+        # so the model tells the user there is nothing to sync while their folder sits there
+        # unmentioned. Say what failed instead of saying nothing (finding #5).
+        _audit_project_context_failure(user_id, e)
+        return ("\n\n# Linked project folder\n(A linked project folder EXISTS but its details "
+                "could not be read right now. Do not say no project is linked; call sync_preview "
+                "to find out what is there.)")
+
+
+def _audit_project_context_failure(user_id: str, exc: Exception) -> None:
+    """Best-effort audit trail for an unreadable project link. Never raises."""
+    try:
+        audit.log(user_id or "?", "project_context_failed",
+                  {"error": f"{type(exc).__name__}: {str(exc)[:200]}"})
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _image_parts(user_id: str, images: list):
@@ -168,6 +224,42 @@ def _image_parts(user_id: str, images: list):
         except Exception:  # noqa: BLE001 — skip an unreadable image, keep the rest
             continue
     return parts
+
+
+def _display_image_items(user_id: str, display):
+    """Split display_media's files into (items the model can see, names of the rest).
+
+    Only genuine images go to the model, because they travel as `image_url` data URLs and
+    an mmproj projector is an IMAGE encoder: base64'ing a 40 MB clip into every subsequent
+    prompt buys nothing except a rejected request or tens of thousands of wasted tokens.
+    The kind is re-derived from the path at replay time rather than trusted from meta, so
+    a file renamed since it was shown cannot quietly change what gets encoded.
+
+    Note on the jail check: resolve_in_jail() returns a Path, and bool(Path(".")) is False
+    — so it must never be used as a truth value. Existence is checked with .exists(), and
+    every read still goes through workspaces.read_bytes(), which re-resolves the path itself.
+    """
+    from .tools.display_media import media_kind
+    images: list = []
+    blind: list[str] = []
+    for item in display or []:
+        rel = str((item or {}).get("path") or "") if isinstance(item, dict) else ""
+        if not rel:
+            continue
+        try:
+            abs_path = workspaces.resolve_in_jail(user_id, rel, allow_missing=False)
+            if not abs_path.exists():
+                continue
+        except Exception:  # noqa: BLE001 — gone or escaped: nothing to send, and no reason to
+            continue       # fail the whole request over a file that stopped existing
+        kind = media_kind(rel)
+        if kind == "image":
+            mime = str((item or {}).get("mime") or "") or "image/png"
+            images.append({"path": rel, "mime": mime})
+        else:
+            name = str((item or {}).get("name") or rel).strip() or rel
+            blind.append(f"{name} ({kind or 'file'})")
+    return images, blind
 
 
 def _attachment_content(user_id: str, att_meta: list, text: str, captions: dict | None = None):
@@ -253,18 +345,38 @@ def _caption_cache_key(user_id: str, conv_id: str) -> str:
 def _remember_caption(user_id: str, conv_id: str, rel: str, text: str) -> None:
     key = _caption_cache_key(user_id, conv_id)
     if key not in _captions and len(_captions) >= _CAPTION_CACHE_MAX_CONVOS:
-        # Dicts keep insertion order, so this drops the least recently *created* chat.
-        # Crude but bounded, which is all a convenience cache needs.
+        # Evict the least recently *used* chat, not the least recently created one.
+        # It used to rely on plain dict insertion order and said so in a comment ("crude
+        # but bounded") — with more than 64 chats in play that dropped the caption of an
+        # actively-used conversation, and the model then received a bare `[attached: x.mp3]`
+        # while the UI still displayed a description: the user believed the model had heard
+        # the recording when it had not (AUDIT #12).
+        _evict_caption_lru()
+    _captions.setdefault(key, {})[rel] = text[:_CAPTION_NOTE_MAX_CHARS + 4000]
+
+
+def _evict_caption_lru() -> None:
+    """Drop the caption entry with the oldest last-touch time. Never raises."""
+    try:
+        victim = min(_captions.items(), key=lambda kv: kv[1].get("_used_at", 0))[0]
+        del _captions[victim]
+    except (KeyError, StopIteration, TypeError, ValueError):
+        # Unreadable stamps (an entry written before this existed) — fall back to the old
+        # insertion-order eviction rather than letting the cache grow unbounded.
         try:
             del _captions[next(iter(_captions))]
         except StopIteration:
             pass
-    _captions.setdefault(key, {})[rel] = text[:_CAPTION_NOTE_MAX_CHARS + 4000]
 
 
 def get_caption(user_id: str, conv_id: str, rel: str) -> str:
     """A previously produced caption/note for this attachment, or ""."""
-    return (_captions.get(_caption_cache_key(user_id, conv_id), {}) or {}).get(rel, "")
+    key = _caption_cache_key(user_id, conv_id)
+    entry = _captions.get(key) or {}
+    if entry:
+        # Touch on read so a chat in use is never the eviction victim (see above).
+        entry["_used_at"] = time.time()
+    return entry.get(rel, "")
 
 
 # ---- durable captions (DEC-061) ---------------------------------------------------
@@ -536,10 +648,17 @@ def build_messages(conv_id: str, user_id: str = "", captions: dict | None = None
     else:
         resolved = (sys_doc.content if sys_doc else None) or user_doc
     system = prompt_mod.assemble(resolved, proto_doc.content if proto_doc else None)
+    # The listing claim in the preamble must be worded from the SAME cap that produced the
+    # listing below, so assemble() is called a second time when a listing is actually
+    # appended: the first call's text cannot know whether the list will be capped.
+    _settings = settings or rs.get_all()
     if user_id:
-        system += _workspace_context(user_id)
+        ws_block, capped = _workspace_context(user_id, _settings)
+        system = prompt_mod.assemble(resolved, proto_doc.content if proto_doc else None,
+                                     settings=_settings, listing_capped=capped)
+        system += ws_block
         system += _project_context(user_id)
-    system += _captioner_hint(settings or rs.get_all())
+    system += _captioner_hint(_settings)
     messages: list[dict] = [{"role": "system", "content": system}]
     last_assistant_with_calls: dict | None = None
     for m in load_history(conv_id):
@@ -573,8 +692,24 @@ def build_messages(conv_id: str, user_id: str = "", captions: dict | None = None
             # to. See DEC-052: this is the same multimodal shape hearth's upload path
             # uses, i.e. the only one known to reach an mmproj projector. A text-only
             # model simply ignores the parts; the tool's own text still explains them.
-            if user_id and meta.get("images"):
-                parts = _image_parts(user_id, meta["images"])
+            #
+            # display_media images are folded into the SAME message (the user sees one
+            # tool chip either way), and its audio/video become a short plain-text note —
+            # never pixels, see _display_image_items. Both are handled off a single `parts`
+            # list so a display-only row (no meta["images"], e.g. a video shown alone) still
+            # reaches the model instead of silently vanishing from its view of the chat.
+            if user_id and (meta.get("images") or meta.get("display")):
+                parts = _image_parts(user_id, meta.get("images") or [])
+                shown, blind = _display_image_items(user_id, meta.get("display"))
+                if shown:
+                    parts = parts + _image_parts(user_id, shown)
+                if blind:
+                    messages.append({
+                        "role": "user",
+                        "content": f"[{meta.get('tool') or 'tool'} also put these on the "
+                                   f"user's screen: {', '.join(blind)}. You were NOT given "
+                                   f"them — you cannot see or hear them; describe them only "
+                                   f"from what you know of the file itself.]"})
                 if parts:
                     messages.append({
                         "role": "user",
@@ -800,50 +935,6 @@ def _merge_progress(st: dict | None, evs: list) -> tuple[dict, list]:
                 e["eta"] = txt
         out.append(e)
     return st, out
-
-    """Turn one parsed log event into a `progress` StreamEvent with an honest ETA.
-
-    Carries llama.cpp's own numbers and the ONE calculation worth doing here:
-
-        remaining tokens / last prefill rate = seconds left
-
-    The rate is what llama.cpp reported for THIS prompt on this very line, never averaged or
-    extrapolated; the remaining token count comes from the server's `n_tokens done` +
-    `progress fraction` pair (so the whole prompt size is n_done / progress). It is still a
-    flat-rate guess over a curve that is not flat (chunked prefill, cache hits), hence "≈".
-
-    Honesty rules that must not be relaxed:
-      * Below 1 % progress nothing is said at all. print_timing rounds the fraction to two
-        decimals, so dividing a handful of tokens by a hundredth of a prompt invents a huge
-        number out of rounding noise.
-      * No rate -> no ETA (not zero). format_seconds returns "" for anything under a second,
-        so a caller that appends it gets silence rather than a misleading "0s left".
-    """
-    data = dict(ev or {})
-    if data.get("kind") == "prefill":
-        n_done = data.get("n_tokens") or 0
-        frac = data.get("progress") or 0.0
-        rate = data.get("rate_tps")
-        data["phase"] = "prefill"
-        data["pct"] = max(0.0, min(1.0, float(frac)))
-        data["prompt_tokens"] = int(n_done)
-        n_left = None
-        if n_done and frac and rate:
-            n_total = int(round(n_done / frac))
-            n_left = max(0, n_total - int(n_done))
-            data["prompt_total"] = n_total
-        if n_left and rate and frac >= 0.01:
-            secs = n_left / float(rate)
-            from .perf import format_seconds
-            txt = format_seconds(secs)
-            if txt:
-                data["eta_s"] = round(secs, 1)
-                data["eta"] = txt
-    elif data.get("kind") == "perf":
-        # A pure speed line (decode rate while generating, or a perf-context summary).
-        # No percentage to report — the UI must not show a bar it has no basis for.
-        data.setdefault("phase", "decode")
-    return StreamEvent("progress", data=data)
 
 
 async def _stream_checked(provider, messages, specs, params, cancel, log_src=None):
@@ -1214,7 +1305,12 @@ async def _agent_loop(user_id, conv_id, provider, settings, ctx,
     # somewhere we cannot see, so passing nothing there is the honest answer rather than a
     # guess. Admin → Model → "Show prefill progress from the server log" turns it off.
     log_src = None
-    if (getattr(provider, "name", "") == "llama-server"
+    _caps = {}
+    try:
+        _caps = provider.capabilities() if hasattr(provider, "capabilities") else {}
+    except Exception:  # noqa: BLE001 — a capability probe must never break a turn
+        _caps = {}
+    if (_caps.get("exposes_log_progress")
             and bool(settings.get("agent.prefill_progress", True))):
         from .manager import get_manager
         _mgr = get_manager()
@@ -1530,11 +1626,34 @@ async def _resume_pending(pending, ctx, provider, settings, download_store,
     NB: an approved gated call is NOT counted against the turn's tool-step budget —
     the user explicitly authorised it, so `agent.max_tool_steps` must never strand it
     mid-execution. Only the continuing loop below is bounded.
+
+    What the approval covers, though, is what was SHOWN at the moment it was asked for.
+    A pending card can sit for hours — an unread browser tab, a phone locked overnight —
+    and in that time `sync_apply`'s preview, an `exec` against files since edited, or a
+    `fs_delete` of a file recreated under the same name all stop meaning what they said.
+    The codebase already refuses exactly this hazard elsewhere (project_apply: "approval
+    of an older preview cannot slip a stale overwrite past a [change]"), so resuming an
+    approval past agent.pending_max_age_s now says so and re-asks rather than executing
+    against a workspace that has moved on (AUDIT #4). Denials always still resolve.
     """
     conv_id = pending["conversation_id"]
     tool = TOOLS_BY_NAME.get(pending["tool_name"])
     args = json.loads(pending.get("payload", "{}"))
     call_id = pending.get("call_id") or "call_resume"
+
+    if pending.get("approved") and _pending_is_stale(pending, settings):
+        age = _pending_age_s(pending)
+        audit.log(pending.get("user_id") or "", "pending_approval_expired",
+                  {"tool": pending.get("tool_name"), "age_s": age, "conv": conv_id})
+        append_message(conv_id, "tool",
+                       f"Not run: this approval is {int((age or 0) // 60)} minute(s) old and the "
+                       f"workspace may have changed since it was shown. Ask {tool.name} again to "
+                       f"get a fresh preview.",
+                       meta=json.dumps({"tool": pending.get("tool_name", "tool"),
+                                        "tool_call_id": call_id}))
+        yield {"type": "tool_result", "name": pending.get("tool_name", "tool"), "ok": False,
+               "preview": "approval expired — not executed", "meta": {}}
+        return
 
     if pending["kind"] == "ask_user":
         # answer already in args["answer"] set at resolve time
@@ -1627,7 +1746,37 @@ def _tool_row_meta(tool_name: str, result, call_id: str = "") -> dict:
     if imgs:
         meta["images"] = [{"path": str(i.get("path", "")), "mime": str(i.get("mime", "") or "")}
                           for i in imgs if isinstance(i, dict) and i.get("path")]
+    # display_media puts files on the USER's screen. Kept under its own key rather than
+    # folded into "images" because that key is read by build_messages and encoded as
+    # image_url data URLs: a video or audio file listed there would be base64'd into every
+    # later prompt and handed to an IMAGE projector, costing tens of thousands of tokens to
+    # say nothing the model could perceive. "display" is UI-only; replay picks out from it
+    # the subset that is genuinely an image (see build_messages).
+    media = (getattr(result, "meta", None) or {}).get("media")
+    if isinstance(media, list) and media:
+        meta["display"] = [{"path": str(m.get("path", "")), "kind": str(m.get("kind", "") or ""),
+                            "url": str(m.get("url", "") or ""),
+                            "artifact_id": str(m.get("artifact_id", "") or ""),
+                            "name": str(m.get("name", "") or "")}
+                           for m in media if isinstance(m, dict) and m.get("path")]
+        cap = str((getattr(result, "meta", None) or {}).get("caption") or "").strip()
+        if cap:
+            meta["display_caption"] = cap[:300]
+    dl = _download_meta(result)
+    if dl:
+        # Persist the artifact IDENTITY, not just a filename. History replay used to
+        # regex-scrape the name out of the tool message prose and look it up first-wins by
+        # filename, so two artifacts sharing a name gave the second one the first's link,
+        # and renaming a file lost its download button outright (AUDIT #10). With the id on
+        # the row, replay resolves exactly what the live stream offered.
+        meta["download"] = dl
     return meta
+
+
+def _download_meta(result) -> dict:
+    """The `download` block of a tool result, if it offers one ({name,url,artifact_id})."""
+    dl = (getattr(result, "meta", None) or {}).get("download")
+    return dict(dl) if isinstance(dl, dict) and dl.get("url") else {}
 
 
 def _ui_meta(tool_name: str, result) -> dict:
@@ -1635,11 +1784,23 @@ def _ui_meta(tool_name: str, result) -> dict:
 
     Same web info under "web" as the persisted row (so live and reloaded views
     render identically), plus everything else the tool returned (download links).
+
+    `media` is copied through explicitly for symmetry with the persisted "display" key:
+    display_media's files must draw the same bubble while streaming and after a reload,
+    exactly as web sources do. It stays off the model's request graph either way — this
+    dict never reaches build_messages.
     """
     out = dict(result.meta or {})
     wm = _web_meta(result)
     if wm:
         out["web"] = wm
+    # Media from display_media only. NOT `result.images` — that field is the model's pixel
+    # channel (pdf_read pages, view_video frames) and those tools' entries carry no `kind`,
+    # so the guard below keeps them out: they are rendered for the model, not put on screen
+    # for the user. Reading both would draw a bubble per PDF page behind every pdf_read.
+    media = (result.meta or {}).get("media") or []
+    if isinstance(media, list) and any(isinstance(m, dict) and m.get("kind") for m in media):
+        out["media"] = [m for m in media if isinstance(m, dict) and m.get("path")]
     return out
 
 
@@ -1786,6 +1947,32 @@ def _guard_result(result, ctx, tool_name: str):
         return guarded
     except Exception:  # noqa: BLE001 — a guard failure must never fail a tool call
         return result
+
+
+def _pending_age_s(pending) -> float | None:
+    """Seconds since the pending card was created, or None when it carries no stamp.
+
+    `created_at` is whole-second epoch time (models.now()). Rows written before this
+    check existed, or hand-built dicts from tests, may lack it — those are treated as
+    NOT stale rather than deleting a user's approval on a missing field.
+    """
+    created = pending.get("created_at")
+    try:
+        return max(0.0, time.time() - float(created))
+    except (TypeError, ValueError):
+        return None
+
+
+def _pending_is_stale(pending, settings) -> bool:
+    """True when an approval is older than agent.pending_max_age_s (0 disables)."""
+    try:
+        limit = int(settings.get("agent.pending_max_age_s") or 0)
+    except (TypeError, ValueError):
+        return False
+    if limit <= 0:
+        return False
+    age = _pending_age_s(pending)
+    return age is not None and age > limit
 
 
 def _persist_pending(conv_id, user_id, treq) -> str:

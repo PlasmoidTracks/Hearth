@@ -83,6 +83,76 @@ state, and each can be started or stopped without disturbing the other. Env fall
 `HEARTH_CAPTIONER_MODEL_PATH`, `_MMPROJ_PATH`, `_SERVER_BIN`, `_CLI_BIN`, `_BASE_URL` (an externally
 run captioner server Hearth will use but never launch or kill). See docs/FEATURES.md and DEC-056.
 
+### Images: drawing with Qwen Image (optional)
+
+Hearth can draw pictures by running **stable-diffusion.cpp's `sd-cli`** as a subprocess — no
+port, no resident server, so it never competes with the chat model. Each call loads the model,
+draws, and exits; the finished PNG comes back to the chat model, which is how it can tell you
+what it actually drew instead of describing an image it never saw.
+
+**Supported models: Qwen Image / Qwen Image 2.1 only.** That narrow scope is deliberate
+(docs/DECISIONS.md DEC-074): this architecture needs three files with three dedicated flags,
+and a generic "diffusion model + optional encoders" shape cannot express it — `--model` is not
+accepted for these weights at all, and a missing encoder or VAE fails as hundreds of
+`… not in model metadata` lines rather than naming the problem.
+
+1. Build or obtain **stable-diffusion.cpp** (`sd-cli`).
+2. Put the three files from one Qwen Image package in one folder, e.g.
+   `~/.lmstudio/models/lmstudio-community/Qwen-image-2.1/`:
+
+   | File | Flag | Example |
+   |---|---|---|
+   | Diffusion model (.gguf) | `--diffusion-model` | `qwen_image_2.1_Q8_0.gguf` |
+   | Text-encoder LLM (.gguf) | `--llm` | `Qwen3VL-8B-Instruct-Q4_K_M.gguf` |
+   | VAE (.safetensors) | `--vae` | `diffusion_pytorch_model.safetensors` |
+
+3. **Admin → Images** → set *stable-diffusion.cpp CLI path* and *Model folder*, enable the
+   switch, **Save**, then **🖼 Draw a test image**. Hearth finds all three files in the folder by
+   name; the three path fields are only for unusually named files, and each tile says which
+   source it used. A missing or unreadable file is refused *before* launching, naming that file.
+4. Ask the assistant for a picture (each call needs your approval — it costs tens of seconds to
+   minutes). `batch` returns several candidates from one model load; `init_image` + `strength`
+   restyles an existing workspace image. Sampling is fixed to euler + flash attention at
+   CFG 4.5 / 20 steps, which is what this model is happy with.
+
+The Images tab shows one tile per required file and **Copy the sd-cli command** gives the exact
+command line for pasting into a terminal. Env fallbacks: `HEARTH_DIFFUSION_CLI_BIN`,
+`HEARTH_DIFFUSION_MODEL_DIR`, `HEARTH_DIFFUSION_DIT|_LLM|_VAE`, `HEARTH_DIFFUSION_BACKEND`.
+Run log: `runtime/diffusion.log`. See DEC-074/DEC-075.
+
+### Image editing: Qwen Image Edit (optional, alongside generation)
+
+Hearth can also **edit** a picture you already have — add/remove/change elements, restyle, rotate,
+or edit text — with **Qwen Image Edit**, running the *same* `sd-cli` binary as a second, independent
+model slot. Generation draws from text; editing transforms an existing image by instruction while
+keeping everything you did not mention. The agent gets a separate `edit_image` tool for it (so it can
+choose drawing vs editing), and both share one runner and lock — a draw and an edit never run at once.
+
+Qwen Image Edit needs the same three-file shape but **different weights**: an Edit DiT, a
+**Qwen2.5-VL** text encoder (not the Qwen3-VL generation uses), and the VAE. The 2509 checkpoint also
+ships a separate vision mmproj (`--llm_vision`); the original and 2511 fold vision into the single
+encoder file, so that slot is optional.
+
+1. Put the Edit files in one folder, e.g. `~/.lmstudio/models/lmstudio-community/Qwen-Image-Edit/`:
+
+   | File | Flag | Example |
+   |---|---|---|
+   | Edit diffusion model (.gguf) | `--diffusion-model` | `Qwen_Image_Edit-Q8_0.gguf` |
+   | Text-encoder LLM (.gguf/.safetensors) | `--llm` | `Qwen2.5-VL-7B-Instruct-Q8_0.gguf` |
+   | VAE (.safetensors) | `--vae` | `qwen_image_vae.safetensors` |
+   | Vision mmproj (optional, 2509 only) | `--llm_vision` | `Qwen2.5-VL-7B-Instruct.mmproj-Q8_0.gguf` |
+
+2. **Admin → Images → "Image editing"** → set the *Edit model folder* (leave the CLI path blank to
+   reuse the generation binary), enable the switch, **Save**, then **✂️ Test an edit**. Hearth finds
+   the files by name; each tile says which source it used, and an unset optional mmproj reads as
+   "optional", not missing.
+3. Ask the assistant to edit an image (each call needs your approval). It passes a workspace image +
+   an instruction; sampling is fixed to euler + flash attention at CFG 2.5 / `--flow-shift 3`, which
+   is what Edit checkpoints are tuned for.
+
+Env fallbacks: `HEARTH_IMAGE_EDIT_CLI_BIN` (falls back to the generation CLI), `_MODEL_DIR`,
+`_DIT|_LLM|_VAE|_LLM_VISION`, `_BACKEND`. Run log: `runtime/diffusion.log` (shared). See DEC-078.
+
 ## Sandboxed command execution (gated)
 
 Off by default. Enable in Admin → Tools → **Command execution**. Hearth auto-detects a
@@ -150,6 +220,7 @@ hearth/            application package
   orchestrator.py  per-turn agent loop   prompt.py     system prompt assembly
   manager.py       llama-server lifecycle provider selection (llm/)
   captioner.py     SECOND model: audio description (own server/port/log; see DEC-056)
+  diffusion.py     image backends via sd-cli: Qwen Image (generate) + Qwen Image Edit profiles
   tools/           fs(read/write/list/upload), exec, ask_user, web_search, device
   routes_auth/chat/admin.py               templates/ static/  UI (Jinja2 + vendored Tailwind)
 docs/              CONTRACT DECISIONS ARCHITECTURE SECURITY OPERATIONS FEATURES DELIVERY_RECORD
@@ -161,10 +232,16 @@ user guide (uploads, artifacts, device access, language), docs/OPERATIONS.md for
 
 ## Notes & limitations
 
-- Single-process design (SQLite + in-memory rate limiting). Fine for family scale; a reverse proxy
-  can add TLS. For many concurrent users run behind `uvicorn --workers` with an external DB and move
-  rate-limiting to Redis (follow-ups listed in the delivery record). Downloads are durable via the
-  artifacts table (no longer tied to in-memory tokens).
+- **Single-process design — run exactly ONE worker.** SQLite, in-memory rate limiting, the
+  abort/turn registry (`cancel.py`), the steering queue (`steering.py`), the audio-caption cache
+  and per-app download tokens are all per-process. `uvicorn --workers 2`, gunicorn or
+  `WEB_CONCURRENCY>1` splits them: **Stop answers "nothing is running" while a turn streams in
+  another worker, a steered message may never be delivered, and a caption produced in one
+  worker is missing in the next** — all of which look like model bugs. Hearth warns at boot if
+  it detects this. Fine for family scale as it stands; scaling past one process needs those
+  four moved to a shared store (Redis or similar) plus an external DB first. A reverse proxy
+  can still add TLS in front of the single process. Downloads are durable via the artifacts
+  table (no longer tied to in-memory tokens).
 - **Device tools are stubbed behind a documented helper protocol until a device helper is paired.** The
   "Allow device access" button is a real per-conversation server-side gate (the tools refuse without it),
   but with no helper daemon shipped there is nothing for them to talk to — the UI says so. Single-file
@@ -175,3 +252,37 @@ user guide (uploads, artifacts, device access, language), docs/OPERATIONS.md for
   plain HTTP (default, can fail gracefully — it's user-triggered only), the same via a local Tor SOCKS5
   proxy, or the operator's real Chrome via Selenium (`pip install selenium`) for JS-heavy/login pages.
   Results render as clickable source links in the chat so answers can be verified. See Admin → Tools → Web.
+Hearth can draw pictures by running **stable-diffusion.cpp's `sd-cli`** as a subprocess — no
+port, no resident server, so it never competes with the chat model. Each call loads the model,
+draws, and exits; the finished PNG comes back to the chat model, which is how it can tell you
+what it actually drew instead of describing an image it never saw.
+
+**Supported models: Qwen Image / Qwen Image 2.1 only.** That narrow scope is deliberate
+(docs/DECISIONS.md DEC-074): this architecture needs three files with three dedicated flags,
+and a generic "diffusion model + optional encoders" shape cannot express it — `--model` is not
+accepted for these weights at all, and a missing encoder or VAE fails as hundreds of
+`… not in model metadata` lines rather than naming the problem.
+
+1. Build or obtain **stable-diffusion.cpp** (`sd-cli`).
+2. Put the three files from one Qwen Image package in one folder, e.g.
+   `~/.lmstudio/models/lmstudio-community/Qwen-image-2.1/`:
+
+   | File | Flag | Example |
+   |---|---|---|
+   | Diffusion model (.gguf) | `--diffusion-model` | `qwen_image_2.1_Q8_0.gguf` |
+   | Text-encoder LLM (.gguf) | `--llm` | `Qwen3VL-8B-Instruct-Q4_K_M.gguf` |
+   | VAE (.safetensors) | `--vae` | `diffusion_pytorch_model.safetensors` |
+
+3. **Admin → Images** → set *stable-diffusion.cpp CLI path* and *Model folder*, enable the
+   switch, **Save**, then **🖼 Draw a test image**. Hearth finds all three files in the folder by
+   name; the three path fields are only for unusually named files, and each tile says which
+   source it used. A missing or unreadable file is refused *before* launching, naming that file.
+4. Ask the assistant for a picture (each call needs your approval — it costs tens of seconds to
+   minutes). `batch` returns several candidates from one model load; `init_image` + `strength`
+   restyles an existing workspace image. Sampling is fixed to euler + flash attention at
+   CFG 4.5 / 20 steps, which is what this model is happy with.
+
+The Images tab shows one tile per required file and **Copy the sd-cli command** gives the exact
+command line for pasting into a terminal. Env fallbacks: `HEARTH_DIFFUSION_CLI_BIN`,
+`HEARTH_DIFFUSION_MODEL_DIR`, `HEARTH_DIFFUSION_DIT|_LLM|_VAE`, `HEARTH_DIFFUSION_BACKEND`.
+Run log: `runtime/diffusion.log`. See DEC-074/DEC-075.

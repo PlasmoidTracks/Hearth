@@ -39,7 +39,10 @@ _EN = {
     "chat.delete_files_q": "Also delete the files (artifacts) from this conversation?",
     "chat.rename_prompt": "New name for this conversation:",
     "chat.upload": "Attach files",
-    "chat.upload_too_big": "File too large (over 25 MB)",
+    # The size is interpolated by chat.js from the server's uploads.max_bytes, so this
+    # string must not bake in a number that Admin can change (AUDIT #8).
+    "chat.upload_too_big": "File too large (over the upload limit)",
+    "chat.upload_replaced": "a file with this name already existed and was replaced — its previous contents are gone",
     # Composer attach menu (replaces the standalone 📎/📷 buttons; add future
     # composer actions here instead of growing the input row).
     "chat.attach_menu": "Attach",
@@ -108,6 +111,12 @@ _EN = {
     "chat.deny": "Deny",
     "chat.reply": "Reply",
     "chat.tool": "tool",
+    # display_media bubbles (chat.js → addMediaBubble). Full screen uses the browser's own
+    # fullscreen API, so there is no custom viewer to translate beyond these labels.
+    "chat.media_fullscreen": "Full screen",
+    "chat.media_download": "Download",
+    "chat.media_unsupported": "Your browser cannot play this file type.",
+    "chat.media_missing": "This file is no longer in your workspace.",
     "chat.web_sources": "Sources",
     "chat.web_read": "read page",
     "chat.web_mode": "via",
@@ -202,7 +211,10 @@ _DE = {
     "chat.delete_files_q": "Auch die Dateien (Artefakte) aus dieser Unterhaltung löschen?",
     "chat.rename_prompt": "Neuer Name für diese Unterhaltung:",
     "chat.upload": "Dateien anhängen",
-    "chat.upload_too_big": "Datei zu groß (über 25 MB)",
+    # Die Größe wird von chat.js aus uploads.max_bytes des Servers eingesetzt — keine
+    # Zahl einbacken, die der Admin ändern kann (AUDIT #8).
+    "chat.upload_too_big": "Datei zu groß (über dem Upload-Limit)",
+    "chat.upload_replaced": "eine Datei mit diesem Namen existierte bereits und wurde ersetzt — ihr bisheriger Inhalt ist weg",
     # Anhefte-Menü im Composer (ersetzt die einzelnen 📎-/📷-Knöpfe; künftige
     # Composer-Aktionen hier eintragen statt die Eingabezeile zu vergrößern).
     "chat.attach_menu": "Anhängen",
@@ -271,6 +283,10 @@ _DE = {
     "chat.deny": "Ablehnen",
     "chat.reply": "Antworten",
     "chat.tool": "Werkzeug",
+    "chat.media_fullscreen": "Vollbild",
+    "chat.media_download": "Herunterladen",
+    "chat.media_unsupported": "Dein Browser kann diesen Dateityp nicht abspielen.",
+    "chat.media_missing": "Diese Datei liegt nicht mehr in deinem Arbeitsbereich.",
     "chat.web_sources": "Quellen",
     "chat.web_read": "Seite gelesen",
     "chat.web_mode": "über",

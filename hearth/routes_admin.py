@@ -12,9 +12,12 @@
   POST /api/admin/model/start           launch llama-server {restart?: bool}
   POST /api/admin/model/stop            stop a Hearth-launched llama-server
   GET  /api/admin/captioner/test         caption a generated 2 s tone — end-to-end wiring check
-  GET  /api/admin/diffusion/status       stable-diffusion.cpp binary/model presence + why not
+  GET  /api/admin/diffusion/status       Qwen Image files present (per file) + why not
   GET  /api/admin/diffusion/command      the exact `sd-cli …` command, shell-quoted
   POST /api/admin/diffusion/test         draw one tiny test image (nothing stored)
+  GET  /api/admin/image_edit/status      Qwen Image Edit files present (per file) + why not
+  GET  /api/admin/image_edit/command     the exact `sd-cli … -r` edit command, shell-quoted
+  POST /api/admin/image_edit/test        edit one tiny synthetic image (nothing stored)
   GET  /api/admin/docs                  list protocols + system prompts
   POST /api/admin/docs                  upsert doc {kind,name,content,is_default}
   POST /api/admin/docs/{id}/delete      delete doc
@@ -229,14 +232,28 @@ async def all_models(_: User = Depends(require_admin)):
     # the listing (and therefore the Model panel) down with it. `status()` is synchronous and
     # only stats files, so it needs no await (unlike the captioner's network probe).
     try:
-        from .diffusion import get_diffusion
-        dif_st = get_diffusion().status()
+        from .diffusion import get_diffusion, PROFILE_EDIT
+        dif = get_diffusion()
+        dif_st = dif.status()
     except Exception as e:  # noqa: BLE001
+        dif = None
         dif_st = {"enabled": False, "reachable": False, "configured": False,
                   "hint": f"image generation status unavailable: {type(e).__name__}: "
                           f"{str(e)[:120]}"}
-    models.append({"id": "diffusion", "role": "Image generator", "kind": "diffusion", **dif_st})
+    models.append({"id": "diffusion", "role": "Image generator (Qwen Image)",
+                   "kind": "diffusion", **dif_st})
+    # The edit model is a second slot on the same binary/runner, so it gets its own row in
+    # Loaded models too. Only listed when editing is enabled or configured — otherwise the
+    # panel would carry a permanent red row for a capability nobody turned on.
+    try:
+        edit_st = (dif if dif is not None else get_diffusion()).status(profile=PROFILE_EDIT)
+        if edit_st.get("enabled") or edit_st.get("configured"):
+            models.append({"id": "image_edit", "role": "Image editor (Qwen Image Edit)",
+                           "kind": "diffusion", **edit_st})
+    except Exception as e:  # noqa: BLE001 — a broken probe must not take the listing down
+        pass
     return JSONResponse({"models": models})
+
 
 
 @router.post("/api/admin/captioner/start")
@@ -319,10 +336,10 @@ async def captioner_command(_: User = Depends(require_admin)):
     return JSONResponse(launch_command_preview(rs.get_all()))
 
 
-# ---- image generation (stable-diffusion.cpp) --------------------------------
+# ---- image generation (Qwen Image via stable-diffusion.cpp) ------------------
 @router.get("/api/admin/diffusion/status")
 async def diffusion_status(_: User = Depends(require_admin)):
-    """Binary/model presence and the reason generation cannot run, if any.
+    """Per-file presence for the three Qwen Image files, plus why it cannot run.
 
     Cheap and synchronous by design — nothing is launched, so this can be called on every
     render of the Images tab.
@@ -343,10 +360,11 @@ async def diffusion_test(request: Request, admin: User = Depends(require_admin),
                          _: None = Depends(check_csrf)):
     """Draw one tiny test picture to prove the whole chain end to end.
 
-    Why Hearth generates rather than trusting config: it is the only check that a given
-    binary + model (+ encoders) combination actually produces a PNG. A missing t5xxl for
-    Flux looks exactly like a working setup right up until sd-cli is asked to draw, and
-    this is where an admin wants to find out — not from their family's chat.
+    Why Hearth generates rather than trusting config: it is the only check that this binary
+    plus these three files actually produce a PNG. Presence checks cannot tell that the LLM
+    encoder belongs to a different package, or that the build rejects a flag — and sd-cli's
+    own failure for a wrong file is hundreds of `… not in model metadata` lines, which is
+    exactly what an admin wants translated here rather than hunting through a log.
 
     Body: `{prompt?: str}`. The image is discarded; the point is the exit code and whether
     bytes appeared, so nothing is written into any workspace.
@@ -362,7 +380,8 @@ async def diffusion_test(request: Request, admin: User = Depends(require_admin),
     dif = get_diffusion()
     t0 = time.time()
     try:
-        # Small and short on purpose: this verifies wiring, not quality.
+        # Small and short on purpose: this verifies wiring, not quality. Square, because
+        # Qwen Image crops odd aspect ratios at very low resolutions rather than composing.
         res = await asyncio.to_thread(
             dif.generate_sync, settings, prompt, width=256, height=256, steps=4, batch=1)
     except DiffusionError as e:
@@ -381,6 +400,79 @@ async def diffusion_test(request: Request, admin: User = Depends(require_admin),
                          "note": ""if images else "the CLI succeeded but produced no file"})
 
 
+# ---- image editing (Qwen Image Edit via the same sd-cli binary) --------------
+@router.get("/api/admin/image_edit/status")
+async def image_edit_status(_: User = Depends(require_admin)):
+    """Per-file presence for the Qwen Image Edit files, plus why it cannot run.
+
+    Same shape as the generation status (one tile per file), but for the edit profile's own
+    settings and its optional vision-mmproj slot. Cheap and synchronous — nothing launches.
+    """
+    from .diffusion import get_diffusion, PROFILE_EDIT
+    return JSONResponse(get_diffusion().status(profile=PROFILE_EDIT))
+
+
+@router.get("/api/admin/image_edit/command")
+async def image_edit_command(_: User = Depends(require_admin)):
+    """The exact `sd-cli` edit command Hearth would build, shell-quoted, for copying out."""
+    from .diffusion import launch_command_preview, PROFILE_EDIT
+    return JSONResponse(launch_command_preview(rs.get_all(), profile=PROFILE_EDIT))
+
+
+@router.post("/api/admin/image_edit/test")
+async def image_edit_test(request: Request, admin: User = Depends(require_admin),
+                          _: None = Depends(check_csrf)):
+    """Edit one tiny synthetic image to prove the edit chain end to end.
+
+    Unlike generation, editing REQUIRES an input image, so this probe draws a small flat PNG
+    itself (Pillow) and feeds it in as the reference. If Pillow is absent there is nothing to
+    edit, and the endpoint says so rather than failing obscurely inside sd-cli. The result is
+    discarded — the point is that the binary plus these files run an edit and return bytes.
+
+    Body: `{prompt?: str}`. Nothing is written into any workspace.
+    """
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001 — no body means the default probe
+        pass
+    from .diffusion import get_diffusion, DiffusionError, PROFILE_EDIT
+    prompt = str(body.get("prompt") or "make the background light blue")[:300]
+    settings = rs.get_all()
+
+    # Build a throwaway reference PNG. Editing without an input is not a thing, so this is the
+    # only honest probe; Pillow is the same dependency the media tools already rely on.
+    try:
+        import tempfile as _tempfile
+        from PIL import Image as _PILImage
+    except Exception:  # noqa: BLE001 — no Pillow means we cannot synthesise an input image
+        return JSONResponse({"ok": False, "seconds": 0.0,
+                             "note": "editing needs a reference image to test with, and this "
+                                     "server has no Pillow to make one (pip install Pillow)"})
+
+    dif = get_diffusion()
+    t0 = time.time()
+    try:
+        with _tempfile.TemporaryDirectory(prefix="hearth-editprobe-") as tmp:
+            ref = os.path.join(tmp, "ref.png")
+            _PILImage.new("RGB", (256, 256), (200, 30, 30)).save(ref)
+            res = await asyncio.to_thread(
+                dif.generate_sync, settings, prompt, width=256, height=256, steps=4, batch=1,
+                ref_image=ref, profile=PROFILE_EDIT)
+    except DiffusionError as e:
+        return JSONResponse({"ok": False, "seconds": round(time.time() - t0, 1),
+                             "note": str(e)})
+    except Exception as e:  # noqa: BLE001 — a test endpoint must not 500
+        return JSONResponse({"ok": False, "seconds": round(time.time() - t0, 1),
+                             "note": f"{type(e).__name__}: {str(e)[:200]}"})
+    images = res.get("images") or []
+    audit.log(admin.id, "image_edit_test", {"ok": bool(images), "seconds": res.get("seconds")})
+    return JSONResponse({"ok": bool(images), "seconds": res.get("seconds"),
+                         "images": len(images),
+                         "bytes": [len(d) for _, d in images],
+                         "seed": res.get("seed"),
+                         "command": " ".join(str(a) for a in (res.get("argv") or [])[:14]),
+                         "note": "" if images else "the CLI succeeded but produced no file"})
 
 
 # ---- docs (protocols + system prompts) --------------------------------------

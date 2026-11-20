@@ -2,6 +2,14 @@
 # Grandchild-holder used by scratch/diffusion_runtime_probe.py: Hearth must kill BOTH this
 # shell and the sleep below it. A plain terminate() of the direct child leaves the sleep
 # running, which is exactly the orphan bug _kill_tree() exists to prevent.
+#
+# `exec sleep 60` would be wrong here for a subtle reason worth recording: dash OPTIMISES a
+# backgrounded command followed by `wait` into an exec, so the "grandchild" becomes the direct
+# child and a single TERM appears to work — the probe would then pass without ever testing
+# process-group teardown. Forking from a subshell defeats that optimisation, so there really
+# are two processes for killpg() to reach.
 echo "wrapper pid $$ starting"
-sleep 60 &
-wait
+( sleep 60 & wait )
+# Also print our own pid/pgid so the probe can assert on the real numbers rather than a
+# pgrep pattern (which self-matches the shell that ran it, and produced false results once).
+echo "wrapper done $$"

@@ -11,6 +11,7 @@ from .. import sandbox
 
 class ExecTool(Tool):
     name = "exec"
+    label = "Command execution"
     description = ("Run a Linux shell command inside a sandbox limited to this user's workspace "
                    "(no network). Requires the user to approve each call. Use for build/test/"
                    "conversion tasks.")

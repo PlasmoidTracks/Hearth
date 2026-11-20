@@ -52,6 +52,7 @@ def _looks_like_audio(rel_path: str, mime: str = "") -> bool:
 
 class AudioInfoTool(Tool):
     name = "audio_info"
+    label = "Audio info (duration/streams)"
     description = ("Report an audio file's technical metadata — duration, codec, sample rate, "
                    "channel count, and whether a video file carries an audio track at all — "
                    "WITHOUT sending it to any model. Call this before describe_audio on a long "
@@ -96,6 +97,7 @@ class AudioInfoTool(Tool):
 
 class DescribeAudioTool(Tool):
     name = "describe_audio"
+    label = "Audio description (captioner model)"
     description = ("Find out what an audio file (or the audio track of a video) actually "
                    "contains by sending it to the captioner model. Returns a text description: "
                    "number and character of speakers, tone and emotion, the words spoken where "

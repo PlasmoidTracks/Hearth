@@ -13,11 +13,14 @@ Exit code 0 = all executed checks passed. Non-zero = failures listed.
 """
 from __future__ import annotations
 import asyncio
+import base64
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -484,8 +487,9 @@ class ToolTests(unittest.TestCase):
         from hearth import workspaces as ws, orchestrator as orch
         uid = "ctxuser"
         ws.write_text(uid, "a.txt", "1")
-        ctx = orch._workspace_context(uid)
+        ctx, capped = orch._workspace_context(uid)
         self.assertIn("a.txt", ctx)
+        self.assertFalse(capped)
 
     def test_workspace_context_shows_sizes_and_uploads(self):
         # The model needs an ls -l equivalent: file SIZES in the prompt listing,
@@ -496,7 +500,7 @@ class ToolTests(unittest.TestCase):
         uid = "ctxuser2"
         ws.write_text(uid, "a.txt", "12345")          # 5 bytes
         ws.write_text(uid, "uploads/photo.png", "x")  # simulated user upload
-        ctx = orch._workspace_context(uid)
+        ctx, capped = orch._workspace_context(uid)
         self.assertIn("a.txt (5 B)", ctx, f"size missing from listing: {ctx!r}")
         self.assertIn("uploads/", ctx)
         # The word "attachments" belongs to prompt.py's WORKSPACE_PREAMBLE (which
@@ -505,6 +509,52 @@ class ToolTests(unittest.TestCase):
         self.assertIn("attached", ctx.lower(), f"uploads not explained as user files: {ctx!r}")
         from hearth import prompt as prompt_mod
         self.assertIn("attachments", prompt_mod.WORKSPACE_PREAMBLE.lower())
+
+    def test_workspace_listing_cap_is_settings_driven_and_announced(self):
+        """AUDIT #1 / B3 — the prompt listing used to cut at a hard-coded 80 with no
+        marker, while the preamble told the model it showed 'every file'."""
+        from hearth.db import init_db
+        init_db()
+        from hearth import workspaces as ws, orchestrator as orch, prompt as prompt_mod
+        uid = "ctxcap"
+        for i in range(12):
+            ws.write_text(uid, f"f{i}.txt", "x")
+        s_small = {"agent.workspace_listing_entries": 5}
+        ctx, capped = orch._workspace_context(uid, s_small)
+        self.assertTrue(capped, "a listing that hit the cap must report it")
+        self.assertIn("…and more", ctx)
+        # A truncated listing must NEVER state a number of omitted files: a capped read
+        # cannot know the total, and an earlier version of this fix invented one.
+        self.assertNotIn("1 more (use fs_list", ctx)
+        self.assertNotIn("every file", prompt_mod.build_workspace_preamble(s_small, True))
+        self.assertIn("INCOMPLETE", prompt_mod.build_workspace_preamble(s_small, True))
+        # Uncapped: no marker appears, and the wording never claims a limit was hit.
+        s_big = {"agent.workspace_listing_entries": 500}
+        ctx2, capped2 = orch._workspace_context(uid, s_big)
+        self.assertFalse(capped2)
+        self.assertNotIn("…and more", ctx2)
+        pre_big = prompt_mod.build_workspace_preamble(s_big, False)
+        self.assertIn("up to 500 entries", pre_big)
+        self.assertNotIn("INCOMPLETE", pre_big)
+        # No settings at all -> the original "every file" text, unchanged.
+        self.assertIn("every file", prompt_mod.build_workspace_preamble())
+
+    def test_workspace_listing_failure_says_failed_not_empty(self):
+        """AUDIT #5 — an exception used to return '', which the model read as an empty
+        workspace and reported to the user as 'your files are gone'."""
+        from hearth.db import init_db
+        init_db()
+        from hearth import orchestrator as orch, workspaces as ws
+        uid = "ctxboom"
+        orig = ws.list_tree
+        ws.list_tree = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("jail exploded"))
+        try:
+            ctx, capped = orch._workspace_context(uid, {})
+        finally:
+            ws.list_tree = orig
+        self.assertIn("FAILED", ctx)
+        self.assertIn("fs_list", ctx)
+        self.assertNotIn("currently empty", ctx)
 
     def test_tool_progress_event_shape(self):
         # StreamEvent.tool_progress must carry only name + char count — the raw
@@ -667,6 +717,12 @@ class HttpTests(unittest.TestCase):
             self.assertIn("default-src 'self'", csp)
             self.assertIn("script-src 'self'", csp)
             self.assertNotIn("cdn.tailwindcss.com", csp)   # no CDN in policy
+            # DEC-077: display_media plays same-origin audio/video, and some browsers
+            # re-check a fullscreened element's loads against the top-level policy. The
+            # directive must stay origin-limited — assert what it allows AND that it did
+            # not become a wildcard while somebody was "fixing" a black video.
+            self.assertIn("media-src 'self' blob:;", csp)
+            self.assertNotRegex(csp, r"media-src[^;]*\*")
             self.assertEqual(r.headers.get("x-content-type-options"), "nosniff")
             self.assertEqual(r.headers.get("x-frame-options"), "DENY")
 
@@ -2987,6 +3043,247 @@ class MediaToolTests(unittest.TestCase):
         self.assertEqual(orch._image_parts("u", []), [])
         self.assertEqual(orch._image_parts("u", [{}]), [])
 
+
+class DisplayMediaToolTests(unittest.TestCase):
+    """display_media: showing a workspace file to the USER, not to the model.
+
+    The interesting risks are all in which bytes go where: a video must never be
+    base64'd into the model's prompt as if it were a picture, and the UI list must
+    survive persistence so a refresh does not silently un-display what was shown.
+    """
+
+    PNG = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
+
+    def _conv(self, uid: str, cid: str):
+        from hearth.db import init_db, session_scope
+        from hearth.models import Conversation, User
+        init_db()
+        with session_scope() as s:
+            if s.get(User, uid) is None:
+                s.add(User(id=uid, username=f"u-{uid}", pw_hash="x"))
+            if s.get(Conversation, cid) is None:
+                s.add(Conversation(id=cid, user_id=uid, title="display"))
+
+    def _tool(self):
+        from hearth.tools import TOOLS_BY_NAME
+        return TOOLS_BY_NAME["display_media"]
+
+    def test_registered_enabled_and_not_gated(self):
+        from hearth.tools import tool_specs, approval_mode
+        from hearth import runtime_settings as rs
+        t = self._tool()
+        self.assertEqual(t.enable_key, "tools.display_media")
+        self.assertFalse(t.gated, "showing a file the user can already download is not "
+                                  "an approval-worthy act")
+        self.assertEqual(approval_mode(t, {}), "auto")
+        self.assertIn("tools.display_media", rs.SPEC_BY_KEY)
+        self.assertTrue(rs.SPEC_BY_KEY["tools.display_media"].default)
+        self.assertIn("display_media", {s["function"]["name"] for s in tool_specs({})})
+
+    def test_kind_detection(self):
+        from hearth.tools.display_media import media_kind
+        self.assertEqual(media_kind("a/b/photo.PNG"), "image")
+        self.assertEqual(media_kind("clip.mp4"), "video")
+        self.assertEqual(media_kind("voice.wav"), "audio")
+        # Not presentational: no element would render these, so the tool refuses instead.
+        for p in ("doc.pdf", "notes.md", "archive.zip", "no_extension"):
+            self.assertEqual(media_kind(p), "", f"{p} must not be treated as displayable")
+
+    def test_shows_media_and_refuses_the_rest_by_name(self):
+        from hearth import workspaces as ws
+        from hearth.tools import ToolContext
+        uid, cid = "dm-show", "dm-show-conv"
+        self._conv(uid, cid)
+        ws.write_bytes(uid, "shot.png", self.PNG)
+        ws.write_bytes(uid, "clip.mp4", b"\x00" * 512)
+        ws.write_bytes(uid, "notes.md", b"hello")
+        res = asyncio.run(self._tool().run(
+            {"paths": ["shot.png", "clip.mp4", "notes.md", "gone.png", "../../etc/passwd"],
+             "caption": "look"}, ToolContext(uid, {}, conversation_id=cid)))
+        self.assertTrue(res.ok)
+        kinds = {m["path"]: m["kind"] for m in res.meta["media"]}
+        self.assertEqual(kinds, {"shot.png": "image", "clip.mp4": "video"})
+        # Every refusal is named rather than silently dropped — a model that cannot tell
+        # which files landed will tell the user it showed them.
+        self.assertIn("notes.md", res.content)
+        self.assertIn("gone.png", res.content)
+        self.assertIn("../../etc/passwd", res.content)
+        self.assertIn("look", res.content)
+        for m in res.meta["media"]:
+            self.assertTrue(m["url"].startswith("/api/artifact/"), "must use the owned route")
+            self.assertTrue(m["artifact_id"])
+
+    def test_nothing_displayable_is_not_a_silent_success(self):
+        from hearth import workspaces as ws
+        from hearth.tools import ToolContext
+        uid, cid = "dm-none", "dm-none-conv"
+        self._conv(uid, cid)
+        ws.write_bytes(uid, "notes.md", b"x")
+        res = asyncio.run(self._tool().run({"paths": ["notes.md"]},
+                                           ToolContext(uid, {}, conversation_id=cid)))
+        self.assertFalse(res.ok)
+        self.assertIn("upload", res.content, "should point at the tool that does work here")
+        empty = asyncio.run(self._tool().run({"paths": []},
+                                             ToolContext(uid, {}, conversation_id=cid)))
+        self.assertFalse(empty.ok)
+
+    def test_video_never_enters_the_model_image_channel(self):
+        """The core safety property: `images` is base64'd as image_url for every later turn.
+
+        A clip listed there would cost a huge prompt and be handed to an IMAGE projector,
+        so only genuine images may ride that channel; audio/video go to the UI only.
+        """
+        from hearth import workspaces as ws, orchestrator as orch
+        from hearth.tools import ToolContext
+        uid, cid = "dm-noleak", "dm-noleak-conv"
+        self._conv(uid, cid)
+        ws.write_bytes(uid, "shot.png", self.PNG)
+        ws.write_bytes(uid, "clip.mp4", b"\x00" * 512)
+        res = asyncio.run(self._tool().run(
+            {"paths": ["shot.png", "clip.mp4"]}, ToolContext(uid, {}, conversation_id=cid)))
+        # Nothing goes into the model's image channel directly: build_messages derives what
+        # the model may see from meta.display, and filling `images` too made replay encode
+        # each displayed picture twice.
+        self.assertIsNone(res.images)
+        row = orch._tool_row_meta("display_media", res, "c1")
+        self.assertNotIn("images", row)
+        self.assertEqual({d["path"] for d in row["display"]}, {"shot.png", "clip.mp4"})
+        # No caption was passed, so no caption key — the UI must not see an empty label.
+        self.assertNotIn("display_caption", row)
+
+    def test_display_persists_and_replays_without_leaking_bytes(self):
+        from hearth import workspaces as ws, orchestrator as orch
+        from hearth.tools import ToolContext
+        uid, cid = "dm-replay", "dm-replay-conv"
+        self._conv(uid, cid)
+        ws.write_bytes(uid, "shot.png", self.PNG)
+        ws.write_bytes(uid, "clip.mp4", b"\x00" * 512)
+        res = asyncio.run(self._tool().run(
+            {"paths": ["shot.png", "clip.mp4"], "caption": "the set"},
+            ToolContext(uid, {}, conversation_id=cid)))
+        row = orch._tool_row_meta("display_media", res, "c9")
+        self.assertEqual(row["display_caption"], "the set")
+        orch.append_message(cid, "assistant", "", meta=json.dumps({"tool_calls": [
+            {"id": "c9", "type": "function",
+             "function": {"name": "display_media", "arguments": "{}"}}]}))
+        orch.append_message(cid, "tool", res.content, meta=json.dumps(row))
+        msgs = orch.build_messages(cid, uid)
+        blob = json.dumps(msgs)
+        # Paths travel; pixels never do (until a message is actually encoded for the model).
+        self.assertNotIn("base64\",", blob.replace("image/png;base64", ""))
+        texts = [m["content"] for m in msgs if m["role"] == "user" and isinstance(m["content"], str)]
+        self.assertTrue(any("clip.mp4" in t and "cannot see or hear" in t for t in texts),
+                        "the model must be told the clip is on screen but not perceivable")
+        multimodal = [m for m in msgs if m["role"] == "user" and isinstance(m["content"], list)]
+        self.assertTrue(multimodal, "the displayed image should reach the model")
+        urls = [p["image_url"]["url"] for m in multimodal for p in m["content"]
+                if p.get("type") == "image_url"]
+        self.assertEqual(len(urls), 1, "exactly one image part — the PNG, never the MP4")
+        self.assertTrue(all(u.startswith("data:image/png;base64,") for u in urls),
+                        "no non-image mime may be encoded as an image_url part")
+
+    def test_video_only_display_still_reaches_the_model_as_text(self):
+        """A display call with no images must not vanish from the model's view."""
+        from hearth import workspaces as ws, orchestrator as orch
+        uid, cid = "dm-vidonly", "dm-vidonly-conv"
+        self._conv(uid, cid)
+        row = {"tool": "display_media", "tool_call_id": "cv1",
+               "display": [{"path": "clip.mp4", "kind": "video", "url": "/api/artifact/x",
+                            "artifact_id": "x", "name": "clip.mp4"}]}
+        ws.write_bytes(uid, "clip.mp4", b"\x00" * 128)
+        orch.append_message(cid, "assistant", "", meta=json.dumps({"tool_calls": [
+            {"id": "cv1", "type": "function",
+             "function": {"name": "display_media", "arguments": "{}"}}]}))
+        orch.append_message(cid, "tool", "Showing 1 file(s)", meta=json.dumps(row))
+        msgs = orch.build_messages(cid, uid)
+        texts = [m["content"] for m in msgs if m["role"] == "user" and isinstance(m["content"], str)]
+        self.assertTrue(any("clip.mp4" in t for t in texts))
+
+    def test_display_replay_ignores_files_that_no_longer_exist(self):
+        from hearth import orchestrator as orch, workspaces as ws
+        uid = "dm-gone"
+        self._conv(uid, "dm-gone-conv")
+        ws.write_bytes(uid, "here.png", self.PNG)
+        ws.write_bytes(uid, "song.mp3", self.PNG)   # exists, but is not an image
+        imgs, blind = orch._display_image_items(uid, [
+            {"path": "here.png"},                        # exists -> image
+            {"path": "deleted.png"},                     # never existed -> skipped entirely
+            {"path": "../../etc/passwd"},                # escape -> skipped, never read
+            {"path": "also-gone.mp3", "name": "also-gone.mp3"},   # missing audio -> skipped
+            {"path": "song.mp3", "name": "song.mp3"}])   # existing audio -> named as unseen
+        self.assertEqual([i["path"] for i in imgs], ["here.png"])
+        self.assertEqual(blind, ["song.mp3 (audio)"],
+                         "only files that actually exist may be reported as on-screen")
+
+    def test_display_replay_handles_dot_prefixed_paths(self):
+        """`./file.png` must not be silently dropped.
+
+        resolve_in_jail() returns a Path, and bool(Path(".")) is False — an earlier version
+        used it as a truth value and every './'-prefixed path vanished from the model's view
+        while absolute-looking and nested paths worked, which is exactly the kind of bug that
+        survives a happy-path test.
+        """
+        from hearth import orchestrator as orch, workspaces as ws
+        uid = "dm-dot"
+        self._conv(uid, "dm-dot-conv")
+        ws.write_bytes(uid, "a.png", self.PNG)
+        imgs, blind = orch._display_image_items(uid, [{"path": "./a.png"}])
+        self.assertEqual([i["path"] for i in imgs], ["./a.png"])
+        self.assertEqual(blind, [])
+
+    def test_call_is_capped_and_says_so(self):
+        from hearth import workspaces as ws
+        from hearth.tools import ToolContext
+        from hearth.tools.display_media import MAX_FILES_PER_CALL
+        uid, cid = "dm-cap", "dm-cap-conv"
+        self._conv(uid, cid)
+        paths = []
+        for i in range(MAX_FILES_PER_CALL + 3):
+            rel = f"p{i}.png"
+            ws.write_bytes(uid, rel, self.PNG)
+            paths.append(rel)
+        res = asyncio.run(self._tool().run({"paths": paths},
+                                           ToolContext(uid, {}, conversation_id=cid)))
+        self.assertTrue(res.ok)
+        self.assertEqual(len(res.meta["media"]), MAX_FILES_PER_CALL)
+        self.assertIn("second call", res.content)
+
+    def test_ui_meta_carries_media_for_live_rendering(self):
+        from hearth import workspaces as ws, orchestrator as orch
+        from hearth.tools import ToolContext
+        uid, cid = "dm-uimeta", "dm-uimeta-conv"
+        self._conv(uid, cid)
+        ws.write_bytes(uid, "shot.png", self.PNG)
+        res = asyncio.run(self._tool().run({"paths": ["shot.png"], "caption": "hi"},
+                                           ToolContext(uid, {}, conversation_id=cid)))
+        ui = orch._ui_meta("display_media", res)
+        self.assertEqual([m["path"] for m in ui["media"]], ["shot.png"])
+        self.assertEqual(res.meta["caption"], "hi")
+
+    def test_model_only_image_tools_do_not_draw_media_bubbles(self):
+        """pdf_read/view_video render pixels FOR THE MODEL — they must not also pop a bubble.
+
+        Both set ToolResult.images, so a UI that read that field would draw a window per
+        rendered page behind every tool chip. Only display_media's kind-tagged entries are
+        presentation for the user.
+        """
+        from hearth import orchestrator as orch
+        from hearth.tools.base import ToolResult
+
+        class PdfRes:
+            content = "Rendered 2 pages."
+            meta = {"pages": [1, 2]}
+            images = [{"path": "media/pdf/a_p1.png", "mime": "image/png"},
+                      {"path": "media/pdf/a_p2.png", "mime": "image/png"}]
+
+        ui = orch._ui_meta("pdf_read", PdfRes())
+        self.assertNotIn("media", ui)
+        row = orch._tool_row_meta("pdf_read", PdfRes(), "cp1")
+        self.assertNotIn("display", row)
+        # The model still gets its pages.
+        self.assertEqual(len(row["images"]), 2)
+
     def test_stub_never_leaks_base64_from_media_messages(self):
         # The stub flattens content lists; a media tool's data URLs must become
         # '[image]' rather than being counted or keyword-matched as text.
@@ -4059,9 +4356,18 @@ class CaptionerHttpTests(unittest.TestCase):
             self._login_admin(c)
             r = c.get("/api/admin/models")
             self.assertEqual(r.status_code, 200, r.text)
-            ids = [m["id"] for m in r.json()["models"]]
+            models = r.json()["models"]
+            ids = [m["id"] for m in models]
             # The whole point of the endpoint: a second loaded model is never invisible.
-            self.assertEqual(ids, ["chat", "captioner"])
+            # Asserted as a SUBSET on purpose, and each entry must carry its own state.
+            # The old assertion compared a literal list of panel rows, so adding the
+            # image generator — a genuine improvement — "broke" the suite while telling
+            # nobody anything about behaviour (AUDIT B1).
+            self.assertIn("chat", ids)
+            self.assertIn("captioner", ids)
+            for m in models:
+                self.assertTrue(m.get("id") and m.get("role"),
+                                f"every model row must identify itself: {m!r}")
 
     def test_captioner_admin_routes_exist_and_require_csrf(self):
         from fastapi.testclient import TestClient
@@ -4173,7 +4479,14 @@ class CaptionStreamAndPersistenceTests(unittest.TestCase):
     def test_ui_preview_is_generous_but_bounded(self):
         from hearth.tools.base import ui_preview, UI_PREVIEW_MAX_CHARS
         self.assertEqual(ui_preview("short"), "short")
-        self.assertEqual(len(ui_preview("x" * 50_000)), UI_PREVIEW_MAX_CHARS)
+        clipped = ui_preview("x" * 50_000)
+        # Bounded — but bounded WITH A MARKER. The exact-length assertion was the bug: it
+        # locked in a silent cut, so a user could not tell a truncated chip from a short
+        # tool result (AUDIT #13). The slice is still exactly UI_PREVIEW_MAX_CHARS long;
+        # only the appended note extends it.
+        self.assertTrue(clipped.startswith("x" * UI_PREVIEW_MAX_CHARS))
+        self.assertIn("truncated for display", clipped)
+        self.assertLess(len(clipped), UI_PREVIEW_MAX_CHARS + 200)
         self.assertEqual(ui_preview(None), "")
 
     def test_describe_audio_streams_progress_to_the_ui(self):
@@ -4289,6 +4602,731 @@ class CaptionStreamAndPersistenceTests(unittest.TestCase):
         self.assertIn("CAPTURED EARLIER", content)
 
 
+
+
+
+
+class AuditRegressionTests(unittest.TestCase):
+    """Regressions for the silent-decision audit (AUDIT_SILENT_DECISIONS.md).
+
+    Each test names the finding it locks down, so a future change that reintroduces a
+    silent cap, a swallowed failure, or a hard-coded policy has a failing test to argue
+    with rather than a paragraph of prose.
+    """
+
+    def _ctx(self, uid, settings=None, conv="c"):
+        from hearth.tools import ToolContext
+        return ToolContext(uid, settings or {}, conversation_id=conv)
+
+    def test_fs_list_announces_its_cap(self):
+        """AUDIT #3 — fs_list is the fallback for a capped prompt listing; it used to
+        stop at 500 silently, so both layers lied at once on a big folder."""
+        import asyncio
+        from hearth.db import init_db
+        init_db()
+        from hearth.tools.fs_tools import FsListTool, FsWriteTool
+        from hearth import workspaces as ws
+        uid = "listcap"
+        for i in range(6):
+            ws.write_text(uid, f"d{i}.txt", "x")
+        capped = asyncio.run(FsListTool().run({"path": "."}, self._ctx(uid, {"agent.fs_list_entries": 3})))
+        self.assertTrue(capped.ok)
+        self.assertIn("truncated at 3 entries", capped.content)
+        self.assertIn("more exist here", capped.content)
+        self.assertTrue(capped.meta.get("truncated"))
+        self.assertEqual(len([l for l in capped.content.splitlines() if "truncated" not in l]), 3)
+        plain = asyncio.run(FsListTool().run({"path": "."}, self._ctx(uid, {})))
+        self.assertNotIn("truncated", plain.content)
+        self.assertFalse(plain.meta.get("truncated"))
+
+    def test_zip_pack_reports_omitted_paths(self):
+        """AUDIT #18 — 250 named paths produced a 200-file zip and a reply saying
+        'packed 200 files', which reads as complete."""
+        import asyncio
+        from hearth.db import init_db
+        init_db()
+        from hearth.tools.fs_tools import FsWriteTool, ZipPackTool
+        uid = "zipcap"
+        for i in range(5):
+            asyncio.run(FsWriteTool().run({"path": f"f{i}.txt", "content": str(i)}, self._ctx(uid)))
+        res = asyncio.run(ZipPackTool().run(
+            {"paths": [f"f{i}.txt" for i in range(5)], "zip_name": "cap.zip"},
+            self._ctx(uid, {"tools.zip_pack.max_files": 2})))
+        self.assertTrue(res.ok, res.content)
+        self.assertIn("packed 2 files", res.content)
+        self.assertIn("3 path(s) were not included", res.content)
+        self.assertEqual(res.meta.get("skipped"), 3)
+
+    def test_upload_reports_when_it_replaced_different_bytes(self):
+        """AUDIT #2 — attaching the same filename twice destroyed the first file with no
+        signal at all. The replacement still happens (DEC-040 §2), but it is now reported."""
+        from hearth.db import init_db
+        init_db()
+        from fastapi.testclient import TestClient
+        from hearth.main import create_app, ensure_bootstrap_admin
+        pw = os.environ.get("BOOT_PW") or ensure_bootstrap_admin()
+        with TestClient(create_app()) as c:
+            r = c.post("/auth/login", data={"username": "admin", "password": pw})
+            self.assertEqual(r.status_code, 200)
+            csrf = {"X-CSRF-Token": c.cookies.get("hearth_csrf", "")}
+            # First attach: nothing existed before.
+            r1 = c.post("/api/upload", headers=csrf,
+                        files={"files": ("dup.txt", b"first contents", "text/plain")})
+            self.assertEqual(r1.status_code, 200, r1.text)
+            a1 = r1.json()["artifacts"][0]
+            self.assertFalse(a1["replaced"])
+            self.assertFalse(a1["replaced_different_content"])
+            # Same name, DIFFERENT bytes: replaced, and the response says so.
+            r2 = c.post("/api/upload", headers=csrf,
+                        files={"files": ("dup.txt", b"completely different", "text/plain")})
+            a2 = r2.json()["artifacts"][0]
+            self.assertTrue(a2["replaced"])
+            self.assertTrue(a2["replaced_different_content"])
+            self.assertNotEqual(a1["id"], a2["id"])
+            # Identical bytes again: replaced is true, but no false alarm about content.
+            r3 = c.post("/api/upload", headers=csrf,
+                        files={"files": ("dup.txt", b"completely different", "text/plain")})
+            a3 = r3.json()["artifacts"][0]
+            self.assertTrue(a3["replaced"])
+            self.assertFalse(a3["replaced_different_content"])
+            # The limit travels with the response so chat.js never needs its own copy.
+            self.assertEqual(r1.json()["max_bytes"], 25 * 1024 * 1024)
+
+    def test_upload_limit_is_an_admin_setting(self):
+        """AUDIT #8 — 25 MiB was a source constant with 'Configurable later' above it,
+        duplicated in chat.js."""
+        from hearth.runtime_settings import SPEC_BY_KEY, set_many, get
+        from hearth.routes_chat import upload_limit_bytes
+        spec = SPEC_BY_KEY.get("uploads.max_bytes")
+        self.assertIsNotNone(spec, "uploads.max_bytes must be an admin-editable setting")
+        self.assertEqual(spec.default, 25 * 1024 * 1024)
+        self.assertEqual(upload_limit_bytes(), 25 * 1024 * 1024)
+        set_many({"uploads.max_bytes": str(3 * 1024 * 1024)})
+        try:
+            self.assertEqual(get("uploads.max_bytes"), 3 * 1024 * 1024)
+            self.assertEqual(upload_limit_bytes(), 3 * 1024 * 1024)
+        finally:
+            set_many({"uploads.max_bytes": str(25 * 1024 * 1024)})
+
+    def test_provider_registry_and_stub_fallback_note(self):
+        """AUDIT #7 — provider choice was an if-chain, and a dead llama-server meant
+        silently talking to a fake model."""
+        import asyncio
+        from hearth.manager import ModelManager, PROVIDERS, backend_choices
+        from hearth.llm.stub import StubProvider
+        self.assertIn("stub", PROVIDERS)
+        self.assertIn("llama-server", PROVIDERS)
+        self.assertEqual(backend_choices(), sorted(PROVIDERS))
+        m = ModelManager()
+        # A configured llama-server that is not answering must be announced, not hidden.
+        # (An unknown backend name cannot reach get_provider() at all: SettingSpec._coerce
+        # maps a value outside `choices` back to the default before it gets here — so this
+        # is also why model.backend gains no new option without its registry entry.)
+        from hearth import runtime_settings as rs
+        from hearth import manager as mgr_mod
+        orig_ensure = m.ensure_server
+
+        async def dead(*a, **k):
+            return ""
+        m.ensure_server = dead  # type: ignore[assignment]
+        rs.set_many({"model.backend": "llama-server"})
+        try:
+            p = asyncio.run(m.get_provider())
+            self.assertIsInstance(p, StubProvider)
+            self.assertIn("llama-server", m.last_fallback_note)
+            self.assertIn("STUB", m.last_fallback_note.upper())
+        finally:
+            rs.set_many({"model.backend": "stub"})
+        # Deliberately the stub -> no fallback note (nothing was substituted).
+        p2 = asyncio.run(m.get_provider())
+        self.assertIsInstance(p2, StubProvider)
+        self.assertEqual(m.last_fallback_note, "")
+
+    def test_provider_capabilities_replace_name_sniffing(self):
+        """AUDIT Part B — `getattr(provider,'name')=='llama-server'` was a capability
+        test written as string equality."""
+        from hearth.llm.stub import StubProvider
+        from hearth.llm.llama_server import LlamaServerProvider
+        stub = StubProvider().capabilities()
+        self.assertTrue(stub["is_stub"])
+        self.assertFalse(stub["exposes_log_progress"])
+        llama = LlamaServerProvider("http://127.0.0.1:1").capabilities()
+        self.assertTrue(llama["exposes_log_progress"])
+        self.assertFalse(llama["is_stub"])
+
+    def test_caption_cache_evicts_least_recently_used(self):
+        """AUDIT #12 — eviction followed insertion order, so with >64 chats a hot
+        conversation lost its caption and the model got `[attached: x.mp3]` alone while
+        the UI still showed a description."""
+        from hearth import orchestrator as orch
+        saved = dict(orch._captions)
+        try:
+            orch._captions.clear()
+            for i in range(orch._CAPTION_CACHE_MAX_CONVOS):
+                orch._remember_caption("u", f"conv{i}", "a.mp3", f"cap{i}")
+            # Touch the OLDEST entry so it becomes the most recently used.
+            first = orch.get_caption("u", "conv0", "a.mp3")
+            self.assertEqual(first, "cap0")
+            orch._remember_caption("u", "overflow", "a.mp3", "new")
+            self.assertTrue(orch.get_caption("u", "conv0", "a.mp3"),
+                            "a recently-used chat must not be the eviction victim")
+            self.assertEqual(orch.get_caption("u", "conv1", "a.mp3"), "",
+                            "the least recently used chat is the one that goes")
+        finally:
+            orch._captions.clear()
+            orch._captions.update(saved)
+
+    def test_tool_labels_are_derived_from_the_classes(self):
+        """AUDIT #17 — labels lived in a second hand-maintained registry; add a tool and
+        forget the entry and Admin rendered nothing for it."""
+        from hearth.tools import TOOLS_BY_NAME, TOOL_LABELS_BY_NAME
+        self.assertEqual(set(TOOL_LABELS_BY_NAME), set(TOOLS_BY_NAME))
+        # Every enable/approval spec must resolve to a real label (no KeyError at import,
+        # no blank row in the admin UI).
+        from hearth.runtime_settings import ALL_SPECS
+        for s in ALL_SPECS:
+            if s.key.startswith("tools.") and s.type == "bool" and s.key.count(".") == 1:
+                name = s.key.split(".", 1)[1]
+                if name in TOOLS_BY_NAME:
+                    # The label must carry the tool's own human-readable name, and its
+                    # enable spec must be derived rather than hand-keyed.
+                    self.assertTrue(s.label.endswith(": enable"), s.label)
+                    self.assertNotEqual(s.label, f"{name}: enable",
+                                        f"{name} has no label — Admin would show a bare key")
+
+    def test_stale_approval_is_not_executed(self):
+        """AUDIT #4 — an approved card could sit for a day and then run against a
+        workspace that had moved on."""
+        from hearth import orchestrator as orch
+        old = {"created_at": int(__import__("time").time()) - 7200}
+        fresh = {"created_at": int(__import__("time").time())}
+        limit = {"agent.pending_max_age_s": 3600}
+        self.assertTrue(orch._pending_is_stale(old, limit))
+        self.assertFalse(orch._pending_is_stale(fresh, limit))
+        # Setting it to 0 disables the check entirely (operator's explicit choice).
+        self.assertFalse(orch._pending_is_stale(old, {"agent.pending_max_age_s": 0}))
+        # A row with no timestamp is never treated as stale — approvals are not deleted
+        # on account of a missing field.
+        self.assertFalse(orch._pending_is_stale({}, limit))
+
+    def test_pdf_read_announces_its_page_clamp(self):
+        """AUDIT #6 — asking for pages 1-40 returned 1-6 with no complaint."""
+        from pathlib import Path
+        from hearth.tools.media_tools import PdfReadTool
+        src = (Path(__file__).resolve().parent.parent / "hearth/tools/media_tools.py").read_text()
+        self.assertIn("you asked for pages up to", src)
+        self.assertLessEqual(PdfReadTool.MAX_PAGES, 8)
+
+    def test_no_dead_duplicate_of_progress_event(self):
+        """AUDIT B2 — 43 unreachable lines duplicating _progress_event sat after
+        _merge_progress's return, where a future ETA fix would silently do nothing."""
+        import ast
+        from pathlib import Path
+        src = (Path(__file__).resolve().parent.parent / "hearth/orchestrator.py").read_text()
+        tree = ast.parse(src)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "_merge_progress":
+                returns = [i for i, st in enumerate(node.body) if isinstance(st, ast.Return)]
+                self.assertTrue(returns)
+                last_return = returns[-1]
+                trailing = [type(st).__name__ for st in node.body[last_return + 1:]]
+                self.assertEqual(trailing, [],
+                                 f"unreachable statements after the final return: {trailing}")
+
+    def test_single_worker_assumption_is_warned_about(self):
+        """AUDIT #11 — README told operators to run `uvicorn --workers`, which silently
+        breaks Stop, steering and captions (all per-process dicts)."""
+        import io, contextlib
+        from hearth import main as main_mod
+        buf = io.StringIO()
+        old = os.environ.get("WEB_CONCURRENCY")
+        try:
+            os.environ["WEB_CONCURRENCY"] = "4"
+            with contextlib.redirect_stdout(buf):
+                main_mod._warn_if_multi_worker()
+            self.assertIn("single-process", buf.getvalue())
+            self.assertIn("Stop", buf.getvalue())
+        finally:
+            if old is None:
+                os.environ.pop("WEB_CONCURRENCY", None)
+            else:
+                os.environ["WEB_CONCURRENCY"] = old
+        buf2 = io.StringIO()
+        try:
+            os.environ.pop("WEB_CONCURRENCY", None)
+            with contextlib.redirect_stdout(buf2):
+                main_mod._warn_if_multi_worker()
+            self.assertEqual(buf2.getvalue(), "", "no warning for the supported single worker")
+        finally:
+            if old is not None:
+                os.environ["WEB_CONCURRENCY"] = old
+
+    def test_hardcoded_policies_now_have_settings(self):
+        """AUDIT Part B, 'Settings / config' — eight policy values lived outside the
+        settings system that exists to govern them. These are the ones moved in."""
+        from hearth.runtime_settings import SPEC_BY_KEY
+        for key in ("uploads.max_bytes", "agent.workspace_listing_entries",
+                    "agent.fs_list_entries", "tools.zip_pack.max_files",
+                    "agent.pending_max_age_s"):
+            self.assertIn(key, SPEC_BY_KEY, f"{key} should be admin-editable")
+class DiffusionQwenImageTests(unittest.TestCase):
+    """Image generation supports ONE architecture — Qwen Image / Qwen Image 2.1 — and the
+    contract is the three files plus their flags. Verified against a real `sd-cli` build
+    (master-1106-532d2c1) with qwen_image_2.1_Q8_0.gguf + Qwen3VL-8B-Instruct-Q4_K_M.gguf +
+    diffusion_pytorch_model.safetensors: those three are required, `--model` is rejected for
+    them, and a missing one fails as hundreds of '… not in model metadata' lines. These tests
+    exist so a future 'generalise it' edit cannot silently re-break the only setup that works.
+    """
+
+    def setUp(self):
+        from hearth import diffusion as sd
+        self.sd = sd
+        self.tmp = tempfile.mkdtemp(prefix="sd-models-")
+        self.dit = os.path.join(self.tmp, "qwen_image_2.1_Q8_0.gguf")
+        self.llm = os.path.join(self.tmp, "Qwen3VL-8B-Instruct-Q4_K_M.gguf")
+        self.vae = os.path.join(self.tmp, "diffusion_pytorch_model.safetensors")
+        for p in (self.dit, self.llm, self.vae):
+            with open(p, "wb") as fh:
+                fh.write(b"x")
+        self.bin = os.path.join(self.tmp, "sd-cli")
+        with open(self.bin, "wb") as fh:
+            fh.write(b"#!/bin/sh\nexit 0\n")
+        os.chmod(self.bin, 0o755)
+
+    def s(self, **over):
+        base = {"diffusion.enabled": True, "diffusion.cli_bin": self.bin,
+                "diffusion.model_dir": self.tmp}
+        base.update(over)
+        return base
+
+    # -- discovery ------------------------------------------------------------
+    def test_model_folder_alone_resolves_all_three_files(self):
+        p = self.sd.resolve_paths(self.s())
+        self.assertEqual(p["models"], {"dit": self.dit, "llm": self.llm, "vae": self.vae})
+        self.assertEqual(set(p["sources"].values()), {"folder"})
+        self.assertEqual(self.sd.preflight(self.s()), "")
+
+    def test_discovery_never_gives_the_llm_file_to_the_diffusion_role(self):
+        """`qwen` appears in BOTH file names; the encoder must not claim the DiT .gguf."""
+        p = self.sd.resolve_paths(self.s())
+        self.assertEqual(p["models"]["dit"], self.dit)
+        self.assertEqual(p["models"]["llm"], self.llm)
+        self.assertNotEqual(p["models"]["dit"], p["models"]["llm"])
+
+    def test_explicit_path_wins_over_the_folder(self):
+        other = os.path.join(self.tmp, "chosen-vae.safetensors")
+        with open(other, "wb") as fh:
+            fh.write(b"x")
+        p = self.sd.resolve_paths(self.s(**{"diffusion.vae_path": other}))
+        self.assertEqual(p["models"]["vae"], other)
+        self.assertEqual(p["sources"]["vae"], "setting")
+
+    def test_legacy_model_path_key_still_feeds_the_diffusion_role(self):
+        """Older installs stored the main model under diffusion.model_path — don't orphan it."""
+        s = {"diffusion.enabled": True, "diffusion.cli_bin": self.bin,
+             "diffusion.model_path": self.dit, "diffusion.vae": self.vae,
+             "diffusion.llm_path": self.llm}
+        p = self.sd.resolve_paths(s)
+        self.assertEqual(p["models"]["dit"], self.dit)
+        self.assertEqual(p["sources"]["dit"], "legacy")
+        self.assertEqual(self.sd.preflight(s), "")
+
+    # -- preflight ------------------------------------------------------------
+    def test_missing_file_names_the_setting_not_a_generic_failure(self):
+        os.remove(self.vae)
+        msg = self.sd.preflight(self.s())
+        self.assertIn("VAE (.safetensors)", msg)
+        self.assertNotIn("Diffusion model", msg, "only the missing file should be listed")
+        self.assertIn("Admin → Images", msg, "the refusal must say where to fix it")
+
+    def test_no_files_at_all_lists_every_role(self):
+        s = {"diffusion.enabled": True, "diffusion.cli_bin": self.bin}
+        msg = self.sd.preflight(s)
+        for label in ("Diffusion model", "Text-encoder LLM", "VAE"):
+            self.assertIn(label, msg)
+
+    def test_disabled_switch_is_reported_before_any_file(self):
+        msg = self.sd.preflight({"diffusion.enabled": False})
+        self.assertIn("disabled", msg)
+
+    # -- argv -----------------------------------------------------------------
+    def test_argv_uses_the_three_dedicated_flags_and_never_model(self):
+        argv = self.sd.build_argv(self.s(), "a lighthouse at dusk", "/tmp/out", steps=0, batch=2)
+        for flag in ("--diffusion-model", "--llm", "--vae"):
+            self.assertIn(flag, argv)
+        self.assertNotIn("--model", argv)
+        self.assertNotIn("-m", argv)
+        self.assertEqual(argv[argv.index("--diffusion-model") + 1], self.dit)
+        self.assertEqual(argv[argv.index("--llm") + 1], self.llm)
+        self.assertEqual(argv[argv.index("--vae") + 1], self.vae)
+
+    def test_argv_pins_the_flags_that_make_qwen_image_work(self):
+        argv = self.sd.build_argv(self.s(), "x", "/tmp/out")
+        i = argv.index("--sampling-method")
+        self.assertEqual(argv[i + 1], "euler")
+        self.assertIn("--diffusion-fa", argv)
+        j = argv.index("--preview")
+        self.assertEqual(argv[j + 1], "none",
+                         "previews would write ./preview.png into Hearth's cwd and cost VAE decodes")
+        self.assertTrue(any(a.endswith("hearth_%03d.png") for a in argv))
+
+    def test_build_argv_refuses_before_launching_when_a_file_is_missing(self):
+        os.remove(self.llm)
+        with self.assertRaises(self.sd.DiffusionError) as cm:
+            self.sd.build_argv(self.s(), "x", "/tmp/out")
+        self.assertIn("Text-encoder LLM", str(cm.exception))
+
+    def test_seed_zero_is_passed_and_random_is_omitted(self):
+        """`-s 0` is a real seed; `-s -1` would be swallowed as the next flag's value."""
+        argv = self.sd.build_argv(self.s(), "x", "/tmp/out", seed=0)
+        self.assertIn("-s", argv)
+        self.assertEqual(argv[argv.index("-s") + 1], "0")
+        self.assertEqual(self.sd.Diffusion._seed_from_argv(argv), 0)
+        rand = self.sd.build_argv(self.s(), "x", "/tmp/out", seed=-1)
+        self.assertNotIn("-s", rand)
+        self.assertIsNone(self.sd.Diffusion._seed_from_argv(rand))
+
+    def test_numbers_are_clamped_not_trusted(self):
+        argv = self.sd.build_argv(self.s(), "x", "/tmp/out", steps=10_000, cfg=999.0,
+                                  width=99_000, height=8, batch=50)
+        self.assertEqual(argv[argv.index("--steps") + 1], str(self.sd.MAX_STEPS))
+        self.assertEqual(argv[argv.index("--cfg-scale") + 1], str(int(self.sd.MAX_CFG)))
+        self.assertEqual(argv[argv.index("-W") + 1], str(self.sd.MAX_EDGE))
+        self.assertEqual(argv[argv.index("-H") + 1], str(self.sd.MIN_EDGE))
+        self.assertEqual(argv[argv.index("-b") + 1], str(self.sd.MAX_BATCH_PER_IMAGE))
+
+    # -- failure translation ---------------------------------------------------
+    def test_sd_cli_log_signatures_are_translated(self):
+        cases = {
+            "[E] get sd version from file failed: 'x.gguf' --- diffusion_engine.cpp:979": "diffusion",
+            "[E] VAE tensor 'first_stage_model.encoder.head.0.gamma' not in model metadata": "VAE",
+            "[E] Conditioner model tensor 'text_encoders.llm.model.norm.weight' nope": "Text-encoder",
+        }
+        for tail, want in cases.items():
+            hint = self.sd.explain_failure(tail)
+            self.assertTrue(hint, f"no hint for {tail[:40]}")
+            self.assertIn(want.lower(), hint.lower())
+        self.assertEqual(self.sd.explain_failure("something unrecognised"), "")
+
+    # -- status / settings surface --------------------------------------------
+    def test_status_reports_each_file_separately(self):
+        st = self.sd.get_diffusion().status(self.s())
+        self.assertTrue(st["configured"])
+        self.assertEqual(st["present"], {"dit": True, "llm": True, "vae": True})
+        os.remove(self.dit)
+        st2 = self.sd.get_diffusion().status(self.s())
+        self.assertFalse(st2["configured"])
+        self.assertFalse(st2["present"]["dit"])
+        self.assertTrue(st2["present"]["llm"], "one missing file must not hide the other two")
+
+    def test_settings_offered_match_the_supported_setup(self):
+        from hearth.runtime_settings import SPEC_BY_KEY
+        for key in ("diffusion.model_dir", "diffusion.dit_path", "diffusion.llm_path",
+                    "diffusion.vae_path"):
+            self.assertIn(key, SPEC_BY_KEY, f"{key} should be admin-editable")
+        for gone in ("diffusion.clip_l", "diffusion.clip_g", "diffusion.t5xxl",
+                     "diffusion.lora_dir", "diffusion.preview"):
+            self.assertNotIn(gone, SPEC_BY_KEY,
+                             f"{gone} belongs to architectures Hearth no longer claims")
+
+    def test_tool_label_says_qwen_image(self):
+        from hearth.tools.image_tools import GenerateImageTool
+        self.assertIn("Qwen Image", GenerateImageTool.label)
+class DiffusionCancellationTests(unittest.TestCase):
+    """Stop must reach a RUNNING sd-cli. `stop_active()` used to read
+
+        if p is None or p.poll() is None: return False
+
+    and a running child has `poll() is None` — so Stop sent no signal at all, returned in
+    0.00 s, and the generation ran to completion holding the GPU. Measured before the fix:
+    stop_active() -> False, child alive 42 s later. These tests use a fake CLI that ignores
+    nothing but signals, so they fail loudly if the early-return ever comes back.
+    """
+
+    def setUp(self):
+        from hearth import diffusion as sd
+        self.sd = sd
+        # One folder per role, so a filename can only match one slot. resolve_paths() does
+        # prefer an explicit path over `model_dir`, but keeping the candidates disjoint means
+        # argv is checked against exactly the file this test created.
+        self.bins = {}
+        for role, name in (("dit", "qwen_image.gguf"), ("llm", "qwen3vl.gguf"),
+                           ("vae", "diffusion_pytorch_model.safetensors")):
+            d = tempfile.mkdtemp(prefix=f"sd-{role}-")
+            with open(os.path.join(d, name), "wb") as fh:
+                fh.write(b"x")
+            self.bins[role] = d
+        # A wrapper that spawns a grandchild and waits: Hearth must take out the group.
+        self.dir = tempfile.mkdtemp(prefix="sd-kill-")
+        self.wrapper = os.path.join(self.dir, "sd-cli")
+        with open(self.wrapper, "w") as fh:
+            fh.write("#!/bin/sh\n( sleep 120 & wait )\n")
+        os.chmod(self.wrapper, 0o755)
+        self.settings = {"diffusion.enabled": True, "diffusion.cli_bin": self.wrapper,
+                         "diffusion.dit_path": os.path.join(self.bins["dit"], "qwen_image.gguf"),
+                         "diffusion.llm_path": os.path.join(self.bins["llm"], "qwen3vl.gguf"),
+                         "diffusion.vae_path": os.path.join(
+                             self.bins["vae"], "diffusion_pytorch_model.safetensors"),
+                         "diffusion.timeout_s": 300}
+
+    def tearDown(self):
+        import signal as _sig
+        for pid in self._group_members():
+            try:
+                os.killpg(os.getpgid(pid), _sig.SIGKILL)
+            except OSError:
+                pass
+
+    def _group_members(self):
+        """Live processes whose PGID leader is our wrapper (i.e. Hearth created them)."""
+        r = subprocess.run(["ps", "-eo", "pid,pgid,args", "--no-headers"],
+                           capture_output=True, text=True)
+        out = []
+        for line in r.stdout.splitlines():
+            parts = line.strip().split(None, 2)
+            if len(parts) < 3 or "sleep 120" not in parts[2]:
+                continue
+            try:
+                out.append(int(parts[0]))
+            except ValueError:
+                pass
+        return out
+
+    def _start(self):
+        d = self.sd.get_diffusion()
+        box = {}
+        th = threading.Thread(
+            target=lambda: box.setdefault(
+                "err", self._run(d, box) or "finished"), daemon=True)
+        th.start()
+        return d, th, box
+
+    def _run(self, d, box):
+        try:
+            d.generate_sync(self.settings, "x")
+            return None
+        except self.sd.DiffusionError as e:
+            box["err"] = str(e)
+            return str(e)
+
+    def test_stop_kills_a_running_generation_and_its_group(self):
+        d, th, box = self._start()
+        deadline = time.time() + 10
+        while time.time() < deadline and not self._group_members():
+            time.sleep(0.2)
+        self.assertTrue(self._group_members(), "the fake sd-cli never started")
+        t0 = time.time()
+        stopped = d.stop_active()
+        # Killing takes real time (SIGTERM, grace, SIGKILL) — a 0.0 s return means it did
+        # nothing, which is exactly the bug.
+        self.assertGreater(time.time() - t0, 0.05,
+                           "stop_active returned instantly: it signalled nothing")
+        self.assertTrue(stopped, "stop_active claims the child survived")
+        th.join(30)
+        self.assertFalse(th.is_alive(), "generate_sync never unwound after Stop")
+        time.sleep(0.5)
+        self.assertEqual(self._group_members(), [],
+                         "processes survived Stop — they would hold the GPU")
+
+    def test_stop_during_model_load_is_honoured(self):
+        """A Stop that lands while sd-cli is still being spawned must not be lost.
+
+        The window is real: `stop_requested` is cleared at the start of generate_sync() and
+        the child only becomes reachable a moment later, so `_set_active()` has to honour a
+        Stop that arrived in between — otherwise pressing Stop during model load silently
+        lets a full generation run afterwards.
+        """
+        d = self.sd.get_diffusion()
+        box = {}
+        th = threading.Thread(target=lambda: self._run(d, box), daemon=True)
+        th.start()
+
+        # Wait for the exact moment the child exists but has produced nothing yet, then Stop
+        # from this thread — racing _set_active() the same way a user's Stop does.
+        deadline = time.time() + 10
+        while time.time() < deadline and not self._group_members():
+            time.sleep(0.02)
+        d.stop_active()
+        th.join(40)
+        self.assertFalse(th.is_alive(), "generate_sync never unwound after a Stop")
+        time.sleep(0.5)
+        self.assertEqual(self._group_members(), [],
+                         f"processes survived a Stop; result was: {box.get('err')}")
+        self.assertTrue(box.get("err"), "a stopped run must report an error, not success")
+
+    def test_a_stopped_run_does_not_blame_the_model_files(self):
+        """Signal exits used to carry 'the model files must all come from the same package'."""
+        d, th, box = self._start()
+        deadline = time.time() + 10
+        while time.time() < deadline and not self._group_members():
+            time.sleep(0.2)
+        d.stop_active()
+        th.join(30)
+        msg = box.get("err", "")
+        self.assertTrue(msg, "no error reported for a stopped generation")
+        self.assertNotIn("same Qwen Image package", msg)
+        self.assertIn("stopped by Hearth", msg)
+
+
+class DiffusionEditProfileTests(unittest.TestCase):
+    """Qwen Image Edit is a SECOND profile in the same runner (DEC-078): its own settings
+    prefix (`image_edit.*`), its own file slots, an optional vision mmproj, `-r` for the
+    reference image (NOT img2img `-i`), CFG 2.5 and `--flow-shift 3`. Generation must stay
+    byte-identical. These lock the contract so neither profile can silently drift into the
+    other's flags or settings.
+    """
+
+    def setUp(self):
+        from hearth import diffusion as sd
+        self.sd = sd
+        # Separate folders for gen and edit so a filename can only match one profile, and
+        # discovery is checked against exactly the file this test created.
+        self.gen_dir = tempfile.mkdtemp(prefix="sd-gen-")
+        with open(os.path.join(self.gen_dir, "qwen_image_2.1_Q8_0.gguf"), "wb") as fh:
+            fh.write(b"x")
+        with open(os.path.join(self.gen_dir, "Qwen3VL-8B-Instruct-Q4_K_M.gguf"), "wb") as fh:
+            fh.write(b"x")
+        with open(os.path.join(self.gen_dir, "diffusion_pytorch_model.safetensors"), "wb") as fh:
+            fh.write(b"x")
+
+        self.edit_dir = tempfile.mkdtemp(prefix="sd-edit-")
+        self.edit_dit = os.path.join(self.edit_dir, "Qwen_Image_Edit-Q8_0.gguf")
+        self.edit_llm = os.path.join(self.edit_dir, "Qwen2.5-VL-7B-Instruct-Q8_0.gguf")
+        self.edit_vae = os.path.join(self.edit_dir, "qwen_image_vae.safetensors")
+        for p in (self.edit_dit, self.edit_llm, self.edit_vae):
+            with open(p, "wb") as fh:
+                fh.write(b"x")
+
+        self.bin = os.path.join(tempfile.mkdtemp(prefix="sd-bin-"), "sd-cli")
+        with open(self.bin, "wb") as fh:
+            fh.write(b"#!/bin/sh\nexit 0\n")
+        os.chmod(self.bin, 0o755)
+
+    def gen_settings(self, **over):
+        base = {"diffusion.enabled": True, "diffusion.cli_bin": self.bin,
+                "diffusion.model_dir": self.gen_dir}
+        base.update(over)
+        return base
+
+    def edit_settings(self, **over):
+        base = {"image_edit.enabled": True, "image_edit.cli_bin": self.bin,
+                "image_edit.model_dir": self.edit_dir}
+        base.update(over)
+        return base
+
+    # -- independent settings --------------------------------------------------
+    def test_edit_profile_reads_its_own_prefix_not_generation(self):
+        p = self.sd.resolve_paths(self.edit_settings(), self.sd.PROFILE_EDIT)
+        self.assertEqual(p["models"]["dit"], self.edit_dit)
+        self.assertEqual(p["models"]["llm"], self.edit_llm)
+        self.assertEqual(p["models"]["vae"], self.edit_vae)
+        # Generation, given the same dict, must NOT pick up the edit files.
+        pg = self.sd.resolve_paths(self.edit_settings(), self.sd.PROFILE_GEN)
+        self.assertEqual(pg["models"]["dit"], "")
+
+    def test_edit_folder_discovery_finds_the_edit_dit_by_name(self):
+        p = self.sd.resolve_paths(self.edit_settings(), self.sd.PROFILE_EDIT)
+        self.assertEqual(p["sources"]["dit"], "folder")
+        self.assertEqual(p["models"]["dit"], self.edit_dit)
+
+    # -- optional vision mmproj ------------------------------------------------
+    def test_optional_vision_mmproj_is_not_required(self):
+        # No llm_vision set → still preflight-clean and configured (original/2511 fold it in).
+        self.assertEqual(self.sd.preflight(self.edit_settings(), self.sd.PROFILE_EDIT), "")
+        st = self.sd.get_diffusion().status(self.edit_settings(), self.sd.PROFILE_EDIT)
+        self.assertTrue(st["configured"])
+        self.assertIn("llm_vision", st["present"])   # reported, but not required
+
+    def test_vision_mmproj_emitted_only_when_set(self):
+        argv = self.sd.build_argv(self.edit_settings(), "make it night", "/tmp/out",
+                                  ref_image="/tmp/in.png", profile=self.sd.PROFILE_EDIT)
+        self.assertNotIn("--llm_vision", argv)
+        mm = os.path.join(self.edit_dir, "Qwen2.5-VL-7B-Instruct.mmproj-Q8_0.gguf")
+        with open(mm, "wb") as fh:
+            fh.write(b"x")
+        argv2 = self.sd.build_argv(self.edit_settings(**{"image_edit.llm_vision_path": mm}),
+                                   "make it night", "/tmp/out", ref_image="/tmp/in.png",
+                                   profile=self.sd.PROFILE_EDIT)
+        self.assertIn("--llm_vision", argv2)
+        self.assertEqual(argv2[argv2.index("--llm_vision") + 1], mm)
+
+    # -- argv contract ---------------------------------------------------------
+    def test_edit_argv_uses_reference_flag_and_edit_sampling(self):
+        argv = self.sd.build_argv(self.edit_settings(), "remove the car", "/tmp/out",
+                                  ref_image="/tmp/in.png", profile=self.sd.PROFILE_EDIT)
+        self.assertIn("-r", argv)
+        self.assertEqual(argv[argv.index("-r") + 1], "/tmp/in.png")
+        self.assertNotIn("-i", argv, "editing is reference conditioning, not img2img")
+        i = argv.index("--cfg-scale")
+        self.assertEqual(argv[i + 1], "2.5", "edit CFG default is 2.5, not generation's 4.5")
+        j = argv.index("--flow-shift")
+        self.assertEqual(argv[j + 1], "3")
+
+    def test_generation_argv_unchanged_no_flowshift_reference(self):
+        argv = self.sd.build_argv(self.gen_settings(), "a fox", "/tmp/out", steps=0)
+        self.assertNotIn("--flow-shift", argv)
+        self.assertNotIn("-r", argv)
+        i = argv.index("--cfg-scale")
+        self.assertEqual(argv[i + 1], "4.5")
+
+    def test_zero_cond_t_off_by_default_on_when_set(self):
+        # Original Qwen-Image-Edit: no --model-args by default.
+        argv = self.sd.build_argv(self.edit_settings(), "x", "/tmp/out", ref_image="/tmp/i.png",
+                                  profile=self.sd.PROFILE_EDIT)
+        self.assertNotIn("--model-args", argv)
+        # 2511 weights: the admin toggle adds it verbatim.
+        argv2 = self.sd.build_argv(self.edit_settings(**{"image_edit.zero_cond_t": True}),
+                                   "x", "/tmp/out", ref_image="/tmp/i.png",
+                                   profile=self.sd.PROFILE_EDIT)
+        self.assertIn("--model-args", argv2)
+        self.assertEqual(argv2[argv2.index("--model-args") + 1], "qwen_image_zero_cond_t=true")
+
+    def test_missing_edit_file_names_the_setting(self):
+        os.remove(self.edit_vae)
+        msg = self.sd.preflight(self.edit_settings(), self.sd.PROFILE_EDIT)
+        self.assertIn("VAE (.safetensors)", msg)
+        self.assertIn("Image Edit", msg)   # says which profile, not a generic message
+
+    def test_edit_disabled_is_reported_before_files(self):
+        msg = self.sd.preflight({"image_edit.enabled": False}, self.sd.PROFILE_EDIT)
+        self.assertIn("disabled", msg)
+
+    # -- shared binary fallback ------------------------------------------------
+    def test_edit_reuses_generation_cli_when_unset(self):
+        s = {"image_edit.enabled": True, "diffusion.cli_bin": self.bin,
+             "image_edit.model_dir": self.edit_dir}
+        p = self.sd.resolve_paths(s, self.sd.PROFILE_EDIT)
+        self.assertEqual(p["bin"], self.bin)
+
+    # -- settings surface ------------------------------------------------------
+    def test_edit_settings_are_admin_editable(self):
+        from hearth.runtime_settings import SPEC_BY_KEY
+        for key in ("image_edit.enabled", "image_edit.model_dir", "image_edit.dit_path",
+                    "image_edit.llm_path", "image_edit.vae_path", "image_edit.llm_vision_path",
+                    "tools.edit_image", "tools.edit_image.approval"):
+            self.assertIn(key, SPEC_BY_KEY, f"{key} should be admin-editable")
+
+    def test_edit_tool_registered_and_gated(self):
+        from hearth.tools import TOOLS_BY_NAME
+        t = TOOLS_BY_NAME["edit_image"]
+        self.assertTrue(t.gated)
+        self.assertEqual(t.enable_key, "tools.edit_image")
+        self.assertIn("Qwen Image Edit", t.label)
+
+    def test_edit_tool_requires_image_and_prompt(self):
+        import asyncio
+        from hearth.tools import ToolContext, TOOLS_BY_NAME
+        t = TOOLS_BY_NAME["edit_image"]
+        ctx = ToolContext("u1", {})
+        r = asyncio.run(t.run({"prompt": "x"}, ctx))
+        self.assertFalse(r.ok)
+        self.assertIn("image", r.content.lower())
+        r2 = asyncio.run(t.run({"image": "a.png"}, ctx))
+        self.assertFalse(r2.ok)
+        self.assertIn("prompt", r2.content.lower())
+
+
 if __name__ == "__main__":
     print(f"[selftest] data dir = {_tmp}")
     unittest.main(verbosity=2)
+

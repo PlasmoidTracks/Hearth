@@ -1,12 +1,13 @@
 """ModelManager — selects a Provider, optionally launches/monitors llama-server,
 and applies admin model settings as CLI flags on (re)load (DEC-001, DEC-008).
 
-Selection logic for get_provider():
-  1. backend == 'llama-server' and reachable -> LlamaServerProvider
-  2. else -> StubProvider (always available; keeps app usable)
+Selection is a lookup in PROVIDERS below, keyed by the same names `model.backend`
+offers; each entry resolves to a provider or falls back to StubProvider with a note.
 
 Launching llama-server is best-effort: if the binary is missing or fails to come
-up, we log and fall back to stub rather than crashing the whole server.
+up, we log and fall back to stub rather than crashing the whole server — but the
+fallback is now reported (get_provider().last_fallback_note) instead of silent,
+because answers from a fake model otherwise look exactly like real ones.
 """
 from __future__ import annotations
 import asyncio
@@ -23,6 +24,20 @@ from .llm.llama_server import LlamaServerProvider
 from .llm.stub import StubProvider
 
 
+# Backend registry: `model.backend` value -> provider class. Adding an OpenAI-compatible
+# or Ollama backend is now one entry here plus its own llm/<name>.py and a choice in the
+# setting spec — not an edit to get_provider()'s control flow (AUDIT Part B).
+PROVIDERS: dict[str, type] = {
+    "stub": StubProvider,
+    "llama-server": LlamaServerProvider,
+}
+
+
+def backend_choices() -> list[str]:
+    """The backends Hearth can actually build, for cross-checking the setting spec."""
+    return sorted(PROVIDERS)
+
+
 class ModelManager:
     def __init__(self):
         self._proc: Optional[asyncio.subprocess.Process] = None
@@ -31,18 +46,49 @@ class ModelManager:
         # a zombie", "child died", …). Surfaced through start() so Admin shows the
         # real reason instead of a generic "not reachable".
         self._last_hint: str = ""
+        # Set by get_provider() whenever the configured backend could not be used and the
+        # stub took over. Read by routes_chat to tell the user in the chat itself.
+        self.last_fallback_note: str = ""
 
     # --- provider selection --------------------------------------------------
     async def get_provider(self) -> Provider:
+        """The provider chats will use, plus a note when it is NOT what was configured.
+
+        Selection used to be an if-chain over `model.backend` with `return StubProvider()`
+        as its unconditional last line: adding any second backend meant editing this
+        function, and — worse — a llama-server that failed its health check mid-session
+        silently swapped in a fake model whose answers look real.
+
+        It is a registry now (`PROVIDERS`, keyed by the same names `model.backend` offers),
+        and every fallback to the stub is recorded on `last_fallback_note` for the caller to
+        surface, since "you are talking to a stub" is not something to discover from output.
+        """
         settings = rs.get_all()
-        if settings.get("model.backend") == "llama-server":
-            base_url = await self.ensure_server(settings)
-            if base_url:
-                p = LlamaServerProvider(base_url)
-                h = await p.health()
-                if h.get("ok"):
-                    return p
+        want = str(settings.get("model.backend") or "stub")
+        factory = PROVIDERS.get(want)
+        if factory is None:
+            # A stored value with no registered backend (leftover from a removed option, or
+            # a hand-edited DB). Say which name was unknown rather than pretending stub.
+            self.last_fallback_note = (f"Backend '{want}' is not a provider Hearth knows "
+                                       f"(known: {', '.join(sorted(PROVIDERS))}). Using the "
+                                       f"stub model — answers are NOT from a real model.")
+            return StubProvider()
+        if want == "stub":
+            self.last_fallback_note = ""
+            return StubProvider()
+        base_url = await self.ensure_server(settings)
+        if base_url:
+            p = LlamaServerProvider(base_url)
+            h = await p.health()
+            if h.get("ok"):
+                self.last_fallback_note = ""
+                return p
+        self.last_fallback_note = (
+            f"Backend '{want}' is configured but not answering, so this turn runs on the "
+            f"built-in STUB model — its replies are canned text, not real model output. "
+            + (self._last_hint or "Check Admin → Model and runtime/llama-server.log."))
         return StubProvider()
+
 
     # --- llama-server lifecycle ---------------------------------------------
     def _default_base(self, bs) -> str:

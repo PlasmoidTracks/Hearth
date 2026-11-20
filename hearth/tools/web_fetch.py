@@ -29,6 +29,7 @@ _UA = "Mozilla/5.0 (compatible; HearthBot/0.1; +private-family-assistant)"
 
 class WebFetchTool(Tool):
     name = "web_fetch"
+    label = "Web fetch"
     description = (
         "Fetch one web page (http/https) and return its readable text plus a list of "
         "links, stripped of markup. Use after web_search to read a specific result. "

@@ -24,6 +24,13 @@ from .base import Provider, StreamEvent, ToolRequest
 class StubProvider(Provider):
     name = "stub"
 
+    def capabilities(self) -> dict:
+        # A fake model. Nothing about it is real telemetry, and callers must be able to
+        # tell that without comparing names — see Provider.capabilities().
+        # `exposes_log_progress` is False because the log-tail source is a llama-server
+        # file Hearth reads; the stub synthesises its own progress events instead.
+        return {"measured_usage": False, "exposes_log_progress": False, "is_stub": True}
+
     async def stream(self, messages, tools, params) -> AsyncIterator[StreamEvent]:
         last_user = ""
         for m in reversed(messages):

@@ -11,6 +11,7 @@ from .base import Tool, ToolResult
 
 class DateTimeTool(Tool):
     name = "datetime"
+    label = "Date & time"
     description = ("Get the current date and time (server local timezone, ISO 8601 with weekday). "
                    "Use this instead of guessing when a message refers to today/now.")
     enable_key = "tools.datetime"

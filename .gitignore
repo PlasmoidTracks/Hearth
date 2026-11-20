@@ -13,3 +13,21 @@ backup/
 
 # OS/editor
 .DS_Store
+
+# --- Search hygiene -----------------------------------------------------------
+# The single biggest hazard for anyone (or any AI) investigating this repo with
+# grep: `data/workspaces/<uid>/project/` can contain a FULL COPY of the source tree
+# — an imported project folder, which is legitimate runtime data but is ~months stale.
+# It is already untracked via `data/`, but it still answers every recursive search and
+# silently misleads readers into editing or citing dead code (see AUDIT_SILENT_DECISIONS.md,
+# "Repo hygiene note that affects every search"). Ripgrep respects .gitignore, so these
+# entries remove it from the default view of a repo-wide search WITHOUT deleting anything.
+# It also excludes `scratch/`'s one-off UI captures and duplicated scratch dumps from
+# results; those files stay on disk and are still reachable by explicit path.
+# Never rely on a grep hit under these paths without checking its mtime against git HEAD.
+
+# Screenshots, logs and browser dumps checked into scratch/ (binary noise in searches)
+scratch/**/*.png
+scratch/**/*.jpg
+scratch/**/*.log
+scratch/menu_test/

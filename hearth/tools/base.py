@@ -17,9 +17,19 @@ def ui_preview(text) -> str:
 
     Long enough that a captioner description or a file read is readable in one chip, but
     still bounded so one careless tool call cannot put a megabyte into an SSE frame.
+
+    When it clips, the chip says so (finding #13). The two budgets are deliberately
+    unlinked — the model may have been given far more than 4 000 characters — and that is
+    exactly why the display cut must be labelled: without a marker, "why did it say that?"
+    has no answer in the transcript, because the user cannot tell a short tool result from
+    a truncated one.
     """
     s = str(text or "")
-    return s if len(s) <= UI_PREVIEW_MAX_CHARS else s[:UI_PREVIEW_MAX_CHARS]
+    if len(s) <= UI_PREVIEW_MAX_CHARS:
+        return s
+    return (s[:UI_PREVIEW_MAX_CHARS]
+            + f"\n…(truncated for display — {len(s) - UI_PREVIEW_MAX_CHARS} of "
+              f"{len(s)} characters not shown; the model may have seen more)")
 
 
 class DeltaThrottle:
@@ -87,6 +97,14 @@ class Tool(ABC):
     gated: bool = False          # default approval: True == "ask" before running
     setting_key: str = ""        # legacy coarse enable key (fallback below)
     enable_key: str = ""         # granular per-tool enable key (preferred)
+    # Human-readable name for Admin → Tools. Belongs on the tool because a label kept in
+    # runtime_settings._TOOL_LABELS had to be hand-synced with the registry: add a tool and
+    # forget the entry, and the admin UI silently rendered nothing for it (AUDIT #17).
+    label: str = ""
+
+    def display_label(self) -> str:
+        """The Admin label: `label` if set, else a title-cased name."""
+        return self.label or (self.name or "tool").replace("_", " ").title()
 
     def enable_key_or_legacy(self) -> str:
         return self.enable_key or self.setting_key

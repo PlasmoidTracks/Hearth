@@ -143,6 +143,12 @@ class LlamaServerProvider(Provider):
         self.base_url = base_url.rstrip("/")
         self.model = model
 
+    def capabilities(self) -> dict:
+        # The only backend whose print_timing lines Hearth can read for prefill progress
+        # (see manager.poll_log_perf and orchestrator's log_src). Declared here so the
+        # agent loop asks `capabilities()` instead of comparing provider.name to a literal.
+        return {"measured_usage": True, "exposes_log_progress": True, "is_stub": False}
+
     async def health(self) -> dict:
         """Liveness + slot info. `n_ctx` comes from /props when the build exposes it."""
         try:

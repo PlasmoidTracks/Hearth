@@ -120,6 +120,7 @@ def _max_edge(ctx) -> int:
 
 class PdfInfoTool(Tool):
     name = "pdf_info"
+    label = "PDF info (pages/metadata)"
     description = ("Report a PDF's page count and metadata (title/author/page size/encrypted) "
                    "WITHOUT rendering anything. Call this before pdf_read so you know how many "
                    "pages there are and can pick a sensible range — reading every page of a long "
@@ -163,14 +164,20 @@ class PdfInfoTool(Tool):
 
 class PdfReadTool(Tool):
     name = "pdf_read"
+    label = "PDF reading (pages as images)"
     description = ("Read a PDF by rendering its pages to IMAGES and showing them to you — so "
                    "figures, scanned pages, tables and layout are NOT lost (fs_read on a PDF only "
                    "yields the embedded text stream). Call pdf_info first for the page count, then "
-                   "request a small range (page_start/page_end, 1-based inclusive; default 6 pages "
-                   "from page 1). Each rendered page is also saved under media/ in your workspace.")
+                   "request a small range (page_start/page_end, 1-based inclusive; at most 6 pages "
+                   "per call — ask for more and the result says so and tells you where to continue). "
+                   "Each rendered page is also saved under media/ in your workspace.")
     enable_key = "tools.pdf_read"
 
-    MAX_PAGES = 6          # per call; more would flood the context window
+    # Per call; more would flood the context window. Deliberately a class attribute rather
+    # than an admin setting: unlike the listing caps, raising this multiplies image tokens by
+    # however many pages a model happens to request, so it is not a safe knob to hand out.
+    # The tool description and the result note both quote it, so they cannot drift.
+    MAX_PAGES = 6
     MAX_TOTAL_IMAGES = 12
 
     def parameters(self):
@@ -215,7 +222,9 @@ class PdfReadTool(Tool):
             return ToolResult(False, "page_end must be an integer")
         if end is None:
             end = min(total or start, start + self.MAX_PAGES - 1)
+        requested_end = end
         end = max(start, min(end, start + self.MAX_PAGES - 1))
+        clamped = requested_end > end
         if total and start > total:
             return ToolResult(False, f"page_start {start} is past the end of a {total}-page PDF")
         try:
@@ -248,6 +257,13 @@ class PdfReadTool(Tool):
         got = sorted(rendered)
         lines = [f"Rendered {len(images)} page(s) of {rel} as images (pages "
                  f"{got[0] + 1}-{got[-1] + 1} of {total or '?'})."]
+        if clamped:
+            # A request for pages 1-40 used to be answered with 1-6 and no complaint, so a
+            # model that asked for the whole document believed it had received it. Say what
+            # was refused and why, next to what was delivered (AUDIT #6).
+            lines.append(f"note: you asked for pages up to {requested_end}; only "
+                         f"{self.MAX_PAGES} per call are rendered (context budget) — "
+                         f"continue with page_start={got[-1] + 2}")
         for it in images:
             lines.append(f"- page image: {it['path']}")
         if len(images) < len(got):
@@ -286,6 +302,7 @@ def _captioner_ready(ctx) -> bool:
 
 class VideoInfoTool(Tool):
     name = "video_info"
+    label = "Video info (runtime/fps)"
     description = ("Report a video's technical metadata — duration (runtime), fps, resolution, "
                    "frame count, size, and whether it carries audio — WITHOUT decoding it. Call "
                    "this before view_video so you know the runtime and can choose timestamps to "
@@ -340,6 +357,7 @@ class VideoInfoTool(Tool):
 
 class ViewVideoTool(Tool):
     name = "view_video"
+    label = "Video viewing (sampled frames)"
     description = ("Look at a video by decoding a SMALL number of frames and showing them to you "
                    "as images (never the whole clip). Default: 8 frames equally spaced over the "
                    "whole runtime. Pass `timestamps` (seconds) to see specific moments, or "

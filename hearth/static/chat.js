@@ -171,7 +171,11 @@ function webSourcesHtml(web){
   const badge = web.backend ? `<span class="text-slate-500"> · ${esc(T('chat.web_mode','via'))} ${esc(web.backend)}</span>` : '';
   if(Array.isArray(web.results) && web.results.length){
     const q = web.query ? ` “${esc(web.query)}”` : '';
-    const items = web.results.slice(0,8).map(r=>{
+    // Show them all. The slice that used to live here (8 of however many the server sent)
+    // silently disagreed with web.max_results: raising the admin setting changed what the
+    // model saw but never what the user could click, and nothing said so (AUDIT #9).
+    // Search results are a handful of items by policy; there is no reason to hide any.
+    const items = web.results.map(r=>{
       const href = safeHref(r.url); if(!href) return '';
       return `<li class="leading-snug"><a href="${esc(href)}" target="_blank" rel="noopener noreferrer" ` +
         `class="text-sky-400 hover:underline break-all">${esc(r.title || hostOf(r.url))}</a>` +
@@ -186,12 +190,17 @@ function webSourcesHtml(web){
     const href = safeHref(web.url); if(!href) return '';
     let links = '';
     if(Array.isArray(web.links) && web.links.length){
-      const items = web.links.slice(0,6).map(l=>{
+      // Page links can genuinely number in the hundreds, so this one stays bounded — but
+      // it now says "6 of 240 shown" instead of pretending the list ended (AUDIT #9).
+      const LINK_CAP = 12;
+      const total = web.links.length;
+      const items = web.links.slice(0,LINK_CAP).map(l=>{
         const h = safeHref(l.url); if(!h) return '';
         return `<li class="truncate"><a href="${esc(h)}" target="_blank" rel="noopener noreferrer" ` +
           `class="text-sky-400/80 hover:underline">${esc(l.text || hostOf(l.url))}</a></li>`;
       }).join('');
-      if(items) links = `<ul class="list-disc pl-4 mt-1 space-y-0.5">${items}</ul>`;
+      if(items) links = `<ul class="list-disc pl-4 mt-1 space-y-0.5">${items}</ul>` +
+        (total > LINK_CAP ? `<div class="text-slate-500 mt-0.5">showing ${LINK_CAP} of ${total} links on the page</div>` : '');
     }
     return `<div class="mt-1 text-[11px] font-sans"><span class="text-slate-400">🌐 ` +
       `<a href="${esc(href)}" target="_blank" rel="noopener noreferrer" class="text-sky-400 hover:underline">${esc(T('chat.web_read','read page'))}: ${esc(hostOf(web.url))}</a>${badge}</span>${links}</div>`;
@@ -372,7 +381,9 @@ async function openConversation(id){
   let arts = [];
   try { arts = await (await api(`/api/artifacts?conversation_id=${S.convId||''}`)).json(); } catch(e){ arts = []; }
   const byName = {};
-  for(const a of arts){ if(!byName[a.filename]) byName[a.filename] = a; }
+  const byId = {};
+  for(const a of arts){ if(!byName[a.filename]) byName[a.filename] = a;
+                        if(a.id) byId[String(a.id)] = a; }
   const shownDl = new Set();
   for (const m of hist){
     if (m.role === 'user') {
@@ -410,12 +421,30 @@ async function openConversation(id){
     // Web tools persist their structured sources in meta.web — re-render the
     // clickable links here so sources stay checkable after a page reload.
     if(metaObj.web) attachWebSources(chip, metaObj.web);
+    // display_media: same bubbles as the live stream, rebuilt from the persisted
+    // `display` list (see orchestrator._tool_row_meta). Without this, anything the model
+    // showed you would vanish on refresh — the chip alone is left implying it displayed
+    // something it never did.
+    if(m.ok !== false && Array.isArray(metaObj.display) && metaObj.display.length){
+      addMediaBubble(metaObj.display, metaObj.display_caption || '', m.created_at);
+    }
     // Only file-offering tools draw a button; fs_write rows never do.
     if((nm === 'upload' || nm === 'zip_pack') && m.ok !== false){
-      const mm = /(?:ready for download|packed .*? into)\s+(\S+)/i.exec(m.content || '');
-      const name = mm && mm[1];
-      const art = name && byName[name];
-      if(art && !shownDl.has(name)){ shownDl.add(name); addDownload({url: art.download_url, name}); }
+      // Resolve by ARTIFACT ID first — the server now persists meta.download on the tool
+      // row (see orchestrator._tool_row_meta). The old path scraped the filename out of
+      // the message text and matched it against a first-wins byName map, which handed the
+      // second `report.pdf` in a conversation the first one's link and lost the button for
+      // any file renamed afterwards (AUDIT #10). Kept as a fallback only for rows written
+      // before ids were stored.
+      let art = null, key = null;
+      const dl = metaObj.download || {};
+      if(dl.artifact_id){ art = byId[String(dl.artifact_id)] || null; key = 'id:' + dl.artifact_id; }
+      if(!art){
+        const mm = /(?:ready for download|packed .*? into)\s+(\S+)/i.exec(m.content || '');
+        const name = (dl.name) || (mm && mm[1]);
+        if(name && byName[name]){ art = byName[name]; key = 'name:' + name; }
+      }
+      if(art && !shownDl.has(key)){ shownDl.add(key); addDownload({url: art.download_url, name: dl.name || art.filename}); }
     }
   }
   loadArtifacts(); loadContextUsage();
@@ -645,6 +674,12 @@ async function handleEvent(ev, state){
       // growing write buffer so long fs_writes never look like a hang.
       toolProgress(ev, state); break; }
     case 'notice': {
+      // A configured backend that silently became a stub is the loudest lie the server can
+      // tell: answers look real. Rendered as a persistent bubble, not an activity line.
+      if(ev.kind === 'provider_fallback'){
+        addMsg('assistant', `<span class="text-amber-400">⚠ ${esc(ev.text || '')}</span>`);
+        break;
+      }
       // Server-side progress that is not a tool call: describing an attached recording with
       // the captioner model takes real time (ffmpeg + listening), and without any signal it
       // is indistinguishable from a hang. The start/done pair is one activity line; the
@@ -707,6 +742,13 @@ async function handleEvent(ev, state){
       // Web tools: render clickable source links under the chip so the user can
       // verify what the model actually read (meta.web — see webSourcesHtml).
       if(ev.meta && ev.meta.web) attachWebSources(chip, ev.meta.web);
+      // display_media: the file goes on screen in its own bubble AFTER the chip, so the
+      // transcript reads "tool ran → here is the thing". Same meta shape as the persisted
+      // row's `display` key, which openConversation() re-renders from — live and reload
+      // must not disagree about what was shown.
+      if(ev.ok && ev.meta && Array.isArray(ev.meta.media) && ev.meta.media.length){
+        addMediaBubble(ev.meta.media, ev.meta.caption || '', null);
+      }
       const i = (state.pending || []).findIndex(p => p.dataset.tool === ev.name);
       if(i >= 0){ (state.pending.splice(i,1)[0]).remove(); }
       finishProgress(ev.name, state, ev.round);
@@ -771,6 +813,182 @@ function addDownload(dl){
   el.href = dl.url; el.className='inline-flex items-center gap-2 text-sm bg-emerald-700/50 hover:bg-emerald-600/50 border border-emerald-600 rounded-lg px-3 py-1.5 max-w-[85%]';
   el.innerHTML = `⬇ ${esc(dl.name)}`; msgsEl.appendChild(el); scrollToBottom(true);
 }
+
+// ---- display_media: media shown to the USER in its own bubble ---------------
+// The other direction from DEC-052: those images go to the model, these go to the
+// human. Files arrive as workspace paths + /api/artifact/{id} URLs, so the browser
+// fetches them through the route that already enforces ownership and decrypts at rest
+// — no base64 in the transcript, no new endpoint, nothing to authorise separately.
+//
+// CSP: media-src 'self' blob: is set explicitly in main.py (DEC-077). Same origin as
+// the default-src fallback it replaces, so nothing is widened; it exists because some
+// browsers re-check a fullscreened element's subresource loads against the top-level
+// document's policy, which is how a same-origin <video> goes black on ⛶. Keep it
+// origin-limited — selftest asserts it never becomes a wildcard.
+//
+// Full screen is the browser's own API on the media element itself — no viewer to
+// build, so playback keeps working, Esc works, and an unsupported container degrades
+// to whatever Chrome/Safari do natively rather than to a broken custom overlay.
+function mediaSrc(item){
+  // Prefer the artifact URL (durable, ownership-checked). Fall back to nothing if it is
+  // absent: a raw workspace path is NOT fetchable and guessing one would leak a 404 as
+  // a broken thumbnail with no explanation.
+  return (item && typeof item.url === 'string' && /^\/api\/artifact\//.test(item.url)) ? item.url : null;
+}
+
+function addMediaBubble(media, caption, ts){
+  const items = (media || []).filter(it => it && it.path);
+  if(!items.length) return null;
+  const T = (k, fb) => (window.I18N && I18N.t(k)) || fb;
+
+  const wrap = document.createElement('div');
+  wrap.className = 'flex justify-start';
+  wrap.setAttribute('data-ts', String(ts || Math.floor(Date.now()/1000)));
+
+  const box = document.createElement('div');
+  box.className = 'media-bubble max-w-[85%] rounded-2xl border border-slate-700 bg-slate-800/70 p-2 text-sm';
+
+  if(caption){
+    const c = document.createElement('div');
+    c.className = 'px-1 pb-2 text-[12px] text-slate-300 leading-snug break-words';
+    c.textContent = caption;   // textContent: a caption is model output, never markup
+    box.appendChild(c);
+  }
+
+  const grid = document.createElement('div');
+  // A single file fills the bubble; several become a compact grid so four pictures do not
+  // stack into four screens of scrolling. Classes are written out literally (not built) —
+  // the vendored Tailwind build only ships utilities it has seen in source.
+  grid.className = items.length > 1 ? 'grid grid-cols-2 gap-2' : 'flex flex-col gap-2';
+  box.appendChild(grid);
+
+  for(const it of items){
+    const cell = document.createElement('div');
+    cell.className = 'media-cell min-w-0';
+    const src = mediaSrc(it);
+    const name = it.name || (String(it.path).split('/').pop() || 'file');
+    const kind = it.kind || 'image';
+
+    if(!src){
+      cell.innerHTML = `<div class="text-[12px] text-amber-300 px-1 py-2">${esc(name)} — ${esc(T('chat.media_missing','This file is no longer in your workspace.'))}</div>`;
+      grid.appendChild(cell); continue;
+    }
+
+    let el;
+    if(kind === 'image'){
+      el = document.createElement('img');
+      el.src = src; el.alt = name; el.loading = 'lazy'; el.decoding = 'async';
+      // Cursor says "click to enlarge" before the user tries it, and keyboard users get
+      // the same affordance (Enter/Space on a focused role=button fires click).
+      el.className = 'w-full h-auto rounded-lg cursor-zoom-in bg-slate-900/40';
+      el.setAttribute('role', 'button');
+      el.tabIndex = 0;
+      el.title = T('chat.media_fullscreen','Full screen');
+    } else if(kind === 'video'){
+      el = document.createElement('video');
+      el.src = src; el.controls = true; el.preload = 'metadata';
+      el.setAttribute('playsinline', '');   // iPhone: play in place, not a forced native overlay
+      el.className = 'w-full max-h-[60vh] rounded-lg bg-black';
+    } else {
+      el = document.createElement('audio');
+      el.src = src; el.controls = true; el.preload = 'metadata';
+      el.className = 'w-full min-w-[12rem]';
+    }
+
+    // A file that 404s (deleted since it was shown) otherwise leaves a grey void or the
+    // browser's broken-image icon. Say what happened, and keep the name readable.
+    const die = () => {
+      const note = document.createElement('div');
+      note.className = 'text-[12px] text-amber-300 px-1 py-2 break-words';
+      note.textContent = `${name} — ${T('chat.media_missing','This file is no longer in your workspace.')}`;
+      cell.textContent = ''; cell.appendChild(note);
+    };
+    el.addEventListener('error', die);
+
+    const bar = document.createElement('div');
+    bar.className = 'flex items-center gap-1 mt-1 min-w-0';
+    const label = document.createElement('span');
+    label.className = 'truncate text-[11px] text-slate-400 flex-1 min-w-0';
+    label.textContent = name;
+    label.title = it.path || name;
+    bar.appendChild(label);
+
+    // Full screen only for things that have a fullscreen presentation: images and video.
+    // Audio has no picture to enlarge — its own controls are the whole UI.
+    if(kind === 'image' || kind === 'video'){
+      const fs = document.createElement('button');
+      fs.type = 'button';
+      fs.className = 'shrink-0 rounded-lg bg-slate-700/70 hover:bg-slate-600 px-2 py-1 text-[11px] leading-none';
+      fs.title = T('chat.media_fullscreen','Full screen');
+      fs.setAttribute('aria-label', T('chat.media_fullscreen','Full screen'));
+      fs.textContent = '⛶';
+      fs.onclick = (e) => { e.stopPropagation(); openMediaFullscreen(el, name); };
+      bar.appendChild(fs);
+    }
+
+    if(kind === 'image'){
+      // Click the picture itself to enlarge — the affordance people expect.
+      el.addEventListener('click', () => openMediaFullscreen(el, name));
+      el.addEventListener('keydown', (e) => {
+        if(e.key === 'Enter' || e.key === ' '){ e.preventDefault(); openMediaFullscreen(el, name); }
+      });
+    }
+
+    // Download as its OWN anchor, never a wrapper around the media: nesting an <a> round
+    // an <img>/<video> makes the whole element a download link (so clicking to view would
+    // save instead), and nested interactive content is invalid HTML anyway.
+    const dl = document.createElement('a');
+    dl.href = src; dl.download = name;
+    dl.className = 'shrink-0 rounded-lg bg-slate-700/70 hover:bg-slate-600 px-2 py-1 text-[11px] leading-none';
+    dl.title = T('chat.media_download','Download');
+    dl.setAttribute('aria-label', T('chat.media_download','Download'));
+    dl.textContent = '⬇';
+    bar.appendChild(dl);
+
+    cell.appendChild(el); cell.appendChild(bar); grid.appendChild(cell);
+  }
+
+  wrap.appendChild(box);
+  if(PREFS.show_timestamps) stampTime(box, parseInt(wrap.getAttribute('data-ts'),10));
+  msgsEl.appendChild(wrap); scrollToBottom();
+  return box;
+}
+
+// Show an existing media element full screen using the browser's native fullscreen.
+// We move NOTHING in the DOM: requestFullscreen on the live <img>/<video> composites
+// it over the whole screen, so there is no clone to keep in sync, no player state to
+// re-attach, and Esc / ⌃⌘F behave exactly as the OS expects.
+//
+// The fallback matters: iOS Safari does not support requestFullscreen on ordinary
+// elements at all — it rejects the promise, and a rejected click that says nothing is
+// indistinguishable from a broken button. So if fullscreen did not actually engage, we
+// open the file in its own tab instead, which every browser can present (and iOS plays
+// video/audio natively there). Nothing here can leave the user with a dead click.
+function openMediaFullscreen(el, name){
+  if(!el) return;
+  const req = el.requestFullscreen || el.webkitRequestFullscreen || el.webkitRequestFullScreen;
+  const fallback = () => {
+    const src = el.currentSrc || el.src;
+    // Only same-origin artifact URLs — never a javascript:/data: navigation.
+    if(typeof src === 'string' && /^\/api\/artifact\//.test(src)){
+      window.open(src, '_blank', 'noopener');
+    }
+  };
+  if(!req){ fallback(); return; }
+  let settled = false;
+  const engaged = () => document.fullscreenElement === el ||
+                        document.webkitFullscreenElement === el;
+  try {
+    const p = req.call(el);
+    if(p && p.then){
+      p.then(() => { settled = true; if(!engaged()) fallback(); })
+       .catch(() => { settled = true; fallback(); });
+    }
+  } catch(e){ settled = true; fallback(); return; }
+  // Some engines resolve nothing and simply do not enter fullscreen; confirm out of band.
+  setTimeout(() => { if(!settled && !engaged()){ settled = true; fallback(); } }, 700);
+}
+
 
 function renderActionRequired(ev){
   const T = (k, fb) => (window.I18N && I18N.t(k)) || fb;
@@ -854,7 +1072,11 @@ function findArtifact(id){
 // Files are uploaded immediately to get an artifact_id, but held in S.attachments
 // and only referenced by the message when the user hits Send. This prevents the
 // model from reacting to each file separately.
-const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
+// The limit is the server's (Admin → Agent → Uploads). This value is only a pre-flight
+// guess used before the first response tells us the real one — /api/upload replies with
+// `max_bytes`, and we cache it so the client never hard-codes a second copy that could
+// disagree with the backend (AUDIT #8: 25 MiB was duplicated here verbatim).
+let MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
 
 async function stageFiles(fileList){
   const files = Array.from(fileList||[]); if(!files.length) return;
@@ -862,7 +1084,7 @@ async function stageFiles(fileList){
   for(const f of files){
     // Client-side size pre-check for a clear message before hitting the server.
     if(f.size > MAX_UPLOAD_BYTES){
-      addMsg('assistant', `<span class="text-red-400">${esc(f.name)}: ${I18N.t('chat.upload_too_big','File too large (over 25 MB)')}</span>`);
+      addMsg('assistant', `<span class="text-red-400">${esc(f.name)}: ${I18N.t('chat.upload_too_big','File too large (over the upload limit)')} — ${Math.round(MAX_UPLOAD_BYTES/1048576)} MB</span>`);
       continue;
     }
     const fd = new FormData();
@@ -881,9 +1103,17 @@ async function stageFiles(fileList){
         try { const e = await r.json(); msg = (e && (e.detail||e.error)) || msg; } catch(_) {}
         addMsg('assistant', `<span class="text-red-400">${esc(msg)}</span>`); continue;
       }
-      const arts = (await r.json()).artifacts || [];
+      const resp = await r.json();
+      // Learn the real limit from the server so this client and the backend cannot drift.
+      if(resp && resp.max_bytes){ MAX_UPLOAD_BYTES = resp.max_bytes; }
+      const arts = resp.artifacts || [];
       for(const a of arts){
         S.attachments.push({ artifact_id:a.id, name:a.filename, mime:a.mime });
+        // Say so when an attach DESTROYED different bytes rather than adding a file. The
+        // server always replaced before; it simply never mentioned it (AUDIT #2).
+        if(a.replaced_different_content){
+          addMsg('assistant', `<span class="text-amber-400">${esc(a.filename)}: ${I18N.t('chat.upload_replaced','a file with this name already existed and was replaced — its previous contents are gone')}</span>`);
+        }
       }
       renderAttachStrip(); loadArtifacts();
     } catch(err){ addMsg('assistant', `<span class="text-red-400">${esc(String(err))}</span>`); }

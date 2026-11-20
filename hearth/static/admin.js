@@ -378,7 +378,7 @@ async function renderModel(){
 }
 
 async function renderTools(){
-  const groups = [['tools-fs','Filesystem'],['tools-project','Linked project folder'],['tools-web','Web'],['tools-media','Media (PDF / video)'],['tools-audio','Audio'],['tools-image','Image generation'],['tools-sys','System & exec'],['tools-device','Device']];
+  const groups = [['tools-fs','Filesystem'],['tools-project','Linked project folder'],['tools-web','Web'],['tools-media','Media (PDF / video)'],['tools-audio','Audio'],['tools-image','Image generation & display'],['tools-sys','System & exec'],['tools-device','Device']];
   let html = `<p class="text-xs text-slate-400 mb-3">Each tool has its own enable switch and approval mode ('auto' runs silently, 'ask' shows an approve/deny card per call). Legacy coarse toggles stay as fallbacks for older stored settings.</p>`;
   for (const [g,label] of groups){
     const specs = SPECS.filter(s=>s.group===g);
@@ -388,7 +388,8 @@ async function renderTools(){
       html += `<div class="text-[11px] text-slate-500 mt-1">A linked folder is copied into the workspace under <code>project/</code>, where the ordinary file tools edit it. "Apply" is the only action that writes to the real folder — it always asks first, refuses if the user changed a file meanwhile, and backs up everything it overwrites. Link folders under <b>Project</b>.</div>`;
     }
     if (g==='tools-image'){
-      html += `<div class="text-[11px] text-slate-500 mt-1">Needs the binary + model set under <b>Images</b>. Each call loads the model, draws, and exits — no server, but a cold load costs time, which is why approval defaults to <code>ask</code>. Pictures land in <code>generated/</code> and are shown back to the model.</div>`;
+      html += `<div class="text-[11px] text-slate-500 mt-1">Needs the binary + model set under <b>Images</b>. Each call loads the model, draws/edits, and exits — no server, but a cold load costs time, which is why approval defaults to <code>ask</code>. Pictures land in <code>generated/</code> and are shown back to the model. <b>Generate</b> draws from text (Qwen Image); <b>Edit</b> transforms an existing picture by instruction (Qwen Image Edit) — a separate model slot, set up under Images.</div>` +
+              `<div class="text-[11px] text-slate-500 mt-1"><b>Display media in chat</b> is the other half: it puts a file that already exists in the workspace on screen for the <i>user</i> (image, audio or video, with full screen and download). Read-only and approval <code>auto</code>, so switching it off only removes the ability to show things — nothing else breaks.</div>`;
     }
     if (g==='tools-device'){
       html += `<div class="text-[11px] text-slate-500 mt-1">Device tools need BOTH a helper URL above and the user's "Allow device access" button in the chat header — unless that requirement is switched off under Agent. User uploads and downloads are unaffected by either.</div>`;
@@ -490,79 +491,173 @@ async function renderAudio(){
   }, {elapsed:'captioning a 2-second test tone', keepElapsed:1000});
 }
 
-// ---- Images tab (stable-diffusion.cpp) --------------------------------------
-// A third model kind, but with no server: `sd-cli` runs per call and exits, so there is
-// nothing to Start/Stop. What an admin needs to see instead is whether the FILES exist and
-// whether one generation actually produces a PNG — which is what "Draw a test image" proves.
-async function renderImages(){
-  const specs = SPECS.filter(s=>s.group==='diffusion');
-  let ds = null;
-  try { ds = await (await api('/api/admin/diffusion/status')).json(); } catch(e){ ds = null; }
+// ---- Images tab (Qwen Image via stable-diffusion.cpp) ------------------------
+// Two model slots share this tab and the same sd-cli binary/runner: Qwen Image for DRAWING
+// and Qwen Image Edit for EDITING. Neither has a server (`sd-cli` runs per call and exits), so
+// what an admin needs is whether each required file is present (one tile per file, since
+// "model: missing" never said WHICH) and whether one run actually produces a PNG — which is
+// what the test buttons prove. The two profiles are configured independently; only the CLI
+// binary is shared (editing falls back to the generation path when its own is blank).
+const IMG_TILE = (k, val, sub, col) => `
+  <div class="rounded-lg border p-2.5 ${col==='ok'?'border-emerald-700/60 bg-emerald-900/20':'border-slate-700 bg-slate-800/40'}">
+    <div class="stat-k">${esc(k)}</div>
+    <div class="mt-1 flex items-center gap-2 font-medium ${col==='ok'?'text-emerald-400':col==='warn'?'text-amber-400':'text-slate-300'}">
+      <span aria-hidden="true">${col==='ok'?'●':col==='warn'?'◍':'○'}</span>${esc(val)}
+    </div>
+    <div class="text-[11px] text-slate-400 mt-0.5 break-all">${sub}</div>
+  </div>`;
 
-  const binOk = !!(ds && ds.capabilities && ds.capabilities.cli_present);
-  const modelOk = !!(ds && ds.capabilities && ds.capabilities.model_present);
-  const on = !!(ds && ds.enabled);
-  const busy = !!(ds && ds.capabilities && ds.capabilities.busy);
+// One tile per file a profile declares, named by role and saying WHERE it came from (an admin
+// who set explicit paths then moved the files needs to know which source is stale). Roles in
+// `required` that are missing read as amber; an unset OPTIONAL role (edit's llm_vision) shows
+// grey "optional" rather than a warning, because leaving it blank is correct for most checkpoints.
+function imgFileTiles(ds, required){
+  const present = (ds && ds.present) || {};
+  const paths = (ds && ds.paths) || {};
+  const sources = (ds && ds.sources) || {};
+  const labels = (ds && ds.labels) || {};
+  const req = new Set(required || Object.keys(labels));
+  return Object.keys(labels).map(role=>{
+    const ok = !!present[role];
+    const p = paths[role] || '';
+    const isReq = req.has(role);
+    const src = sources[role]==='folder' ? 'found in the model folder'
+              : sources[role]==='setting' ? 'your explicit path'
+              : sources[role]==='env' ? 'from the environment'
+              : sources[role]==='legacy' ? 'from an older Hearth setting'
+              : (isReq ? 'not set' : 'optional — not set');
+    const col = ok ? 'ok' : (isReq ? 'warn' : '');
+    const val = ok ? 'found' : (p ? 'missing' : (isReq ? 'not set' : 'optional'));
+    return IMG_TILE(labels[role] || role, val,
+                    p ? `<span title="${esc(p)}">${esc(p.split('/').pop())}</span> · ${esc(src)}`
+                      : esc(src),
+                    col);
+  }).join('');
+}
+
+// Render one profile's status tiles + hint + action buttons. `cfg` carries the endpoint paths,
+// the intro sentence, and unique element-id prefixes so both profiles can coexist in one panel.
+function imgProfileBlock(cfg){
+  const ds = cfg.ds || {};
+  const binOk = !!(ds.capabilities && ds.capabilities.cli_present);
+  const allOk = !!ds.configured;
+  const on = !!ds.enabled;
+  const busy = !!(ds.capabilities && ds.capabilities.busy);
   const BTN = 'rounded-lg px-3 py-1.5 text-xs disabled:opacity-50 disabled:cursor-not-allowed';
-
-  const tile = (k, val, sub, col) => `
-    <div class="rounded-lg border p-2.5 ${col==='ok'?'border-emerald-700/60 bg-emerald-900/20':'border-slate-700 bg-slate-800/40'}">
-      <div class="stat-k">${esc(k)}</div>
-      <div class="mt-1 flex items-center gap-2 font-medium ${col==='ok'?'text-emerald-400':col==='warn'?'text-amber-400':'text-slate-300'}">
-        <span aria-hidden="true">${col==='ok'?'●':col==='warn'?'◍':'○'}</span>${esc(val)}
-      </div>
-      <div class="text-[11px] text-slate-400 mt-0.5">${esc(sub)}</div>
+  const idp = cfg.idPrefix;
+  return `
+    <div class="grid grid-cols-2 md:grid-cols-3 gap-2 mb-3 text-sm">
+      ${IMG_TILE('Switch', on?'enabled':'disabled', 'the tool is offered at all', on?'ok':'')}
+      ${IMG_TILE('sd-cli binary', binOk?'found':'not found', cfg.binHint, binOk?'ok':'warn')}
+      ${IMG_TILE('Now', busy?'busy':'idle', 'one run at a time (shared)', busy?'warn':'')}
+    </div>
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-2 mb-4 text-sm">${imgFileTiles(ds, cfg.requiredRoles)}</div>
+    ${(ds.hint) ? `<div class="mb-4 rounded-lg border border-amber-700/60 bg-amber-900/20 p-3 text-xs text-amber-300">⚠ ${esc(ds.hint)}</div>`:''}
+    ${(ds.model_dir && !ds.hint) ? `<div class="mb-4 rounded-lg border border-emerald-800/50 bg-emerald-900/10 p-3 text-xs text-emerald-300">✓ Ready. Model folder: <span class="font-mono break-all">${esc(ds.model_dir)}</span></div>`:''}
+    <div class="flex flex-wrap items-center gap-2 mb-4">
+      <button id="${idp}Test" class="${BTN} bg-sky-800 hover:bg-sky-700 border border-sky-700" ${allOk?'':'title="Set the model files first"'}>${cfg.testLabel}</button>
+      <button id="${idp}Copy" class="${BTN} bg-slate-800 hover:bg-slate-700 border border-slate-700">Copy the sd-cli command</button>
     </div>`;
+}
+
+async function renderImages(){
+  const genSpecs = SPECS.filter(s=>s.group==='diffusion');
+  const editSpecs = SPECS.filter(s=>s.group==='image_edit');
+  // Ordered so each profile's settings read top-to-bottom in the order that matters:
+  // enable → binary → folder → the model files → sampling → limits.
+  const GEN_ORDER = ['diffusion.enabled','diffusion.cli_bin','diffusion.model_dir',
+                     'diffusion.dit_path','diffusion.llm_path','diffusion.vae_path'];
+  const EDIT_ORDER = ['image_edit.enabled','image_edit.cli_bin','image_edit.model_dir',
+                      'image_edit.dit_path','image_edit.llm_path','image_edit.vae_path',
+                      'image_edit.llm_vision_path','image_edit.zero_cond_t'];
+  const byOrder = (specs, order) => specs.slice().sort((a,b)=>{
+    const ai = order.indexOf(a.key), bi = order.indexOf(b.key);
+    return (ai<0?99:ai)-(bi<0?99:bi);
+  });
+
+  let genDs=null, editDs=null;
+  try { genDs = await (await api('/api/admin/diffusion/status')).json(); } catch(e){ genDs = null; }
+  try { editDs = await (await api('/api/admin/image_edit/status')).json(); } catch(e){ editDs = null; }
 
   $('panel').innerHTML = `
-    <p class="text-xs text-slate-400 mb-3">Hearth can draw pictures by running stable-diffusion.cpp's <code>sd-cli</code> as a subprocess. There is no server to keep running: each generation loads the model, draws, and exits — so it never competes with the chat model for a port, but a cold load does cost time. The finished image comes back to the chat model, which is how it can tell you what it actually drew.</p>
-    <div class="grid grid-cols-2 md:grid-cols-4 gap-2 mb-4 text-sm">
-      ${tile('Switch', on?'enabled':'disabled', 'the tool is offered at all', on?'ok':'')}
-      ${tile('sd-cli binary', binOk?'found':'not found', 'Admin → Images → CLI path', binOk?'ok':'warn')}
-      ${tile('Model file', modelOk?'found':(ds&&ds.model_path?'missing':'not set'), 'the .gguf to draw with', modelOk?'ok':'warn')}
-      ${tile('Now', busy?'generating':'idle', 'one generation at a time', busy?'warn':'')}
-    </div>
-    ${(ds && ds.hint) ? `<div class="mb-4 rounded-lg border border-amber-700/60 bg-amber-900/20 p-3 text-xs text-amber-300">⚠ ${esc(ds.hint)}</div>`:''}
-    <div class="flex flex-wrap items-center gap-2 mb-4">
-      <button id="saveImg" class="${BTN} bg-sky-600 hover:bg-sky-500 text-sm px-4 py-2">Save</button>
-      <button id="testImg" class="${BTN} bg-sky-800 hover:bg-sky-700 border border-sky-700">🖼 Draw a test image</button>
-      <button id="copyImgCmd" class="${BTN} bg-slate-800 hover:bg-slate-700 border border-slate-700">Copy the sd-cli command</button>
-    </div>
+    <p class="text-xs text-slate-400 mb-3">Hearth draws and edits pictures with stable-diffusion.cpp's <code>sd-cli</code>, run as a subprocess. There is no server to keep running: each call loads the model, works, and exits — so it never competes with the chat model for a port, but a cold load costs time. The finished image comes back to the chat model, which is how it can tell you what it actually made. Sampling flags (euler, flash attention) are fixed to values proven to work.</p>
+
+    <h3 class="font-medium text-sm mt-2 mb-1">🎨 Image generation — Qwen Image / 2.1</h3>
+    <p class="text-[11px] text-slate-500 mb-3">Draws from a text prompt. Needs the CLI path and three files (DiT + Qwen3-VL encoder + VAE).</p>
+    ${imgProfileBlock({ds: genDs, idPrefix:'gen', requiredRoles:['dit','llm','vae'],
+                       binHint:'the generation CLI path below', testLabel:'🖼 Draw a test image'})}
+
+    <hr class="border-slate-700 my-5"/>
+
+    <h3 class="font-medium text-sm mb-1">✂️ Image editing — Qwen Image Edit</h3>
+    <p class="text-[11px] text-slate-500 mb-3">Edits an existing picture by instruction (add/remove/change, restyle, edit text) while keeping the rest. A separate model slot with its own files (Edit DiT + Qwen2.5-VL encoder + VAE; optional vision mmproj for 2509). Uses the same sd-cli binary — leave its CLI path blank to reuse the generation one.</p>
+    ${imgProfileBlock({ds: editDs, idPrefix:'edit', requiredRoles:['dit','llm','vae'],
+                       binHint:'blank reuses the generation CLI path', testLabel:'✂️ Test an edit'})}
+
     <div id="imgBusy" class="hidden text-xs text-sky-300 mb-3"></div>
     <div id="imgOut" class="hidden mb-4 rounded-lg border border-slate-700 bg-black/40 p-3 text-[11px] font-mono whitespace-pre-wrap break-words max-h-48 overflow-auto"></div>
-    ${fieldsSafe(specs)}
-    <button id="saveImg2" class="mt-4 rounded-lg bg-sky-600 px-4 py-2 text-sm">Save</button>`;
 
-  const save = beginOp($('saveImg'), 'Saving…', ()=> saveSettings(specs), {status:'imgBusy'});
-  $('saveImg').onclick = save;
-  $('saveImg2').onclick = beginOp($('saveImg2'), 'Saving…', ()=> saveSettings(specs), {status:'imgBusy'});
+    ${fieldsSafe(byOrder(genSpecs, GEN_ORDER))}
+    <hr class="border-slate-700 my-5"/>
+    ${fieldsSafe(byOrder(editSpecs, EDIT_ORDER))}
+    <button id="saveImg" class="mt-4 rounded-lg bg-sky-600 px-4 py-2 text-sm">Save</button>`;
 
-  const t = $('testImg');
-  if (t) t.onclick = beginOp(t, 'Drawing…', async ()=>{
+  const allSpecs = genSpecs.concat(editSpecs);
+  $('saveImg').onclick = beginOp($('saveImg'), 'Saving…', ()=> saveSettings(allSpecs), {status:'imgBusy'});
+
+  // Generation test — draws a tiny picture.
+  const gt = $('genTest');
+  if (gt) gt.onclick = beginOp(gt, 'Drawing…', async ()=>{
     const box = $('imgOut'); let d=null;
     try { d = await (await api('/api/admin/diffusion/test',{method:'POST',body:'{}'})).json(); }
     catch(e){ d={ok:false, note:String(e)}; }
     if(box && d){
       box.classList.remove('hidden');
-      box.textContent = (d.ok ? `✓ drew ${d.image} image(s) in ${d.seconds}s`
+      box.textContent = (d.ok ? `✓ drew ${d.images} image(s) in ${d.seconds}s`
                               : '✗ could not generate:\n') + (d.note || JSON.stringify(d));
     }
-  }, {elapsed:'loading the diffusion model and drawing 256×256 at 4 steps', keepElapsed:1000});
+  }, {elapsed:'loading Qwen Image and drawing a small test picture', keepElapsed:1000});
 
-  const c = $('copyImgCmd');
-  if (c) c.onclick = beginOp(c, 'Loading…', async ()=>{
+  const gc = $('genCopy');
+  if (gc) gc.onclick = beginOp(gc, 'Loading…', async ()=>{
     const box = $('imgOut'); let d=null;
     try { d = await (await api('/api/admin/diffusion/command')).json(); } catch(e){ d={ok:false, note:String(e)};}
+    if(box && d){ box.classList.remove('hidden'); box.textContent = d.ok ? d.command : ('⚠ '+(d.note||'no command')); }
+  });
+
+  // Edit test — edits a tiny synthetic image (needs Pillow on the server).
+  const et = $('editTest');
+  if (et) et.onclick = beginOp(et, 'Editing…', async ()=>{
+    const box = $('imgOut'); let d=null;
+    try { d = await (await api('/api/admin/image_edit/test',{method:'POST',body:'{}'})).json(); }
+    catch(e){ d={ok:false, note:String(e)}; }
+    if(box && d){
+      box.classList.remove('hidden');
+      box.textContent = (d.ok ? `✓ edited ${d.images} image(s) in ${d.seconds}s`
+                              : '✗ could not edit:\n') + (d.note || JSON.stringify(d));
+    }
+  }, {elapsed:'loading Qwen Image Edit and editing a small test picture', keepElapsed:1000});
+
+  const ec = $('editCopy');
+  if (ec) ec.onclick = beginOp(ec, 'Loading…', async ()=>{
+    const box = $('imgOut'); let d=null;
+    try { d = await (await api('/api/admin/image_edit/command')).json(); } catch(e){ d={ok:false, note:String(e)};}
     if(box && d){ box.classList.remove('hidden'); box.textContent = d.ok ? d.command : ('⚠ '+(d.note||'no command')); }
   });
 }
 
 async function renderAgent(){  const specs = SPECS.filter(s=>s.group==='agent');
+  // Uploads live in their own group so the size cap is not buried among agent levers;
+  // it used to be a source constant with no admin surface at all (AUDIT #8).
+  const upSpecs = SPECS.filter(s=>s.group==='uploads');
   $('panel').innerHTML = `
     <p class="text-xs text-slate-400 mb-3">How much leeway one chat turn gets. The tool-step cap is the main guard against a model that keeps calling tools instead of answering.</p>`
     + fieldsSafe(specs)
+    + (upSpecs.length ? `<h3 class="font-medium text-sm mt-5 mb-1">Uploads</h3>
+      <div class="text-[11px] text-slate-500 mb-2">Applies to every file attached in chat; the chat UI reads this limit rather than carrying its own copy.</div>`
+      + fieldsSafe(upSpecs) : '')
     + `<button id="saveAgent" class="mt-4 rounded-lg bg-sky-600 px-4 py-2 text-sm">Save</button>`;
-  $('saveAgent').onclick = beginOp($('saveAgent'), 'Saving…', ()=> saveSettings(specs));
+  $('saveAgent').onclick = beginOp($('saveAgent'), 'Saving…', ()=> saveSettings(specs.concat(upSpecs)));
 }
 
 async function saveSettings(specs){

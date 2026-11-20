@@ -160,3 +160,47 @@ interleaving history.
 - **routes_chat.py → delete_artifact** — gained `{purge:bool}`. Row-only deletion was the original behaviour
   and left the bytes in the jail unreachable; `purge:true` removes the file through `ws.resolve_in_jail()`
   (never a raw path) and reports `file_deleted`. Audit action `artifact_delete` records path + purged flag.
+
+
+## Session-12 components (`display_media` — media for the user, not the model)
+- **tools/display_media.py** — `media_kind()` is the single classifier (extension → image/audio/video/''),
+  used by both the tool and the orchestrator so "displayable" cannot mean two things. The tool jail-checks
+  every path, refuses non-presentational files by name, registers each survivor as an artifact, and returns
+  `meta.media`. It deliberately sets **no** `ToolResult.images`: that field is the model's pixel channel and
+  replay derives it from `meta.display` instead (DEC-077).
+- **orchestrator.py** — `_tool_row_meta()` persists display files under `display`/`display_caption`;
+  `_ui_meta()` mirrors them as `media` so live and reloaded views agree; `_display_image_items()` splits the
+  persisted list at replay into images the projector can use and names of files it cannot, appending the
+  latter as plain text. Reads still resolve through `workspaces`, and `resolve_in_jail()`'s `Path` return is
+  never treated as a boolean (`bool(Path("."))` is False).
+- **routes_chat.py** — unchanged by design: media loads from the existing `/api/artifact/{id}` route, which
+  enforces ownership and decrypts at rest. No new endpoint, no token, no separate authorisation surface.
+- **main.py** — CSP gains `media-src 'self' blob:` (origin-limited; asserted non-wildcard in selftest) so
+  fullscreen media keeps loading its own stream.
+- **chat.js** — `addMediaBubble()` renders one bubble per call (grid when several), native elements only, with
+  ⛶ full screen via `openMediaFullscreen()` and a separate `<a download>` per file; `mediaSrc()` accepts only
+  `/api/artifact/…` URLs. Wired into both the live `tool_result` handler and `openConversation()`'s history
+  replay, so a refresh does not un-display anything.
+- **i18n.py** — `chat.media_*` keys in EN and DE (the parity test catches a missing translation).
+
+
+## Session-13 components (`edit_image` — Qwen Image Edit as a second diffusion profile)
+- **diffusion.py** — now carries two `Profile`s sharing one runner/lock/log: `PROFILE_GEN`
+  (`diffusion.*`, byte-for-byte the prior behaviour) and `PROFILE_EDIT` (`image_edit.*`). A `Profile`
+  holds the setting/env prefix, role list + flags, folder-discovery patterns, required-role set, CFG
+  default, optional `--flow-shift`, and a `zero_cond_t` switch. Every backend function takes an
+  optional `profile=` defaulting to generation, so existing callers are unchanged. Editing feeds the
+  input as `-r` (reference conditioning) not `-i` (img2img), samples at CFG 2.5 / `--flow-shift 3`, and
+  emits `--llm_vision` only when that optional file resolves. The two profiles share the busy **lock**
+  (a draw and an edit never overlap on one GPU) but keep separate settings, files, and status. DEC-078.
+- **tools/image_tools.py** — `EditImageTool` (`edit_image`, gated) reuses `StagedImage`/`_store_images`;
+  it jail-checks the input image, decrypts it into a private temp dir, runs the edit profile, and shows
+  the result back to the model like `generate_image`. Names outputs `edit_*` so they never collide with
+  a draw.
+- **routes_admin.py** — `/api/admin/image_edit/{status,command,test}` mirror the generation ones for the
+  edit profile; the test probe synthesises a throwaway PNG (Pillow) because editing needs an input. The
+  Loaded-models listing gains an `image_edit` row only when editing is enabled or configured.
+- **runtime_settings.py** — `IMAGE_EDIT_SPECS` (`image_edit.*`, CFG default 2.5) plus `tools.edit_image`
+  enable/approval (off / ask). The edit CLI binary falls back to the generation one when unset.
+- **static/admin.js** — the Images tab renders both profiles from a shared block helper; an unset
+  optional role reads "optional" not "missing", and each profile has its own test + copy-command buttons.

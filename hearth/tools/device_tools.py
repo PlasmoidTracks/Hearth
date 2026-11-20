@@ -45,6 +45,7 @@ def _gate(ctx) -> str:
 
 class DeviceListTool(Tool):
     name = "device_list"
+    label = "Device folder listing"
     description = ("List files in the user's allow-listed device folder (read-only). Requires a "
                    "paired device helper.")
     setting_key = "tools.device"      # legacy fallback key
@@ -70,6 +71,7 @@ class DeviceListTool(Tool):
 
 class DeviceScreenshotTool(Tool):
     name = "device_screenshot"
+    label = "Device screenshot"
     description = ("Capture a screenshot from the user's paired device (read-only). Requires a "
                    "paired device helper. Returns an image the UI can display.")
     setting_key = "tools.device"      # legacy fallback key

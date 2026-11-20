@@ -101,6 +101,7 @@ def _strip_tags(s: str) -> str:
 
 class WebSearchTool(Tool):
     name = "web_search"
+    label = "Web search"
     description = (
         "Search the web and return titles, URLs, and snippets. Keep the query SHORT: "
         "2-6 keywords, not a natural sentence — long descriptive queries return little "

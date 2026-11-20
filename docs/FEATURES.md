@@ -197,6 +197,46 @@ ceiling for every transcript bubble, and each chip collapses by clicking its hea
 - **Too-large uploads** now report the file name and the 25 MB limit instead of a generic failure.
 - **Model awareness:** the assistant is told which files exist in your workspace, so it can offer to read them.
 
+## Drawing and editing pictures (`generate_image` / `edit_image`)
+The assistant can make images two ways, using models you configure in Admin → Images. Both cost
+minutes of CPU/GPU, so each call asks your approval first, and the finished picture is shown back to
+the model so it can tell you what it actually made rather than describing one it never saw.
+
+- **`generate_image` (Qwen Image / 2.1):** draws a brand-new picture from a text description. Give it
+  a visual prompt; `batch` returns several candidates from one model load, and `init_image` +
+  `strength` restyles an existing workspace image. Needs the CLI path + three files (DiT, Qwen3-VL
+  encoder, VAE).
+- **`edit_image` (Qwen Image Edit):** changes a picture you already have — add/remove/change elements,
+  restyle, rotate, or edit text — while keeping everything you did not mention. Give it a workspace
+  image and an instruction like *"remove the red car"* or *"make the sky a sunset"*. It is a separate
+  model slot with its own files (Edit DiT, Qwen2.5-VL encoder, VAE; optional vision mmproj for the
+  2509 checkpoint) but reuses the same sd-cli binary. Needs it set up under Admin → Images → *Image
+  editing*.
+- **Where they land:** results are saved in `generated/` in your workspace and appear as a download,
+  so you can keep or re-download them later. If a model is not configured, the assistant says exactly
+  what is missing instead of inventing an image.
+
+## Showing media to *you* (`display_media`)
+Everything above shows pictures to the **model**. This is the other direction: the assistant puts a
+file that already exists in your workspace **on your screen**, in its own bubble in the conversation.
+
+- **What it shows:** images inline, video and audio with native playback controls. Up to 8 files per
+  call — one fills the bubble, several arrange into a compact grid — with an optional short caption
+  saying what you are looking at.
+- **Per file you get:** ⛶ full screen (images and video) and ⬇ download, plus the filename. Clicking an
+  image enlarges it; keyboard users can Tab to it and press Enter. Full screen is your browser's own —
+  so Esc closes it and playback keeps working. On iPhone Safari, which does not support element full
+  screen, the file opens in its own tab instead rather than doing nothing.
+- **What it refuses:** anything a browser cannot present (PDFs, text, archives). It says so by name and
+  offers `upload` instead, so you never get a broken placeholder where a file should be.
+- **It is read-only.** It moves nothing, writes nothing, and can only show files in *your own*
+  workspace — media loads through the same ownership-checked download route as every other file, so it
+  adds no new access. Toggle in Admin → Tools → *Image generation & display*.
+- **The assistant does not perceive what it displays.** Showing a clip puts it in front of you, not into
+  the model's context — sending video or audio bytes to an image projector would cost a huge prompt and
+  tell the model nothing. It is told which files are on screen but that it cannot see or hear them, so
+  it won't narrate a video it only displayed; `describe_audio` and `view_video` remain the ways it can.
+
 ## Media: PDFs and video (how it behaves now)
 The assistant can look at documents and video **as images**, so visual information is not lost.
 

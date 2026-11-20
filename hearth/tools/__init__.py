@@ -23,7 +23,8 @@ from .web_fetch import WebFetchTool
 from .time_tool import DateTimeTool
 from .media_tools import PdfInfoTool, PdfReadTool, VideoInfoTool, ViewVideoTool
 from .audio_tools import AudioInfoTool, DescribeAudioTool
-from .image_tools import GenerateImageTool
+from .image_tools import GenerateImageTool, EditImageTool
+from .display_media import DisplayMediaTool
 from .context_tool import ContextUsageTool
 from .device_tools import DeviceListTool, DeviceScreenshotTool
 from .sync_tools import SyncPreviewTool, SyncApplyTool
@@ -166,11 +167,18 @@ _ALL_TOOLS: list[Tool] = [
     PdfInfoTool(), PdfReadTool(), VideoInfoTool(), ViewVideoTool(),
     AudioInfoTool(), DescribeAudioTool(),
     GenerateImageTool(),
+    EditImageTool(),
+    DisplayMediaTool(),
     ContextUsageTool(),
     DeviceListTool(), DeviceScreenshotTool(),
 ]
 
 TOOLS_BY_NAME = {t.name: t for t in _ALL_TOOLS}
+
+# Admin-facing labels, derived from the tool classes (Tool.label). runtime_settings reads
+# this instead of maintaining its own dict keyed by tool name — the second registry that
+# had to be hand-synced whenever a tool was added (AUDIT #17).
+TOOL_LABELS_BY_NAME = {t.name: t.display_label() for t in _ALL_TOOLS}
 
 
 def enabled_tools(settings: dict) -> list[Tool]:

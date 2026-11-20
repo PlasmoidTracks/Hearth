@@ -1,0 +1,10 @@
+HEARTH_HOST=0.0.0.0 HEARTH_COOKIE_SAMESITE=lax HEARTH_PORT=8082 python -m hearth.main
+
+Missing: 
+Abort button
+setting to set max tool uses
+visualization of model doing background works (asked it to create a file and it showed nothing - should show that its writing, and or what its writing in its tool use)
+"Allow device access" does nothing? I could still upload files without it. 
+Starting the llama.cpp server is clunky, should be more straigh forward (start button, instead of reload)
+Missing context usage bar for user
+Missing "retry", "force respond", "talk as agent" buttons

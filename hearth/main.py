@@ -39,11 +39,20 @@ def _add_security_headers(app: FastAPI) -> None:
     from .config import get_boot_settings
     bs = get_boot_settings()
     # frame-ancestors 'none' blocks clickjacking; X-Frame-Options for legacy.
+    #
+    # media-src is set explicitly rather than left to fall back to default-src 'self'.
+    # Same origin either way, so this widens nothing — but fullscreen has a quirk worth
+    # the one directive: when an element goes fullscreen some browsers re-check its
+    # subresource loads against the *top-level* document's policy, which is how a
+    # perfectly same-origin <video> ends up black-and-frozen the moment ⛶ is pressed.
+    # Stating it removes that class of failure from display_media (chat.js
+    # openMediaFullscreen) without loosening any source.
     csp = (
         "default-src 'self'; "
         "script-src 'self'; "
         "style-src 'self' 'unsafe-inline'; "
         "img-src 'self' data: blob:; "
+        "media-src 'self' blob:; "
         "font-src 'self' data:; "
         "connect-src 'self'; "
         "form-action 'self'; "
@@ -70,6 +79,7 @@ def create_app() -> FastAPI:
     init_db()
     _bootstrap_admin()
     _seed_docs()
+    _warn_if_multi_worker()
 
     app = FastAPI(title="Hearth", version="0.1.0")
     _add_security_headers(app)
@@ -121,6 +131,44 @@ def create_app() -> FastAPI:
 
     app.mount("/static", StaticFiles(directory=str(PKG_DIR / "static")), name="static")
     return app
+
+
+def _warn_if_multi_worker() -> None:
+    """Shout, at boot, if this process is one of several that cannot see each other.
+
+    Four pieces of correctness-critical state are module-level dicts: the turn/cancel
+    registry (cancel.py), the steering queue (steering.py), the caption cache
+    (orchestrator._captions) and per-app download tokens. They are per-process by
+    construction, so under `uvicorn --workers 2+` (or gunicorn, or WEB_CONCURRENCY) a
+    request lands in whichever worker handles it:
+
+      * POST /api/chat/abort can answer aborted=False while the turn streams elsewhere;
+      * a steered message can be queued where no running turn will ever drain it;
+      * a caption produced in one worker is invisible to the next turn in another.
+
+    Those look exactly like model bugs, not deployment bugs, which is why guessing was
+        replaced with a warning (AUDIT #11). Nothing here can fix it — only a shared store
+    can — so the honest move is to say it out loud at startup.
+    """
+    import os
+    n = ""
+    try:
+        n = os.environ.get("WEB_CONCURRENCY", "").strip()
+    except Exception:  # noqa: BLE001 — env inspection must never break boot
+        return
+    try:
+        workers = int(n) if n else 0
+    except ValueError:
+        return
+    if workers > 1:
+        print("=" * 60)
+        print(f"[Hearth] WARNING: WEB_CONCURRENCY={workers} — Hearth is single-process by design.")
+        print("         Stop/abort, message steering and audio captions live in per-process")
+        print("         memory, so with several workers they will intermittently do nothing")
+        print("         (Stop answers 'not running', a steered message never arrives).")
+        print("         Run ONE worker process; scale with more Hearth instances only once")
+        print("         those are backed by shared storage.")
+        print("=" * 60)
 
 
 def _bootstrap_admin() -> None:

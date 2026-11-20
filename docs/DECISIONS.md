@@ -1394,3 +1394,345 @@ Playwright in this sandbox failed with `ERR_ALPN_NEGOTIATION_FAILED` (an environ
 the change), so the probe could not seed a row. The DOM/menu assertions above that *did* run came from markup
 and handler inspection plus the API-level tests, not from a human-speed session in a browser.
 `scratch/files_menu_probe.py` is left in place to finish that pass.
+
+---
+
+# Audit remediation (DEC-067 … DEC-073)
+
+Seven records for the work done against `AUDIT_SILENT_DECISIONS.md` — an audit of silent
+caps, swallowed failures, hard-coded policies and rigid seams. Each entry states what the
+code did before, what it does now, and which test locks it down. Findings are cited by
+their audit number. Full report: `AUDIT_SILENT_DECISIONS.md`; progress log:
+`AUDIT_PROGRESS.md`.
+
+## DEC-067 — The workspace listing says how incomplete it is, in the prompt and in `fs_list`
+Question: What should the model be told when we cap what it can see of the user's files?
+Decision: One setting governs the per-prompt listing (`agent.workspace_listing_entries`,
+default 80 as before); the listing itself appends `…and more (the listing stops here — use
+fs_list for the rest)`; and the environment preamble is *generated* from that same number
+rather than asserting a fixed claim. `fs_list` gains its own setting
+(`agent.fs_list_entries`, default 500) and now names its cap in its result. Both learn
+whether anything was omitted from a new `EntryList.truncated` flag on `workspaces.list_tree`.
+Evidence: The old code capped at 80 silently while `WORKSPACE_PREAMBLE` told the model "The
+workspace listing in this prompt shows every file" — an active misinstruction, because a
+model that believes the list is complete never calls `fs_list`, so a 312-file workspace was
+invisible to agent and user alike (audit #1 / B3). `fs_list` then capped at 500 with no note,
+so both layers lied at once (#3). `fs_search` already announced its cap; this matches it.
+Reversibility: High — defaults reproduce the previous limits; only the wording changed.
+Note for whoever revisits this: the marker deliberately says "and more", **not** "and N
+more". A capped listing cannot know how many entries it omitted, and an intermediate version
+of this fix counted one probe entry past the cap and reported "1 more" for a directory with
+308 hidden files — a fabricated number in the system prompt, worse than no number. If exact
+counts are ever wanted, `list_tree` must count the whole directory (uncapped scan) rather
+than infer it from the truncated read.
+Tests: `test_workspace_listing_cap_is_settings_driven_and_announced`,
+`AuditRegressionTests.test_fs_list_announces_its_cap`.
+
+## DEC-068 — A prompt section that fails says "failed", never silence
+Question: When building a prompt section goes wrong, what should the model read?
+Decision: An empty string is banned as an error result for these sections. The workspace
+listing renders `(listing FAILED — do NOT conclude the workspace is empty; use fs_list with
+'.' to try again)` and the project block renders `(A linked project folder EXISTS but its
+details could not be read right now…)`, each audit-logged (`workspace_listing_failed`,
+`project_context_failed`).
+Evidence: Both were wrapped in `except Exception: return ""`. Absence of a section reads to
+a model as absence of data, so a jail error or DB fault made a populated workspace look empty
+and Hearth told the user their files were gone (#5). DEC-026 called this "degrade to no-op";
+a no-op that falsifies the contents of someone's workspace is not neutral.
+Reversibility: High.
+
+## DEC-069 — Upload replacement is reported, and the size cap is an admin setting
+Question: Does re-attaching `report.pdf` silently destroy the first one?
+Decision: It still replaces (DEC-040 §2 stands — two attachments are two transfers, and each
+message's artifact stays fetchable), but every upload response now carries `replaced` and
+`replaced_different_content`, computed by hashing the pre-existing file before truncating it,
+and `upload_replaced` is audit-logged with both digests. The chat shows an amber warning when
+different bytes were destroyed. Separately, the 25 MiB cap moved into
+`uploads.max_bytes`; `/api/upload` returns `max_bytes` and `chat.js` caches it instead of
+carrying its own literal.
+Evidence: The upload path wrote unconditionally with no existence check (#2), and the limit
+was a source constant under a "Configurable later" comment, duplicated at `chat.js:857` (#8).
+DEC-040's justification only holds when the two files are identical — which is precisely the
+case that can now be detected cheaply.
+Reversibility: Medium — response gains fields; nothing removed.
+Tests: `test_upload_reports_when_it_replaced_different_bytes`,
+`test_upload_limit_is_an_admin_setting`.
+
+## DEC-070 — Provider selection is a registry, and a stub fallback is announced in chat
+Question: What happens when the configured backend is not answering?
+Decision: `manager.PROVIDERS` maps `model.backend` values to provider classes; adding a
+backend is one entry plus its module. Capabilities are declared as data
+(`Provider.capabilities()` → `exposes_log_progress`, `measured_usage`, `is_stub`) instead of
+being sniffed by comparing `provider.name` to a string literal. Whenever the effective
+provider is not the configured one, `last_fallback_note` is set and `_stream_turn` emits a
+`provider_fallback` notice that renders as a persistent amber bubble.
+Evidence: `get_provider()` ended in an unconditional `return StubProvider()`, so a llama-server
+that died mid-session meant talking to a fake model whose answers look real, with nothing said
+(#7); and the prefill-progress source was gated on `getattr(provider,"name","")=="llama-server"`.
+The stub-as-default itself remains Accepted (DEC-001) — the silence was the defect.
+Tests: `test_provider_registry_and_stub_fallback_note`,
+`test_provider_capabilities_replace_name_sniffing`.
+
+## DEC-071 — Approvals expire; stale ones are refused rather than executed blind
+Question: Is an approval card still valid a day after it was shown?
+Decision: No. Past `agent.pending_max_age_s` (default 3600 s, 0 disables) an approved gated
+call is not executed: the tool row records that the approval expired, the user is told to re-run
+the tool for a fresh preview, and `pending_approval_expired` is audit-logged. Rows with no
+timestamp are never treated as stale — an approval is not destroyed by a missing field.
+Evidence: `_resume_pending` executed approved calls without any freshness check (#4), while
+`project_apply.py` already refuses exactly this hazard for sync ("approval of an older preview
+cannot slip a stale overwrite past a [change]"). The step-budget exemption documented there is
+unaffected: an approval still never counts against `agent.max_tool_steps`.
+Reversibility: High — set the age to 0 for the previous behaviour.
+Test: `test_stale_approval_is_not_executed`.
+
+## DEC-072 — Single-process is stated loudly, and contradicts no more
+Question: Is `uvicorn --workers` a scaling path?
+Decision: No, and README now says so in those words. Hearth warns at boot when
+`WEB_CONCURRENCY > 1`, naming the four per-process structures that break — the abort registry
+(`cancel.py`), the steering queue (`steering.py`), the caption cache and per-app download
+tokens — and what the user will see: Stop answering "nothing is running", steering never
+arriving, captions missing on the next turn. The caption cache itself moved from insertion-order
+eviction to least-recently-used (touched on read).
+Evidence: README recommended `uvicorn --workers` for "many concurrent users" while all four
+correctness-critical structures were module-level dicts (#11) — advice that produces failures
+looking like model bugs. The caption cache's eviction was documented as "crude but bounded"
+while its actual failure mode was the model receiving `[attached: x.mp3]` with no description
+as the UI still displayed one (#12).
+Tests: `test_single_worker_assumption_is_warned_about`,
+`test_caption_cache_evicts_least_recently_used`.
+
+## DEC-073 — Truncation is labelled wherever it happens; tool labels derive from tools
+Question: Can a user tell truncated output from complete output?
+Decision: Not any more. `ui_preview()` appends `(truncated for display — N of M characters not
+shown; the model may have seen more)` when it clips, keeping the display/model budget split
+(DEC-061) but labelling which one the user is looking at. `zip_pack` reports omitted paths
+(`tools.zip_pack.max_files`, default 200) instead of saying "packed 200" about a 250-file
+request. `pdf_read` states that a wider range was requested and where to continue. History
+replay resolves download buttons by persisted artifact id, with the old filename scrape kept
+only as a fallback for rows written before ids were stored. Admin tool labels derive from
+`Tool.label` via `tools.TOOL_LABELS_BY_NAME`, so a new tool cannot be added without one.
+Evidence: #13 (4 000-char chip vs 24 000-char model budget, unlabelled), #18 (files vanishing
+from a zip under a truthful-looking count), #6 (a 40-page request answered with 6 pages and no
+complaint), #10 (two same-named artifacts sharing one download link; renaming a file losing its
+button), #17 (labels hand-synced in a second registry). B2's 43 dead lines duplicating
+`_progress_event` after `_merge_progress`'s return are deleted, with an AST test that fails if
+unreachable statements reappear.
+Tests: `test_ui_preview_is_generous_but_bounded` (updated),
+`test_zip_pack_reports_omitted_paths`, `test_pdf_read_announces_its_page_clamp`,
+`test_tool_labels_are_derived_from_the_classes`, `test_no_dead_duplicate_of_progress_event`.
+
+### Deliberately not changed
+
+* **`pdf_read.MAX_PAGES` / `view_video.MAX_FRAMES` are not admin settings.** Unlike a listing
+  cap, these multiply image tokens per call by whatever a model happens to request; the audit's
+  "one setting plus one sentence" is half right — the sentence is worth adding (done), the knob
+  is not safe to hand out. Both now quote their own limit in the tool description and result.
+* **`UI_PREVIEW_MAX_CHARS` stays separate from `agent.tool_output_max_chars`.** DEC-061's
+  reasoning is sound; the missing piece was a label, not a shared budget.
+* **The four per-process dicts are not moved to Redis.** That is a real change requiring a
+  deployment decision; the honest interim step is a boot warning plus a README that no longer
+  recommends the configuration that breaks them.
+* **`data/workspaces/<uid>/project/`, the stale full copy of this tree, is not deleted** — it
+  lives inside a live user's workspace and deleting it is destructive. Documented in
+  `data/README-do-not-search.md`, with `.gitignore` entries so ripgrep skips it; the audit's own
+  searches were misled by it, and mine were too.
+
+# Image generation is Qwen Image, on purpose (DEC-074 … DEC-075)
+
+## DEC-074 — Image generation supports one architecture: Qwen Image / Qwen Image 2.1
+Question: `hearth/diffusion.py` tried to serve SD1.5, SDXL, Flux and SD3 as well as Qwen
+Image; what should it support instead?
+Decision: **Qwen Image only**, and the settings/UI are reshaped around exactly that. Three
+required files, each with its own flag — `--diffusion-model` (the DiT .gguf), `--llm` (the
+Qwen3-VL text encoder), `--vae` (`diffusion_pytorch_model.safetensors`) — resolved from one
+"Model folder" setting by filename, with three optional overrides for unusually named files.
+Sampling is pinned to what works: `--sampling-method euler`, `--diffusion-fa`,
+`--preview none`. Removed outright: `clip_l`, `clip_g`, `t5xxl`, `lora_dir`, the preview
+toggle, and `-m/--model` as a way to name the main model.
+Evidence (all reproduced on this machine with sd-cli `master-1106-532d2c1`):
+* The old `build_argv()` passed the main model as `-m/--model` and had no `--llm` flag at
+  all, so **no setting combination could ever have launched Qwen Image.** Passing its DiT
+  .gguf through `--model` fails with `get sd version from file failed` — which reads like a
+  corrupt model, not a wrong flag.
+* A missing `--vae` exits 1 after ~240 lines of `[E] VAE tensor '…' not in model metadata`;
+  a missing `--llm` exits 1 with `Conditioner model tensor 'text_encoders.llm.…'`. Neither
+  mentions the setting at fault, which is how this feature sat broken unnoticed.
+* Working, verified end to end through the rewritten module: 640×640/6 steps in 17 s; batch
+  of 2 with `-b` and `hearth_%03d.png`; `-s 0` honoured as a real seed (not random);
+  image-to-image via `-i … --strength 0.6`.
+Reversibility: Medium — the file contract is small and documented, but adding another
+architecture now means a new backend module with its own flag set, not widening this one.
+That is the intended cost: every unused encoder knob was also a way to configure a broken
+run, and "broad support" here meant a UI full of fields that all produced the same failure.
+Tests: `DiffusionQwenImageTests` (16) in `scripts/selftest.py` — folder discovery, the
+`qwen`/`qwen3vl` name collision that must not hand the DiT file to the encoder role,
+explicit-path precedence, legacy-key fallback, per-file refusal wording, argv flag contract
+(including "never `--model`"), seed 0 vs omitted random, clamping, log-signature
+translation, per-file status, and a guard that the removed settings stay removed.
+
+## DEC-075 — A refused generation names the file; sd-cli's own failure is translated
+Question: When generation cannot run or fails, what do the model and the admin read?
+Decision: `preflight()` requires all three files and reports **each** missing one by its
+setting label ("'VAE (.safetensors)' does not exist: /path — set it in Admin → Images"),
+before any subprocess starts. When sd-cli itself fails, `explain_failure()` matches the log
+tail against known signatures (`get sd version from file failed`, `VAE tensor`,
+`text_encoders.llm`, `not in model metadata`) and puts the plain-language cause first, the
+raw tail second, the log path last. The Images tab shows one tile per required file with its
+filename and **where it came from** (folder / your explicit path / environment / older
+setting), because "Model file: missing" never said which of three was wrong.
+Evidence: the failure message is what a small chat model repeats to the user, and what an
+admin acts on; the old text was one generic string for four distinct causes. Reproduced
+output with the LLM .gguf put in the VAE slot: *"the diffusion CLI exited with code 1 after
+0.7s — the VAE is missing or wrong for this model: set 'VAE (.safetensors)' to the
+diffusion_pytorch_model.safetensors that ships with the Qwen Image files; last output: …"*.
+Note for whoever revisits this: the hint table matches substrings, so it must stay ordered
+most-specific-first and any new architecture needs its own signatures — a wrong-but-known
+hint is worse than no hint, because the model will repeat it confidently.
+
+## DEC-076 — Stop reaches the running sd-cli; it had never reached anything
+Question: `Diffusion.stop_active()` looked like it killed the generation in flight. Did it?
+Decision: No — and the fix is a two-line branch, kept with its own tests because the shape of
+the bug is easy to re-introduce. `_active_proc` holds the running child or `None`, so
+`if p is None or p.poll() is None: return False` returned early for **every running** child
+(`Popen.poll()` is `None` while the process lives). Stop recorded intent and signalled
+nothing; the intent was then honoured by `_set_active()` on the *next* generation, killing a
+process that had already exited. Now: `None` → record intent and return False; anything else →
+`_kill_tree(p)` and report whether it is really gone. Related fixes made in the same pass:
+
+  * `_kill_tree()`'s grace went 2 s → 15 s. Measured here, a mid-generation sd-cli (1024×1024,
+    30 steps) exits on SIGTERM in well under 20 s and releases VRAM as it goes; escalating to
+    SIGKILL sooner risks leaving driver-side allocations behind for a process that was already
+    dying. `killed` now means "it ignored SIGTERM", which is the useful signal.
+  * A stopped run no longer blames the model files. Signal exits land in the same `rc != 0`
+    branch as real failures, so pressing Stop produced *"the diffusion CLI exited with code -15
+    — the model files must all come from the same Qwen Image package"*, which sends the user
+    hunting a config problem that does not exist. Negative exit codes now read
+    "stopped by Hearth (Stop)" / "killed by its timeout limit".
+
+Evidence: before the change, measured against a real Qwen Image generation in flight —
+`stop_active()` returned `False` in **0.00 s** having sent no signal, and the child was still
+running 42 s later (`pgrep` + `/proc/<pid>/pgid` confirmed it was Hearth's own process group;
+earlier readings that suggested otherwise were an artefact of `pgrep -f "sd-cli"` matching the
+shell that ran it). After: `stop_active() -> True in 0.5 s`, process group empty, thread
+unwound with "image generation was stopped by Hearth (Stop) after 20.9s".
+Tests: `DiffusionCancellationTests` (3) — Stop kills a running child *and its group* and takes
+longer than 0.05 s to return (an instant return is the bug), a Stop racing model load is not
+lost, and a stopped run never carries the "same package" hint. `scratch/diffusion_runtime_probe.py`
+was also corrected: its orphan check used `pgrep -f "sleep 60"`, which matches the invoking
+shell too, and its wrapper let dash optimise `sleep 60 & wait` into an exec — so the probe
+could pass without ever testing group teardown. Both now assert on Hearth-created process
+groups only, and TIMEOUT/CANCEL/BUSY all PASS.
+
+## DEC-077 — `display_media`: showing a file to the user, and keeping those bytes out of the model
+Question: The tools could render, describe, and hand out files — but could the assistant put a
+picture on the user's screen? Decision: No, and `display_media` is that missing direction. Every
+existing media path points at the *model*: `ToolResult.images` becomes a synthetic user-role
+multimodal message (DEC-052), so `pdf_read` pages and generated PNGs reached an mmproj projector
+and never the browser — the user saw a tool chip plus a ⬇. The new tool takes workspace paths,
+classifies them by extension into image/audio/video, refuses anything a browser cannot present
+(naming it, and pointing at `upload`), registers each as an artifact, and returns
+`meta.media = [{path, kind, url, artifact_id, name}]`. Files then load from `/api/artifact/{id}` —
+the route that already enforces ownership and decrypts at rest — so no new endpoint, no token,
+nothing to authorise separately. Rendering is native HTML (`<img>`/`<video controls>`/
+`<audio controls>`) driven by `addMediaBubble`, live from the SSE event and again from the
+persisted row, so a refresh does not quietly un-display what was shown.
+
+Two boundaries did the real work:
+
+  * **The model must not be fed what it cannot perceive.** `meta["images"]` is encoded as
+    `image_url` data URLs on *every* later turn, and an mmproj projector is an image encoder — so
+    listing a clip there would base64 tens of megabytes into each request for nothing. Displayed
+    files therefore live under their own persisted key (`display`), and `build_messages` derives
+    from it only the subset whose extension is genuinely an image. Audio/video arrive as one short
+    text line naming them, which is also what stops the model narrating a video it merely put on
+    screen (`describe_audio` / `view_video` are named in its result for that reason).
+  * **One source of truth per file.** The first version put an image in *both* `images` and
+    `display`; replay then encoded the same PNG twice — two identical data URLs, double the image
+    tokens. Measured: 2 `image_url` parts for one displayed picture. Now `display_media` sets
+    neither `images` field; the display list is authoritative and replay yields exactly one part.
+
+Full screen is the browser's own `requestFullscreen()` on the live element — no viewer to build,
+so playback state survives, Esc works, and an odd container degrades to whatever Chrome/Safari do
+rather than to a broken custom overlay. iOS Safari does not support element fullscreen at all, so
+a rejection (or a promise that resolves without anything being fullscreened) falls back to opening
+the artifact URL in its own tab: a click can never be a dead end. Download is always a *separate*
+`<a download>` rather than a wrapper around the media — nesting an anchor round an `<img>` makes
+clicking-to-view save the file instead, and nested interactive content is invalid HTML anyway.
+
+CSP gained `media-src 'self' blob:` (DEC-018's policy otherwise inherits `default-src 'self'`).
+This widens no source; it exists because some browsers re-check a fullscreened element's
+subresource loads against the top-level document's policy, which is how a same-origin `<video>`
+turns black-and-frozen exactly when full screen is pressed.
+
+Admin: `tools.display_media`, **on** by default, approval **auto** — showing a file the user can
+already download is not an act worth an approve card per picture, and gating it would only train
+users to mash Approve. Off simply removes the ability to show things.
+
+Tests: `DisplayMediaToolTests` (12) — registration/enable/approval, kind detection incl. refusal of
+pdf/md/zip, jail escape + missing file + non-media each named in the reply, nothing-displayable is a
+failure not a quiet success, no audio/video ever enters the model image channel, exactly one
+`image_url` part on replay (the double-encode regression), video-only display still reaches the
+model as text, `./`-prefixed paths survive (`resolve_in_jail()` returns a `Path`, and
+`bool(Path("."))` is `False` — an earlier revision used it as a truth value and silently dropped
+every such path), missing files skipped rather than announced, per-call cap stated when hit.
+
+
+# Image editing is a second profile in the same runner (DEC-078)
+
+## DEC-078 — Qwen Image Edit shares the diffusion runner as a second profile, not a new module
+Question: DEC-074 said "supporting another architecture means adding a new backend module".
+Qwen Image Edit arrived — is it that new module, or something else?
+Decision: **It is not a new architecture; it is a second *profile* of the same one.** Qwen Image
+Edit runs on the very same `sd-cli` binary and needs the very same three-file shape (DiT + text
+encoder + VAE). What differs is which weights fill those slots, how the input image enters, and
+what sampling is pinned. So rather than fork `diffusion.py`, it now carries two **profiles** —
+`PROFILE_GEN` (`diffusion.*`, unchanged) and `PROFILE_EDIT` (`image_edit.*`) — that share one
+runner, one lock, one log, and all the cancel/kill code. A `Profile` object holds everything
+architecture-specific: setting prefix, env prefix, role list + flags, folder-discovery patterns,
+required-role set, CFG default, optional `--flow-shift`, and a `zero_cond_t` switch.
+
+The two are configured as **independent slots** so an operator can run either or both:
+  * Generation: DiT + **Qwen3-VL** encoder + VAE, CFG ~4.5 (unchanged from DEC-074).
+  * Editing: Edit DiT + **Qwen2.5-VL** encoder + VAE, an optional fourth `--llm_vision` mmproj for
+    the 2509 checkpoint, CFG **2.5**, and `--flow-shift 3`. The reference image goes in as `-r`
+    (reference conditioning through the VLM + VAE encoder), **not** `-i` — img2img is a different
+    mechanism that perturbs with noise; Qwen Image Edit's whole point is preserving the unedited
+    regions, which reference conditioning does and img2img does not.
+
+Evidence (upstream `stable-diffusion.cpp` `docs/models/qwen_image_edit.md`, commit 5dcfa798):
+the CLI examples pass `--diffusion-model <Edit .gguf> --vae <qwen_image_vae.safetensors>
+--llm <Qwen2.5-VL>` with `-r <input.png> -p "<instruction>" --cfg-scale 2.5 --sampling-method
+euler --flow-shift 3`; the 2509 recipe adds `--llm_vision <...mmproj...gguf>`; and 2511 needs
+`--model-args qwen_image_zero_cond_t=true`. That is why `llm_vision` is an **optional** role
+(emitted only when a path resolves) rather than required — the original checkpoint and 2511 fold
+vision into the single `--llm` file, so demanding it would refuse setups that work.
+
+Why not two modules: the runner's hard-won parts (process-group kill, DEC-076's stop polarity, the
+busy lock, log-tail translation, temp-dir staging) are identical for both, and duplicating them is
+how those fixes drift out of sync. The one thing that must NOT be shared is a model load — so they
+share the **lock** (a draw and an edit never overlap; they compete for the same GPU) but keep
+separate settings and file slots.
+
+Backward compatibility: `PROFILE_GEN` reproduces the old module byte-for-byte — same setting keys,
+same env fallbacks (`HEARTH_DIFFUSION_*`), same legacy keys (`diffusion.model_path`, `diffusion.vae`),
+same argv (no flow-shift, no `-r`, CFG 4.5). Every function (`resolve_paths`, `preflight`,
+`build_argv`, `status`, `generate_sync`) takes an optional `profile=` defaulting to generation, so
+existing callers and all 19 pre-existing diffusion tests pass unchanged.
+
+UI: the Images tab renders both profiles from one shared block helper — a tile per file (an unset
+**optional** role reads grey "optional", not amber "missing"), a per-profile test button ("Draw a
+test image" / "Test an edit"; the edit probe synthesises a throwaway PNG via Pillow because editing
+needs an input), and a copy-command button each. Loaded models gains an `image_edit` row that only
+appears when editing is enabled or configured, so nobody gets a permanent red row for a capability
+they never turned on.
+
+Env fallbacks: `HEARTH_IMAGE_EDIT_{CLI_BIN,MODEL_DIR,DIT,LLM,VAE,LLM_VISION,BACKEND}`. The edit CLI
+binary falls back to the generation one when unset — same executable, only files differ.
+
+Tests: `DiffusionEditProfileTests` (12) — profile isolation (edit settings never leak into
+generation resolution), folder discovery of the Edit DiT by name, optional mmproj not required but
+emitted when set, `-r` + CFG 2.5 + `--flow-shift 3` and no `-i`, generation argv unchanged (no
+flow-shift/`-r`, CFG 4.5), missing-file refusal naming the profile, disabled-switch wording, shared
+binary fallback, settings surface, tool registration/gating, and edit_image requiring both image and
+prompt.

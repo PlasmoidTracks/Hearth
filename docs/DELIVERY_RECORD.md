@@ -719,3 +719,42 @@ when it cannot. A video with zero audio tracks is called silent rather than mere
    `captioner.route_candidate()` (`.mp4`/`.webm` are in `AUDIO_EXTS`) and is subject to
    `captioner.max_bytes`; DEC-064 deliberately did not change the upload path. Worth revisiting:
    size-gate it, or route video to windowed analysis only.
+
+
+## Session 13 — Qwen Image Edit as a second diffusion profile (`edit_image`)
+
+**IMPLEMENTED — unit + HTTP-verified with the stub CLI; UNVERIFIED against real Qwen Image Edit weights.**
+Adds instruction-based image editing alongside text-to-image, without forking the diffusion runner.
+
+### What changed
+- `hearth/diffusion.py`: two `Profile`s (`PROFILE_GEN` unchanged, new `PROFILE_EDIT`) sharing one
+  runner/lock/log/cancel code. Editing feeds `-r` (reference), CFG 2.5, `--flow-shift 3`, optional
+  `--llm_vision`. All backend functions take `profile=` defaulting to generation. DEC-078.
+- `hearth/tools/image_tools.py`: `EditImageTool` (`edit_image`, gated) — jail-checks the input image,
+  stages it decrypted, runs the edit profile, shows the result back to the model.
+- `hearth/runtime_settings.py`: `IMAGE_EDIT_SPECS` (`image_edit.*`) + `tools.edit_image` enable/approval.
+- `hearth/routes_admin.py`: `/api/admin/image_edit/{status,command,test}` + a conditional Loaded-models row.
+- `hearth/static/admin.js`: Images tab renders both profiles; tools hint updated.
+- Docs: DEC-078 (DECISIONS), README editing subsection, FEATURES drawing/editing section, ARCHITECTURE
+  session-13 block, CONTINUATION gotcha rewritten.
+
+### Verified in this session (actually run)
+- `python scripts/selftest.py` → **250 passed** (stdlib). With `HEARTH_RUN_HTTP=1` → **262 passed**.
+- New `DiffusionEditProfileTests` (12): profile isolation, edit folder discovery of the Edit DiT by
+  name, optional mmproj not-required-but-emitted, `-r` + CFG 2.5 + `--flow-shift 3` and no `-i`,
+  generation argv unchanged (no flow-shift/`-r`, CFG 4.5), missing-file refusal naming the profile,
+  disabled wording, shared-binary fallback, settings surface, tool registration/gating, edit_image
+  requiring both image and prompt. All 19 pre-existing diffusion tests still pass unchanged.
+- Live admin endpoints via `TestClient`: `/api/admin/image_edit/status` returns the profile shape with
+  `label`; `/command` builds; `/test` refuses actionably when disabled; the `image_edit` Loaded-models
+  row appears only after enabling editing.
+
+### Operator verification checklist (session 13) — needs real Qwen Image Edit weights + sd-cli
+1. Admin → Images → *Image editing*: point *Edit model folder* at a folder with an Edit DiT, a
+   Qwen2.5-VL encoder, and the VAE; leave CLI path blank (reuses generation binary). Enable, Save.
+   Expect three green file tiles + a grey "optional" mmproj tile; **✂️ Test an edit** returns ✓ in seconds.
+2. Ask: "edit uploads/photo.png — remove the red car." Approve → an `edit_*` PNG lands in `generated/`,
+   is shown back, and the assistant describes what actually changed and whether the rest held.
+3. With only generation configured (editing off), ask for an edit → the tool names the missing edit
+   setup; it must not fall through to `generate_image` or invent a result.
+4. 2509 checkpoint: set the optional vision mmproj path → `Copy the sd-cli command` shows `--llm_vision`.

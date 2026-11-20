@@ -34,8 +34,28 @@ from ..errors import hint
 from .. import workspaces as ws
 
 
+def _int_setting(ctx, key: str, fallback: int) -> int:
+    """Read a positive integer runtime setting, falling back when unset or junk.
+
+    One helper because several filesystem limits moved out of class attributes into
+    Admin → Agent, and each needs the same tolerance for a missing/partial settings dict
+    (tools are also driven directly from tests with hand-built contexts).
+    """
+    try:
+        v = int(ctx.setting(key) or 0)
+    except (TypeError, ValueError, AttributeError):
+        return fallback
+    return v if v > 0 else fallback
+
+
+def _fs_list_cap(ctx) -> int:
+    """Max entries one fs_list call returns (agent.fs_list_entries, default 500)."""
+    return _int_setting(ctx, "agent.fs_list_entries", 500)
+
+
 class FsReadTool(Tool):
     name = "fs_read"
+    label = "Filesystem read"
     description = ("Read a UTF-8 text file from the user's workspace (relative path). Optionally "
                    "limit to a line range: start_line/end_line are 1-based and INCLUSIVE; omit "
                    "both to read the whole file.")
@@ -95,6 +115,7 @@ class FsReadTool(Tool):
 
 class FsListTool(Tool):
     name = "fs_list"
+    label = "Filesystem list"
     description = "List files and directories in the user's workspace (relative path; '.' for root)."
     setting_key = "tools.fs_read"      # legacy fallback key
     enable_key = "tools.fs_list"       # granular key (falls back to tools.fs_read)
@@ -105,21 +126,33 @@ class FsListTool(Tool):
             "required": []}
 
     async def run(self, args, ctx):
+        # The prompt listing is capped too, so this tool is the fallback the model uses to
+        # see the rest. Returning exactly `cap` entries with no note was the second layer of
+        # the same lie: on a big folder both the prompt and its escape hatch stopped silently.
+        # Whether anything was omitted comes from list_tree's own `.truncated` flag — counting
+        # probe entries cannot yield a total (fs_search already announces its cap; this matches).
+        cap = _fs_list_cap(ctx)
         try:
-            entries = ws.list_tree(ctx.user_id, args.get("path", "."))
-            if not entries:
-                return ToolResult(True, "(empty)")
-            lines = [f"{'DIR ' if e['is_dir'] else '     '}{e['name']}"
-                     + (f"  {e['size']}B" if e['size'] is not None else "") for e in entries]
-            return ToolResult(True, "\n".join(lines))
+            entries = ws.list_tree(ctx.user_id, args.get("path", "."), max_entries=cap)
         except ws.JailEscape as e:
             return ToolResult(False, hint("escape_root", f"refused: {e}"))
         except FileNotFoundError:
             return ToolResult(False, hint("file_not_found", f"not found: {args.get('path')}"))
+        truncated = bool(getattr(entries, "truncated", False))
+        if not entries:
+            return ToolResult(True, "(empty)")
+        lines = [f"{'DIR ' if e['is_dir'] else '     '}{e['name']}"
+                 + (f"  {e['size']}B" if e['size'] is not None else "") for e in entries]
+        if truncated:
+            lines.append(f"(listing truncated at {cap} entries — more exist here; narrow with a "
+                         f"subdirectory path, or raise Admin → Agent → fs_list max entries)")
+        return ToolResult(True, "\n".join(lines),
+                          meta={"truncated": truncated, "entries": len(entries)})
 
 
 class FsWriteTool(Tool):
     name = "fs_write"
+    label = "Filesystem write/overwrite"
     description = ("Write/overwrite a UTF-8 text file in the user's workspace (relative path). "
                    "WARNING: replaces the entire file — prefer fs_edit for small changes. The file "
                    "is saved and listed under Artifacts, but this tool does NOT give the user a "
@@ -159,6 +192,7 @@ class FsWriteTool(Tool):
 
 class UploadTool(Tool):
     name = "upload"
+    label = "Offer file for download"
     description = ("Give the user a download button for a file in their workspace — including one "
                    "you just wrote. This is the ONLY tool that produces a download link in the "
                    "chat, so call it whenever (and only when) the user asked to receive a file. "
@@ -191,6 +225,7 @@ class UploadTool(Tool):
 
 class FsAppendTool(Tool):
     name = "fs_append"
+    label = "Filesystem append"
     description = ("Append text to the END of an existing workspace file (created if missing). "
                    "Use instead of fs_write when you only want to add content.")
     enable_key = "tools.fs_append"
@@ -219,6 +254,7 @@ class FsAppendTool(Tool):
 
 class FsEditTool(Tool):
     name = "fs_edit"
+    label = "Filesystem edit (find/replace)"
     description = ("Replace an exact text segment inside one workspace file. The old_text must "
                    "match exactly (whitespace included) and by default must be UNIQUE in the "
                    "file — include more surrounding context if it matches several places. Set "
@@ -263,6 +299,7 @@ class FsEditTool(Tool):
 
 class FsDeleteTool(Tool):
     name = "fs_delete"
+    label = "Filesystem delete"
     description = ("Delete a file from the user's workspace. This is irreversible — approval is "
                    "required by default.")
     gated = True   # ask by default (admin can flip tools.fs_delete.approval)
@@ -288,6 +325,7 @@ class FsDeleteTool(Tool):
 
 class FsMoveTool(Tool):
     name = "fs_move"
+    label = "Filesystem move/rename"
     description = ("Rename or move a file/folder within the user's workspace (both paths "
                    "workspace-relative). Overwrites the destination only if overwrite=true.")
     enable_key = "tools.fs_move"
@@ -314,6 +352,7 @@ class FsMoveTool(Tool):
 
 class FsSearchTool(Tool):
     name = "fs_search"
+    label = "Filesystem search"
     description = ("Search file CONTENTS across the workspace with a case-insensitive regex, "
                    "optionally restricted by a glob pattern (e.g. '*.md'). Returns matching "
                    "lines as path:line: text.")
@@ -380,6 +419,7 @@ class FsSearchTool(Tool):
 
 class ZipPackTool(Tool):
     name = "zip_pack"
+    label = "Zip bundling"
     description = ("Bundle several workspace files into one .zip and offer it as a downloadable "
                    "artifact (like attaching a folder). Paths are workspace-relative; the zip is "
                    "written to the workspace root.")
@@ -404,7 +444,12 @@ class ZipPackTool(Tool):
         try:
             resolved = []
             total = 0
-            for rel in paths[:200]:
+            # Anything past the limit used to vanish while the reply still said
+            # "packed {len(resolved)} files" — truthful about the zip, misleading about the
+            # request. The slice is now a setting and every dropped path is counted in the
+            # result so a caller can see that 250 named files did NOT all arrive (#18).
+            cap = _int_setting(ctx, "tools.zip_pack.max_files", 200)
+            for rel in paths[:cap]:
                 # read_bytes decrypts transparently, so zips always contain usable
                 # plaintext even when workspace encryption at rest is enabled.
                 data = ws.read_bytes(ctx.user_id, str(rel))
@@ -414,6 +459,7 @@ class ZipPackTool(Tool):
                                                   f"too much data to zip "
                                                   f"(>{self.MAX_TOTAL_BYTES // 1048576} MB)"))
                 resolved.append((os.path.normpath(str(rel)), data))
+            skipped = len(paths) - cap
         except ws.JailEscape as e:
             return ToolResult(False, hint("escape_root", f"refused: {e}"))
         except FileNotFoundError as e:
@@ -432,6 +478,12 @@ class ZipPackTool(Tool):
         from .. import artifacts
         art = artifacts.record(ctx.user_id, zname, conversation_id=ctx.conversation_id,
                                kind="produced")
-        return ToolResult(True, f"packed {len(resolved)} files into {zname}",
+        msg = f"packed {len(resolved)} files into {zname}"
+        if skipped:
+            # Name the shortfall in the message itself, not just in meta the model never sees.
+            msg += (f" — NOT {len(paths)}: {skipped} path(s) were not included "
+                    f"(limit {cap} per call). Bundle the rest in a second zip.")
+        return ToolResult(True, msg,
                           meta={"download": {"name": art["filename"], "url": art["download_url"],
-                                             "artifact_id": art["id"]}})
+                                             "artifact_id": art["id"]},
+                                "packed": len(resolved), "skipped": skipped})

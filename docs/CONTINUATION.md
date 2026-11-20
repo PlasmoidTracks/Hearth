@@ -225,6 +225,25 @@ HEARTH_RUN_HTTP=1 python scripts/selftest.py     # + FastAPI TestClient HTTP/CSP
 - **`round_id` correlates chips** (`r{loop+round_offset}` on `tool_progress`/`tool_call`/`tool_result`).
   Client keys progress chips by `name|round`; if you add a new entry point into `_agent_loop`, pass a
   `round_offset` that doesn't collide with rounds already retired, or its chips silently never appear.
+- **Image generation is Qwen Image, editing is Qwen Image Edit — two PROFILES in one runner**
+  (DEC-074, DEC-078). `hearth/diffusion.py` carries `PROFILE_GEN` (`diffusion.*`) and
+  `PROFILE_EDIT` (`image_edit.*`) sharing one runner/lock/log. Generation: `--diffusion-model`
+  (DiT .gguf) + `--llm` (Qwen3-VL encoder) + `--vae`, CFG ~4.5. Editing: Edit DiT + **Qwen2.5-VL**
+  encoder + VAE (+ optional `--llm_vision` mmproj for 2509), reference image via `-r` (**not** `-i`
+  img2img), CFG **2.5**, `--flow-shift 3`. Passing the DiT through `-m/--model` fails as `get sd
+  version from file failed`, and a missing required file fails as hundreds of `… not in model
+  metadata` lines. Each profile takes ONE folder plus optional overrides; only its REQUIRED files are
+  demanded (edit's llm_vision is optional). Sampling is pinned per profile (euler, `--diffusion-fa`,
+  `--preview none`) — do not "generalise" the flag set without a third architecture to justify it, and
+  add `_LOG_HINTS` entries for any you do add. New backend functions take `profile=` defaulting to
+  generation; keep that default so existing callers/tests stay byte-identical.
+- **`Popen.poll() is None` means RUNNING** (DEC-076). `Diffusion.stop_active()` once read
+  `if p is None or p.poll() is None: return False`, which therefore returned immediately for every
+  live child and killed nothing. When you see a "stop/abort does nothing" report, check the guard's
+  polarity against that fact first. Also: never prove process teardown with `pgrep -f "<pattern>"`
+  from a shell — the pattern matches the invoking `/bin/sh -c`, so it reports orphans that aren't
+  there (and hides real ones). Assert on the PGID of the child you created; and note dash optimises
+  `sleep & wait` into an **exec**, so a fake "grandchild" harness needs `( … & wait )` to fork.
 
 ## Verification discipline (this session had NO execute tool)
 The agent could not run the server/tests — the operator ran them and caught real bugs (imports,

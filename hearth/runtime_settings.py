@@ -219,6 +219,40 @@ AGENT_SPECS: list[SettingSpec] = [
                 "everything equally. Names are matched exactly against the tool names shown in "
                 "Admin → Tools.",
                 group="agent"),
+    SettingSpec("agent.pending_max_age_s", "Approvals: maximum age (seconds)", "int", 3600,
+                "How long an approve/deny card stays executable. An approval left sitting — unread tab, "
+                "phone locked overnight — runs against a workspace that may have changed since the "
+                "preview was shown, so past this age Hearth refuses it and asks the model to re-run the "
+                "tool for a fresh preview instead. Applies to every gated call (exec, fs_delete, "
+                "sync_apply, screenshots). 0 disables the check and lets an approval run whenever it is "
+                "clicked.",
+                min=0, max=86400, group="agent"),
+    SettingSpec("agent.workspace_listing_entries", "Workspace listing: files in the prompt", "int", 80,
+                "How many workspace entries (files and folders) Hearth lists inside EVERY prompt so "
+                "the model knows what exists. A larger workspace is not hidden — the listing says "
+                "'…and N more (use fs_list)' and the model is told to look the rest up — but it does "
+                "not see them unprompted. Raise it if a listing of 80 is too small for your usual "
+                "folders; every entry costs a little context on every message.",
+                min=1, max=5000, group="agent"),
+    SettingSpec("agent.fs_list_entries", "fs_list: max entries per call", "int", 500,
+                "How many entries one `fs_list` tool call returns before it stops and says so. This "
+                "is the fallback the model uses when the prompt listing is capped or stale, so it is "
+                "deliberately larger than the prompt listing. A call that hits the limit names the "
+                "limit rather than returning a silently short list.",
+                min=1, max=100000, group="agent"),
+]
+
+# ---- Uploads ----------------------------------------------------------------
+# Was a hard-coded 25 MiB in routes_chat with a "Configurable later" comment above it, and
+# duplicated as a literal in chat.js — so attaching a longer recording meant editing source
+# in two places. The client now reads this value from /api/upload's response instead.
+UPLOAD_SPECS: list[SettingSpec] = [
+    SettingSpec("uploads.max_bytes", "Max upload size per file (bytes)", "int", 25 * 1024 * 1024,
+                "Largest single file a user can attach in chat. Applies to every upload; the chat "
+                "UI reads this value rather than carrying its own copy. Raise it for long "
+                "recordings — a 10-minute voice memo is roughly 10-20 MB. It is a denial-of-service "
+                "guard, not a quota: there is no per-user storage limit.",
+                min=1024, max=2_147_483_647, group="uploads"),
 ]
 
 # ---- Tool enablement --------------------------------------------------------
@@ -226,6 +260,12 @@ AGENT_SPECS: list[SettingSpec] = [
 # ("auto" = run silently, "ask" = require per-call approval). Legacy keys
 # (tools.fs_read / tools.fs_write / tools.device) remain as fallbacks for older
 # stored settings — see hearth/tools/__init__.py:enabled_tools().
+# Human-readable labels for Admin → Tools, resolved from the tool classes themselves.
+# This used to be a literal dict keyed by tool name and indexed with `[name]`, so adding a
+# tool without editing it here raised KeyError at import — or, once guarded, silently drew
+# no row in the admin UI for a tool that existed and worked (AUDIT #17). The mapping below
+# is only a fallback for tools whose class does not declare `label`; keeping it lets the
+# nicer wording survive while making the classes the real source.
 _TOOL_LABELS = {
     "fs_read": "Filesystem read", "fs_list": "Filesystem list", "fs_search": "Filesystem search",
     "fs_write": "Filesystem write/overwrite", "fs_append": "Filesystem append",
@@ -238,16 +278,35 @@ _TOOL_LABELS = {
     "pdf_info": "PDF info (pages/metadata)", "pdf_read": "PDF reading (pages as images)",
     "video_info": "Video info (runtime/fps)", "view_video": "Video viewing (sampled frames)",
     "audio_info": "Audio info (duration/streams)", "describe_audio": "Audio description (captioner model)",
-    "generate_image": "Image generation (stable-diffusion.cpp)",
+    "generate_image": "Image generation (Qwen Image)",
+    "edit_image": "Image editing (Qwen Image Edit)",
     "context_usage": "Context-window usage (meta)",
 }
 
+
+def _tool_label(name: str) -> str:
+    """Label for a tool: its class `label` if it declares one, else the table above.
+
+    Imported lazily and defensively — runtime_settings must not depend on the tool
+    package importing cleanly (tools import this module), so any failure falls back to the
+    static table and then to a title-cased name rather than breaking settings at boot.
+    """
+    try:
+        from .tools import TOOL_LABELS_BY_NAME
+        lab = TOOL_LABELS_BY_NAME.get(name)
+        if lab:
+            return lab
+    except Exception:  # noqa: BLE001 — labels are cosmetic; never break the settings module
+        pass
+    return _TOOL_LABELS.get(name) or name.replace("_", " ").title()
+
+
 def _tool(name: str, desc: str, default: bool = True, group: str = "tools"):
-    return SettingSpec(f"tools.{name}", f"{_TOOL_LABELS[name]}: enable", "bool", default, desc, group=group)
+    return SettingSpec(f"tools.{name}", f"{_tool_label(name)}: enable", "bool", default, desc, group=group)
 
 
 def _approval(name: str, default: str, extra: str = "", group: str = "tools"):
-    return SettingSpec(f"tools.{name}.approval", f"{_TOOL_LABELS[name]}: approval", "choice", default,
+    return SettingSpec(f"tools.{name}.approval", f"{_tool_label(name)}: approval", "choice", default,
                        "How each call is approved. 'auto' runs silently; 'ask' shows an approve/deny "
                        "card in the chat first." + extra,
                        choices=["auto", "ask"], group=group)
@@ -339,7 +398,10 @@ TOOL_SPECS: list[SettingSpec] = [
                 "long articles (costs context tokens); lower to keep turns cheap.",
                 min=1000, max=64000, group="tools-web"),
     SettingSpec("web.max_links", "Fetch: max links listed", "int", 30,
-                "How many of the page's links are appended after the text (and shown as source links).",
+                "How many of the page's links are appended after the text. The chat UI shows its own "
+                "smaller selection of these as clickable source links and labels it 'showing N of M', "
+                "so this number governs what the MODEL receives — raising it does not raise the number "
+                "of links rendered in the chat.",
                 min=0, max=200, group="tools-web"),
     _approval("sync_apply", "ask",
               " Always keep 'ask': this is the only tool that writes outside a workspace. "
@@ -409,16 +471,45 @@ TOOL_SPECS: list[SettingSpec] = [
                 "Pillow (pip install Pillow) — without it, images are sent at render resolution.",
                 min=320, max=4096, group="tools-media"),
     _tool("generate_image",
-          "Let the assistant DRAW pictures by running stable-diffusion.cpp (`sd-cli`) on this "
-          "machine. Off by default, and approval 'ask' by default: each call occupies the machine "
-          "for tens of seconds to minutes, so it stays the user's decision to approve. Needs a "
-          "binary and a model set under Images; without them the tool explains what is missing "
-          "instead of inventing an image. Generated files land in `generated/` in the user's "
-          "workspace and are shown back to the model, so it can judge its own result.",
+          "Let the assistant DRAW pictures by running stable-diffusion.cpp (`sd-cli`) with a "
+          "Qwen Image / Qwen Image 2.1 model on this machine. Off by default, and approval 'ask' "
+          "by default: each call occupies the machine for tens of seconds to minutes, so it stays "
+          "the user's decision to approve. Needs the CLI path and the three model files set under "
+          "Images; without them the tool explains what is missing instead of inventing an image. "
+          "Generated files land in `generated/` in the user's workspace and are shown back to the "
+          "model, so it can judge its own result.",
           default=False, group="tools-image"),
     _approval("generate_image", "ask",
               " Keep 'ask': one generation can cost minutes of CPU/GPU. Set 'auto' only if you "
               "trust the current model not to draw repeatedly.", group="tools-image"),
+    _tool("edit_image",
+          "Let the assistant EDIT an existing picture with **Qwen Image Edit** (the same "
+          "stable-diffusion.cpp `sd-cli` binary, a separate model slot). Give it a workspace image "
+          "and an instruction and it adds/removes/changes elements, restyles, rotates, or edits "
+          "text while preserving the rest — a different model from `generate_image`, which draws "
+          "from text alone. Off by default, approval 'ask' by default: each call costs minutes of "
+          "CPU/GPU. Needs the Edit model files set under Images → Qwen Image Edit; without them the "
+          "tool explains what is missing instead of inventing a result. Edited files land in "
+          "`generated/` and are shown back to the model so it can judge its own work.",
+          default=False, group="tools-image"),
+    _approval("edit_image", "ask",
+              " Keep 'ask': one edit can cost minutes of CPU/GPU. Set 'auto' only if you trust the "
+              "current model not to edit repeatedly.", group="tools-image"),
+    _tool("display_media",
+          "Let the assistant put an existing workspace image, audio clip, or video ON SCREEN in "
+          "the chat as its own bubble — viewable inline, full screen, and downloadable. This is "
+          "the display half of the media tools: pdf_read/view_video send pixels to the MODEL, "
+          "this one shows them to the USER. Read-only (it moves nothing and writes nothing), so "
+          "approval stays 'auto' by default; files still come from the owner-checked artifact "
+          "route, so it can only ever show files in that user's own workspace.",
+          group="tools-image"),
+
+    SettingSpec("tools.zip_pack.max_files", "zip_pack: max files per call", "int", 200,
+                "How many files one `zip_pack` call includes. Paths beyond this are NOT added — "
+                "the tool now says so in its reply instead of quietly packing fewer than you "
+                "asked for. Raise it to bundle bigger folders in one go; the total size is still "
+                "capped at 64 MB per call.",
+                min=1, max=100000, group="tools-fs"),
 
     # --- device ---
     _tool("device_list",
@@ -590,99 +681,97 @@ CAPTIONER_SPECS: list[SettingSpec] = [
                 min=-1, max=2147483647, group="captioner"),
 ]
 
-# ---- Image generation: stable-diffusion.cpp as an external CLI (DEC-067) -----
-# No port and no supervised process, unlike the captioner: `sd-cli` runs per call and exits.
-# The cost of that simplicity is a model load per generation, which is why the defaults favour
-# a moderate step count and why one call may produce several images. Off until an admin supplies
-# paths — nothing about it is claimed to work before then.
+# ---- Image generation: stable-diffusion.cpp as an external CLI -----------------
+# Deliberately Qwen Image / Qwen Image 2.1 only (see the module docstring in
+# hearth/diffusion.py for the evidence). No port and no supervised process, unlike the
+# captioner: `sd-cli` runs per call and exits — so the cost is a model load per
+# generation, which is why one call may produce several images and why the timeout is
+# generous. Off until an admin supplies the files; nothing is claimed to work before then.
+#
+# The UI shape matters: Qwen Image needs exactly three files that live together in one
+# folder, so 'Model folder' does the work and the three path settings are overrides for
+# unusual names. Anything broader (clip_l / clip_g / t5xxl / LoRA dirs) was removed rather
+# than left as dead weight — every unused knob is a way to configure a broken setup.
 DIFFUSION_SPECS: list[SettingSpec] = [
     SettingSpec("diffusion.enabled", "Enable image generation", "bool", False,
                 "Let Hearth draw pictures by running stable-diffusion.cpp's `sd-cli` as a "
-                "subprocess. The chat model never needs to be multimodal — it asks for an image, "
-                "and the finished PNG comes back to it so it can see what it drew. Leave off until "
-                "the binary and model paths below are filled in.",
+                "subprocess (Qwen Image / Qwen Image 2.1 only). The chat model never needs to be "
+                "multimodal — it asks for an image, and the finished PNG comes back to it so it can "
+                "see what it drew. Leave off until the CLI path and the model folder below are set.",
                 group="diffusion"),
     SettingSpec("diffusion.cli_bin", "stable-diffusion.cpp CLI path", "str", "",
                 "Absolute path to your `sd-cli` executable, e.g. "
                 "/home/you/stable-diffusion.cpp/build/bin/sd-cli. Leave blank to use "
-                "HEARTH_DIFFUSION_CLI_BIN. Hearth runs it directly (never through a shell) with "
-                "the settings below; only the flags documented here are passed, so an unexpected "
-                "build fails loudly rather than silently drawing something odd.",
+                "HEARTH_DIFFUSION_CLI_BIN. Hearth runs it directly (never through a shell) with the "
+                "flags shown by 'Copy the sd-cli command', so an unexpected build fails loudly "
+                "rather than silently drawing something odd.",
                 group="diffusion"),
-    SettingSpec("diffusion.model_path", "Diffusion model (.gguf)", "str", "",
-                "Absolute path to the main model, e.g. "
-                "/home/you/models/sd_xl_base_1.0-Q4_0.gguf or a Flux-dev / Qwen-Image file. For "
-                "models whose text encoder is NOT bundled (Flux: `--clip_l` + `--t5xxl`; SD3: "
-                "`--clip_l` + `--clip_g`), fill in the encoder paths below too — a missing one is "
-                "refused before running rather than producing garbage. Overridable with "
-                "HEARTH_DIFFUSION_MODEL_PATH.",
+    SettingSpec("diffusion.model_dir", "Model folder", "str", "",
+                "The directory holding the three Qwen Image files — Hearth finds them by name, so "
+                "this is usually the only thing to fill in. Example: "
+                "/home/you/.lmstudio/models/lmstudio-community/Qwen-image-2.1. Overridable with "
+                "HEARTH_DIFFUSION_MODEL_DIR.",
                 group="diffusion"),
-    SettingSpec("diffusion.clip_l", "Text encoder clip_l (.gguf)", "str", "",
-                "Optional. Path to clip_l for Flux / SD3 / other multi-encoder models. Omitted "
-                "entirely when blank, so single-file SD1.5/SDXL setups are unaffected.",
+    SettingSpec("diffusion.dit_path", "Diffusion model (.gguf)", "str", "",
+                "The Qwen Image transformer, e.g. qwen_image_2.1_Q8_0.gguf — passed as "
+                "`--diffusion-model`, never `--model`, which this architecture does not accept. "
+                "Blank means: whatever the model folder contains. Env fallback "
+                "HEARTH_DIFFUSION_DIT.",
                 group="diffusion"),
-    SettingSpec("diffusion.clip_g", "Text encoder clip_g (.gguf)", "str", "",
-                "Optional. Path to clip_g (SD3.x and some SDXL-Ultra models). Omitted when blank.",
+    SettingSpec("diffusion.llm_path", "Text-encoder LLM (.gguf)", "str", "",
+                "Qwen Image reads prompts through a vision LLM rather than CLIP, so this is "
+                "required — e.g. Qwen3VL-8B-Instruct-Q4_K_M.gguf from the same package. Passed as "
+                "`--llm`. Blank means: whatever the model folder contains. Env fallback "
+                "HEARTH_DIFFUSION_LLM.",
                 group="diffusion"),
-    SettingSpec("diffusion.t5xxl", "Text encoder t5xxl (.gguf)", "str", "",
-                "Optional. Path to t5xxl — required for Flux-dev and for Qwen-Image quality. It is "
-                "the largest encoder, so a quantised copy (t5xxl_fp8_e4m3) keeps RAM in check.",
-                group="diffusion"),
-    SettingSpec("diffusion.vae", "Standalone VAE (.gguf)", "str", "",
-                "Optional. Path to a separate VAE / image decoder, for models that need one or "
-                "when you prefer a cleaner decoder than the bundled one. Omitted when blank.",
-                group="diffusion"),
-    SettingSpec("diffusion.lora_dir", "LoRA directory", "str", "",
-                "Optional directory of LoRA files, passed as `--lora-model-dir`. Hearth does not "
-                "let the model choose which LoRA to apply — the library applies what the model file "
-                "itself expects, so keep this empty unless you have wired that up deliberately.",
+    SettingSpec("diffusion.vae_path", "VAE (.safetensors)", "str", "",
+                "The image decoder, usually diffusion_pytorch_model.safetensors next to the other "
+                "two files. Passed as `--vae`. Without it sd-cli fails after printing hundreds of "
+                "'VAE tensor … not in model metadata' lines, so Hearth refuses before launching. "
+                "Blank means: whatever the model folder contains. Env fallback HEARTH_DIFFUSION_VAE.",
                 group="diffusion"),
     SettingSpec("diffusion.backend", "Compute backend (--backend)", "str", "",
-                "Blank = stable-diffusion.cpp's own default (usually the first GPU it finds). Use "
-                "`cpu` to keep VRAM free for the chat model, or a per-module assignment such as "
-                "`clip=cpu,vae=cuda0,diffusion=vulkan0`. Run `sd-cli --list-devices` to see the "
-                "device names this build accepts. Overridable with HEARTH_DIFFUSION_BACKEND.",
+                "Blank = stable-diffusion.cpp's own auto-fit, which picks a GPU and spills to RAM "
+                "as needed (recommended). Use `cpu` to keep VRAM free for the chat model, or a "
+                "per-module assignment such as `diffusion=vulkan1,vae=cpu`. Run `sd-cli "
+                "--list-devices` to see the device names this build accepts. Overridable with "
+                "HEARTH_DIFFUSION_BACKEND.",
                 group="diffusion"),
 
     # ---- Defaults for one generation. The model may override most of them, but every value
     # is clamped in hearth/diffusion.py — a chatty model cannot ask for 10 000 steps.
     SettingSpec("diffusion.width", "Default width (px)", "int", 768,
-                "Default image width when the assistant does not choose one. Multiples of 64 suit "
-                "most models; 512 for SD1.5, 1024 for SDXL/Flux. Clamped to 64-2048 per call.",
+                "Default image width when the assistant does not choose one. Qwen Image handles "
+                "512-1328 well; keep multiples of 64 or it crops oddly. Clamped to 64-2048 per call.",
                 min=64, max=2048, group="diffusion"),
     SettingSpec("diffusion.height", "Default height (px)", "int", 768,
                 "Default image height when the assistant does not choose one. Same range and "
-                "guidance as width.",
+                "guidance as width; portrait examples: 640x896, 768x1024.",
                 min=64, max=2048, group="diffusion"),
     SettingSpec("diffusion.steps", "Default steps", "int", 20,
-                "Sampling steps per image. The main cost knob: 20 is a good default for most "
-                "models (Flux-distilled wants ~4, SDXL 20-30). Clamped to 1-60 per call so one "
-                "request cannot tie up the machine.",
+                "Sampling steps per image — the main cost knob, and roughly linear in time. Qwen "
+                "Image 2.1 is comfortable at 20; below ~12 fine detail suffers, above ~30 buys "
+                "little. Clamped to 1-60 per call so one request cannot tie up the machine.",
                 min=1, max=60, group="diffusion"),
     SettingSpec("diffusion.cfg_scale", "Default CFG scale", "float", 4.5,
-                "How strictly to follow the prompt. ~1.5 is loose and creative, ~4.5 suits Flux "
-                "(which is guidance-distilled), ~7 SDXL/SD1.5. Clamped to 0-30 per call.",
+                "How strictly to follow the prompt. 4.5 is the Qwen Image sweet spot: lower drifts "
+                "away from the description, higher burns contrast and posterises. Clamped per call.",
                 min=0.0, max=30.0, group="diffusion"),
-    SettingSpec("diffusion.strength", "Default denoising strength", "float", 0.75,
-                "Used only when generating FROM an image (`init_image`): 0.2 barely changes the "
-                "input, 0.75 transforms it while keeping composition.",
+    SettingSpec("diffusion.strength", "Default edit strength", "float", 0.6,
+                "Used only when drawing FROM an image (`init_image`): 0.2 barely changes the input, "
+                "0.6 keeps composition while restyling, 0.9 replaces most of it.",
                 min=0.0, max=1.0, group="diffusion"),
     SettingSpec("diffusion.seed", "Default seed (-1 = random)", "int", -1,
                 "Fix this to make every generation reproducible while you tune the model; leave at "
                 "-1 for variety. The assistant can still pass its own seed to refine one result.",
                 min=-1, max=2147483647, group="diffusion"),
-    SettingSpec("diffusion.preview", "Use a fast VAE preview while sampling", "bool", True,
-                "Passes `--preview vae` so step previews are decoded cheaply. Hearth always pins "
-                "this flag one way or the other: sd-cli defaults to `proj` AND writes ./preview.png "
-                "into the working directory, which would litter wherever Hearth happens to run.",
-                group="diffusion"),
 
     # ---- Limits ---------------------------------------------------------------------
     SettingSpec("diffusion.timeout_s", "Generation timeout (s)", "int", 600,
                 "Wall-clock limit for ONE sd-cli run, including model load — which is the bulk of "
-                "it for a big DiT model on CPU. Exceeding it kills the process and says so, rather "
-                "than leaving a chat waiting forever. Raise it for slow hardware or huge models; "
-                "lower it to catch a misconfigured build sooner.",
+                "it for a 7 GB DiT plus an 8B text encoder. Exceeding it kills the process and says "
+                "so rather than leaving a chat waiting forever. Lower it to catch a misconfigured "
+                "build sooner; raise it for slow hardware or big batches.",
                 min=30, max=7200, group="diffusion"),
     SettingSpec("diffusion.busy_timeout_s", "Queue wait (s)", "int", 900,
                 "Generations are serialised: two at once share memory bandwidth, make each other "
@@ -692,12 +781,116 @@ DIFFUSION_SPECS: list[SettingSpec] = [
                 min=0, max=3600, group="diffusion"),
     SettingSpec("diffusion.extra_args", "Diffusion extra args", "str", "",
                 "Raw CLI arguments appended verbatim to the sd-cli command, e.g. "
-                "\"--offload-to-cpu --flash-attn on\" or \"--vae-tiling\". Use this for anything "
-                "not covered above; a malformed value is refused rather than guessed at.",
+                "\"--vae-tiling --offload-to-cpu\". The escape hatch for anything not covered "
+                "above; a malformed value is refused rather than guessed at.",
                 group="diffusion"),
 ]
 
-ALL_SPECS: list[SettingSpec] = MODEL_SPECS + AGENT_SPECS + TOOL_SPECS + CAPTIONER_SPECS + DIFFUSION_SPECS
+# ---- Image EDITING: Qwen Image Edit, same sd-cli binary as generation ----------
+# A SECOND, independent model slot alongside the generation one (DEC-078). Qwen Image Edit
+# shares stable-diffusion.cpp's `sd-cli` and the same three-file shape — DiT + text encoder +
+# VAE — but it is a different set of weights: an Edit DiT, a Qwen2.5-VL text encoder (not the
+# Qwen3-VL that generation uses), and optionally a separate vision mmproj for the 2509
+# checkpoint. It edits by feeding a reference image in through `-r` (VLM + VAE conditioning),
+# which is not the same as img2img, and it samples at CFG ~2.5 with `--flow-shift 3`. So it
+# gets its own settings prefix (`image_edit.*`) and its own tool (`edit_image`); generation
+# keeps `diffusion.*` and `generate_image`. Both run through one shared runner and lock, so a
+# draw and an edit never overlap. Nothing is claimed to work until an admin supplies files.
+IMAGE_EDIT_SPECS: list[SettingSpec] = [
+    SettingSpec("image_edit.enabled", "Enable image editing", "bool", False,
+                "Let Hearth EDIT an existing picture with **Qwen Image Edit** by running the same "
+                "stable-diffusion.cpp `sd-cli` binary as a subprocess. This is separate from image "
+                "generation: generation draws from text, editing takes a picture you already have "
+                "and changes it by instruction (add/remove/modify elements, restyle, rotate, edit "
+                "text) while the Edit model preserves the rest. Leave off until the CLI path and "
+                "the Edit model folder below are set.",
+                group="image_edit"),
+    SettingSpec("image_edit.cli_bin", "stable-diffusion.cpp CLI path (editing)", "str", "",
+                "Absolute path to your `sd-cli` executable — usually the SAME binary as image "
+                "generation. Leave blank and Hearth reuses the generation CLI path, so you only "
+                "need to fill this if editing runs from a different build. Env fallback "
+                "HEARTH_IMAGE_EDIT_CLI_BIN.",
+                group="image_edit"),
+    SettingSpec("image_edit.model_dir", "Edit model folder", "str", "",
+                "The directory holding the Qwen Image Edit files — Hearth finds them by name, so "
+                "this is usually the only thing to fill in. Put the Edit DiT, the Qwen2.5-VL text "
+                "encoder, and the VAE here. This is NOT the generation folder: the Edit weights "
+                "and its text encoder are different files. Overridable with HEARTH_IMAGE_EDIT_MODEL_DIR.",
+                group="image_edit"),
+    SettingSpec("image_edit.dit_path", "Edit diffusion model (.gguf)", "str", "",
+                "The Qwen Image Edit transformer, e.g. Qwen_Image_Edit-Q8_0.gguf or "
+                "qwen-image-edit-2511-Q4_K_M.gguf — passed as `--diffusion-model`. Blank means: "
+                "whatever the edit model folder contains. Env fallback HEARTH_IMAGE_EDIT_DIT.",
+                group="image_edit"),
+    SettingSpec("image_edit.llm_path", "Text-encoder LLM (.gguf)", "str", "",
+                "Qwen Image Edit reads prompts and the reference image through Qwen2.5-VL (not the "
+                "Qwen3-VL that generation uses), so this is required — e.g. "
+                "Qwen2.5-VL-7B-Instruct-Q8_0.gguf or qwen_2.5_vl_7b.safetensors. Passed as `--llm`. "
+                "Blank means: whatever the edit model folder contains. Env fallback "
+                "HEARTH_IMAGE_EDIT_LLM.",
+                group="image_edit"),
+    SettingSpec("image_edit.vae_path", "VAE (.safetensors)", "str", "",
+                "The image decoder, usually qwen_image_vae.safetensors / diffusion_pytorch_model."
+                "safetensors. Passed as `--vae`. Blank means: whatever the edit model folder "
+                "contains. Env fallback HEARTH_IMAGE_EDIT_VAE.",
+                group="image_edit"),
+    SettingSpec("image_edit.llm_vision_path", "Vision encoder mmproj (optional, 2509)", "str", "",
+                "Only needed for the Qwen Image Edit **2509** checkpoint, which ships a separate "
+                "vision encoder passed as `--llm_vision` (e.g. Qwen2.5-VL-7B-Instruct.mmproj-"
+                "Q8_0.gguf). Leave blank for the original Qwen-Image-Edit and 2511, which fold "
+                "vision into the single text-encoder file — setting it when your checkpoint does "
+                "not want it is the one way to break an otherwise-good setup. Env fallback "
+                "HEARTH_IMAGE_EDIT_LLM_VISION.",
+                group="image_edit"),
+    SettingSpec("image_edit.zero_cond_t", "Zero-cond timestep (2511 checkpoints)", "bool", False,
+                "Turn ON only for the Qwen Image Edit **2511** checkpoint: it passes "
+                "`--model-args qwen_image_zero_cond_t=true`, without which edit quality degrades "
+                "badly. Leave OFF for the original Qwen-Image-Edit and 2509, which do not want it.",
+                group="image_edit"),
+    SettingSpec("image_edit.backend", "Compute backend (--backend)", "str", "",
+                "Blank = stable-diffusion.cpp's own auto-fit (recommended). Use `cpu` to keep VRAM "
+                "free for the chat model, or a per-module assignment such as "
+                "`diffusion=vulkan1,vae=cpu`. Same semantics as the generation backend setting. "
+                "Overridable with HEARTH_IMAGE_EDIT_BACKEND.",
+                group="image_edit"),
+
+    # ---- Defaults for one edit. The model may override most, but every value is clamped in
+    # hearth/diffusion.py; note the CFG default is 2.5 (what Edit is tuned for), not 4.5.
+    SettingSpec("image_edit.width", "Default width (px)", "int", 768,
+                "Default output width when the assistant does not choose one. Editing usually keeps "
+                "the input's proportions; keep multiples of 64. Clamped to 64-2048 per call.",
+                min=64, max=2048, group="image_edit"),
+    SettingSpec("image_edit.height", "Default height (px)", "int", 768,
+                "Default output height when the assistant does not choose one. Same range as width.",
+                min=64, max=2048, group="image_edit"),
+    SettingSpec("image_edit.steps", "Default steps", "int", 20,
+                "Sampling steps per edit — the main cost knob. 20 is a good default for Edit; below "
+                "~12 fine detail suffers. Clamped to 1-60 per call.",
+                min=1, max=60, group="image_edit"),
+    SettingSpec("image_edit.cfg_scale", "Default CFG scale", "float", 2.5,
+                "How strictly to follow the edit instruction. Qwen Image Edit is tuned around 2.5 — "
+                "much lower drifts from the request, much higher can override parts of the image you "
+                "wanted kept. Clamped per call.",
+                min=0.0, max=30.0, group="image_edit"),
+    SettingSpec("image_edit.seed", "Default seed (-1 = random)", "int", -1,
+                "Fix this to make every edit reproducible while you tune; leave at -1 for variety.",
+                min=-1, max=2147483647, group="image_edit"),
+
+    # ---- Limits ---------------------------------------------------------------------
+    SettingSpec("image_edit.timeout_s", "Edit timeout (s)", "int", 600,
+                "Wall-clock limit for ONE sd-cli edit run, including model load. Exceeding it kills "
+                "the process and says so. Lower to catch a misconfigured build sooner; raise for slow "
+                "hardware.",
+                min=30, max=7200, group="image_edit"),
+    SettingSpec("image_edit.extra_args", "Edit extra args", "str", "",
+                "Raw CLI arguments appended verbatim to the sd-cli edit command. The escape hatch for "
+                "anything not covered above; a malformed value is refused rather than guessed at.",
+                group="image_edit"),
+]
+
+
+ALL_SPECS: list[SettingSpec] = (MODEL_SPECS + AGENT_SPECS + TOOL_SPECS + CAPTIONER_SPECS
+                                + DIFFUSION_SPECS + IMAGE_EDIT_SPECS + UPLOAD_SPECS)
 SPEC_BY_KEY = {s.key: s for s in ALL_SPECS}
 
 
@@ -756,3 +949,4 @@ def set_many(values: dict) -> None:
 def _model():
     from .models import Setting
     return Setting
+

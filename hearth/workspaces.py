@@ -73,11 +73,37 @@ def rel_from_jail(user_id: str, abs_path: Path) -> str:
     return os.path.relpath(abs_path, root)
 
 
-def list_tree(user_id: str, rel_path: str = "", max_entries: int = 500) -> list[dict]:
+class EntryList(list):
+    """A `list` of workspace entries plus a truthful `truncated` flag.
+
+    Subclass rather than attribute-on-list: a plain Python list rejects arbitrary
+    attributes, and stuffing a sentinel dict into the list itself would make it look like
+    one more file to every existing consumer. Iteration, indexing, len(), slicing, equality
+    and JSON serialisation are all plain-list behaviour — `truncated` is invisible to them.
+
+    Slicing returns a plain list (CPython behaviour), i.e. the flag is deliberately lost: a
+    rebuilt list cannot know what was cut, and must not claim to.
+    """
+
+    truncated: bool = False
+
+
+def list_tree(user_id: str, rel_path: str = "", max_entries: int = 500) -> "EntryList":
+    """List one directory inside the jail, up to `max_entries`.
+
+    Returns an :class:`EntryList`; read `.truncated` to learn whether the scan stopped at
+    the cap. The old contract — "a list of exactly max_entries dicts" — could not
+    distinguish 'there were exactly 80' from 'there were 312', which is what made the prompt
+    listing's omission unquantifiable. Counting entries cannot fix that either: a capped read
+    yields no total, so probing cap+1 reports "1 more" for a directory with 308 hidden files
+    (AUDIT #1). The only honest statement is the boolean this returns.
+    """
     p = resolve_in_jail(user_id, rel_path or ".", allow_missing=False)
     out: list[dict] = []
+    truncated = False
     for entry in sorted(os.scandir(p), key=lambda e: (e.is_file(), e.name.lower())):
         if len(out) >= max_entries:
+            truncated = True
             break
         # skip symlinked dirs pointing outside
         rp = Path(os.path.realpath(entry.path))
@@ -90,7 +116,9 @@ def list_tree(user_id: str, rel_path: str = "", max_entries: int = 500) -> list[
             "is_dir": entry.is_dir(follow_symlinks=False),
             "size": st.st_size if entry.is_file(follow_symlinks=False) else None,
         })
-    return out
+    result = EntryList(out)
+    result.truncated = truncated
+    return result
 
 
 def read_text(user_id: str, rel_path: str, max_bytes: int = 256_000) -> str:

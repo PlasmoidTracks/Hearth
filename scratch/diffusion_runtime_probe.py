@@ -23,20 +23,63 @@ init_db()
 from hearth import diffusion as sd  # noqa: E402
 
 os.makedirs("/tmp/models", exist_ok=True)
-with open("/tmp/models/sd.gguf", "wb") as fh:
-    fh.write(b"fake")
+for _p in ("/tmp/models/sd.gguf", "/tmp/models/llm.gguf", "/tmp/models/vae.safetensors"):
+    with open(_p, "wb") as fh:
+        fh.write(b"fake")
 
 WRAPPER = os.path.join(ROOT, "scratch", "fake_tools", "wrapper-cli")
 os.chmod(WRAPPER, 0o755)
+# Qwen Image needs three files (see hearth/diffusion.py); the fake CLI ignores them, but
+# preflight refuses to launch without all three, so the probe has to provide them.
 BASE = {"diffusion.enabled": True,
-        "diffusion.model_path": "/tmp/models/sd.gguf",
-        "diffusion.cli_bin": WRAPPER}
+        "diffusion.cli_bin": WRAPPER,
+        "diffusion.dit_path": "/tmp/models/sd.gguf",
+        "diffusion.llm_path": "/tmp/models/llm.gguf",
+        "diffusion.vae_path": "/tmp/models/vae.safetensors"}
+
+
+# Process groups this probe knows Hearth created (the fake wrapper runs with
+# start_new_session=True, so its PGID equals its PID). Populated by the Popen spy below.
+OUR_GROUPS = set()
 
 
 def grandchildren():
-    """Any `sleep 60` still alive — the grandchild the wrapper spawns."""
-    r = subprocess.run(["pgrep", "-f", "sleep 60"], capture_output=True, text=True)
-    return [p for p in r.stdout.split() if p]
+    """Live members of a Hearth-created process group that mention `sleep 60`.
+
+    Deliberately NOT `pgrep -f "sleep 60"`: that pattern also matches the /bin/sh -c wrapper
+    of whatever shell invoked this probe, so it saw orphans that never existed and — worse —
+    could keep reporting FAIL long after Hearth had killed everything. Restricting to groups
+    Hearth itself created makes the claim about the thing being tested.
+    """
+    out = []
+    r = subprocess.run(["ps", "-eo", "pid,pgid,args", "--no-headers"],
+                       capture_output=True, text=True)
+    for line in r.stdout.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) < 3 or "sleep 60" not in parts[2]:
+            continue
+        try:
+            pid, pgid = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        if pid == pgid or pgid in OUR_GROUPS:
+            out.append(pid)
+    return out
+
+
+def _spy_popen():
+    """Wrap subprocess.Popen inside hearth.diffusion to record the groups it creates."""
+    real = sd.subprocess.Popen
+
+    class Spy(real):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            try:
+                OUR_GROUPS.add(os.getpgid(self.pid))
+            except OSError:
+                pass
+
+    sd.subprocess.Popen = Spy
 
 
 def settle():
@@ -61,6 +104,15 @@ def case_timeout():
 
 
 def case_cancel():
+    """Cooperative cancel must not be relied on to interrupt a blocking subprocess.
+
+    `cancel` is checked before launch and between steps, but sd-cli is one long blocking
+    child, so the real teardown comes from hearth.cancel (Stop → stop_active()) or from the
+    timeout. This case therefore asserts what is true and useful: the wait unwinds quickly
+    once the child dies, and nothing of Hearth's own process groups survives it. The old
+    version reported FAIL for 25 s of `th.join(20)` because nothing signalled the child at
+    all — which was a symptom of stop_active() being a no-op, not a property of cancel.
+    """
     settle()
     ev = threading.Event()
     out = {}
@@ -78,9 +130,11 @@ def case_cancel():
     time.sleep(1.5)
     t0 = time.time()
     ev.set()
+    stopped = sd.get_diffusion().stop_active()   # what Stop actually does (DEC-076)
     th.join(20)
-    ok = settle()
-    return ("PASS" if ok else "FAIL (orphan)") + f" | unwound in {time.time() - t0:.1f}s, {out.get('r', '')}"
+    ok = settle() and not th.is_alive() and bool(out.get("r"))
+    return (("PASS" if ok else "FAIL") + f" | unwound in {time.time() - t0:.1f}s, "
+            f"stop_active={stopped}, {out.get('r', 'thread still running')}")
 
 
 def case_busy():
@@ -105,6 +159,7 @@ def case_busy():
 
 
 if __name__ == "__main__":
+    _spy_popen()      # so orphan checks are about Hearth's own children only
     print("TIMEOUT :", case_timeout())
     print("CANCEL  :", case_cancel())
     print("BUSY    :", case_busy())
