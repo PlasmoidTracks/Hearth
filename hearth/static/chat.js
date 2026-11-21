@@ -1420,11 +1420,13 @@ async function loadSkills(){
 // bound to S.uploadToProject, `visible` decides whether it shows at all.
 const ATTACH_ITEMS = [
   { act: 'files',   icon: '📎', label: 'chat.upload' },
-  // Camera/gallery only makes sense while a project link is active (matches the
-  // previous behavior, where the capture input was only clickable then). Gated
-  // here via visible() instead of by un-hiding the raw <input type=file>.
-  { act: 'camera',  icon: '📷', label: 'chat.am_camera',
-    visible: ()=> !!(S.proj && S.proj.linked) },
+  // Shoot a new photo (capture="environment" opens the camera app directly on
+  // Android/iOS; the shot is staged as an attachment — nothing is saved to the
+  // gallery first). Always available, not just with a project link.
+  { act: 'camera',  icon: '📷', label: 'chat.am_camera' },
+  // Pick an existing image: no capture attribute, so Android shows its standard
+  // chooser (gallery / files) and the photo can be attached straight from there.
+  { act: 'gallery', icon: '🖼️', label: 'chat.am_gallery' },
   // Upload destination toggle (DEC-049): shown only when a project folder is
   // linked. Off = files attach to the chat as always (uploads/). On = files land
   // in the project copy so they can be applied to the real folder. The server
@@ -1496,6 +1498,7 @@ function attachMenuAction(act){
   // display:none inputs, so #cameraInput stays permanently hidden.
   if(act === 'files'){ const el=$('fileInput'); if(el) el.click(); return; }
   if(act === 'camera'){ const el=$('cameraInput'); if(el) el.click(); return; }
+  if(act === 'gallery'){ const el=$('galleryInput'); if(el) el.click(); return; }
 }
 
 // One-time wiring (runs at boot, after the menu button exists in the DOM).
@@ -1550,6 +1553,7 @@ $('retryBtn').onclick = retryLastTurn;
 wireAttachMenu();
 $('fileInput').onchange = (e) => { stageFiles(e.target.files); e.target.value=''; };
 $('cameraInput').onchange = (e) => { stageFiles(e.target.files); e.target.value=''; };
+$('galleryInput').onchange = (e) => { stageFiles(e.target.files); e.target.value=''; };
 $('langSel').onchange = (e) => setLanguage(e.target.value);
 wireDragDrop();
 

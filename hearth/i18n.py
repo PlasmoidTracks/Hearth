@@ -46,7 +46,8 @@ _EN = {
     # Composer attach menu (replaces the standalone 📎/📷 buttons; add future
     # composer actions here instead of growing the input row).
     "chat.attach_menu": "Attach",
-    "chat.am_camera": "Camera / Photo",
+    "chat.am_camera": "Take photo",
+    "chat.am_gallery": "Photo from gallery",
     "chat.am_proj_into": "Uploads \u2192 project",
     "chat.am_proj_hint": "Send uploads into the linked project folder instead of attaching them to this chat",
     # Linked project folder (DEC-049) — header chip + composer upload toggle.
@@ -218,7 +219,8 @@ _DE = {
     # Anhefte-Menü im Composer (ersetzt die einzelnen 📎-/📷-Knöpfe; künftige
     # Composer-Aktionen hier eintragen statt die Eingabezeile zu vergrößern).
     "chat.attach_menu": "Anhängen",
-    "chat.am_camera": "Kamera / Foto",
+    "chat.am_camera": "Foto aufnehmen",
+    "chat.am_gallery": "Foto aus der Galerie",
     "chat.am_proj_into": "Uploads \u2192 Projekt",
     "chat.am_proj_hint": "Uploads in den verknüpften Projektordner senden, statt sie an diesen Chat anzuhängen",
     # Verknüpfter Projektordner (DEC-049) — Kopfleiste + Upload-Ziel im Composer.

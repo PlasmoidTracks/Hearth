@@ -213,7 +213,12 @@
 
       <form id="composer" class="flex gap-2 items-end">
         <input type="file" id="fileInput" multiple class="hidden"/>
+        <!-- capture="environment": straight to the rear camera (Android/iOS) — the shot is
+             staged as an attachment directly, never saved to the gallery first. -->
         <input type="file" id="cameraInput" accept="image/*" capture="environment" class="hidden"/>
+        <!-- No capture attribute: Android shows its standard chooser (gallery / files), so
+             existing photos can be picked straight from the gallery. -->
+        <input type="file" id="galleryInput" accept="image/*" class="hidden"/>
         <!-- Attach menu: one button replaces the old 📎/📷 row (and later, more).
              The panel is positioned by chat.js (fixed, above the button) and closes
              on outside click / Escape / scroll / resize, like the conv ⋮ menu.
