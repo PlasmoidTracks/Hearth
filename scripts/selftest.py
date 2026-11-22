@@ -1594,8 +1594,10 @@ class CaptionerStreamTests(unittest.TestCase):
                 fh.write(b"x")
             settings = self._settings(**{"captioner.model_path": model,
                                          # preflight also wants a launchable server binary;
-                                         # no process is started here (external base_url).
-                                         "captioner.server_bin": sys.executable})
+                                         # the captioner uses the chat model's, so that is
+                                         # the setting to point at. No process is started
+                                         # here (external base_url).
+                                         "model.server_bin": sys.executable})
 
             # Not cancelled -> a normal caption.
             h = CancelHandle(user_id="u")
@@ -3044,6 +3046,113 @@ class MediaToolTests(unittest.TestCase):
         self.assertEqual(orch._image_parts("u", [{}]), [])
 
 
+class FsReadMediaGateTests(unittest.TestCase):
+    """fs_read refuses media by name and points at the tool that works.
+
+    Without this gate a model fs_reads a clip and receives the replacement characters of
+    its own bytes — a wall of U+FFFD that costs the context, reads as a corrupted file,
+    and invites an invented description of a video it never perceived.
+    """
+
+    PNG = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
+
+    def _conv(self, uid: str, cid: str):
+        from hearth.db import init_db, session_scope
+        from hearth.models import Conversation, User
+        init_db()
+        with session_scope() as s:
+            if s.get(User, uid) is None:
+                s.add(User(id=uid, username=f"u-{uid}", pw_hash="x"))
+            if s.get(Conversation, cid) is None:
+                s.add(Conversation(id=cid, user_id=uid, title="readgate"))
+
+    def test_media_extensions_are_refused_naming_the_right_tool(self):
+        import asyncio
+        from hearth.tools.fs_tools import FsReadTool
+        from hearth.tools import ToolContext
+        self._conv("readgate", "readgate-conv")
+        ctx = ToolContext("readgate", {}, conversation_id="readgate-conv")
+        cases = {"shot.png": self.PNG, "clip.mp4": b"\x00" * 4096,
+                 "voice.wav": b"RIFF" + b"\x00" * 4096, "doc.pdf": b"%PDF-1.7\n%\xff\xff\xff\xff\n"}
+        want = {"shot.png": "display_media", "clip.mp4": "view_video",
+                "voice.wav": "describe_audio", "doc.pdf": "pdf_read"}
+        for rel, blob in cases.items():
+            from hearth import workspaces as ws
+            ws.write_bytes("readgate", rel, blob)
+            r = asyncio.run(FsReadTool().run({"path": rel}, ctx))
+            self.assertFalse(r.ok, f"{rel} must not be readable as text")
+            self.assertIn(rel, r.content, "the refusal must name the file it refused")
+            self.assertIn(want[rel], r.content, f"{rel} should be pointed at {want[rel]}")
+            # No binary dump, and actionable advice rather than an apology.
+            self.assertNotIn("\ufffd", r.content, f"{rel}: no replacement characters to the model")
+            self.assertIn("Hint:", r.content)
+
+    def test_line_range_does_not_bypass_the_gate(self):
+        """The classic dodge: re-issue the same read with start_line/end_line."""
+        import asyncio
+        from hearth import workspaces as ws
+        from hearth.tools.fs_tools import FsReadTool
+        from hearth.tools import ToolContext
+        self._conv("readgate2", "readgate2-conv")
+        ws.write_bytes("readgate2", "clip.mp4", b"\x00" * 8192)
+        ctx = ToolContext("readgate2", {})
+        r = asyncio.run(FsReadTool().run({"path": "clip.mp4", "start_line": 1, "end_line": 5}, ctx))
+        self.assertFalse(r.ok)
+        self.assertIn("view_video", r.content)
+
+    def test_text_and_unknown_extensions_still_read(self):
+        import asyncio
+        from hearth import workspaces as ws
+        from hearth.tools.fs_tools import FsReadTool
+        from hearth.tools import ToolContext
+        self._conv("readgate3", "readgate3-conv")
+        ctx = ToolContext("readgate3", {}, conversation_id="readgate3-conv")
+        for rel in ("notes.md", "data.csv", "script.py", "config.json"):
+            ws.write_text("readgate3", rel, f"content of {rel}\nsecond line\n")
+            r = asyncio.run(FsReadTool().run({"path": rel}, ctx))
+            self.assertTrue(r.ok, f"{rel} must stay readable: {r.content}")
+            self.assertEqual(r.content.strip(), f"content of {rel}\nsecond line")
+        # An unrecognised suffix is NOT assumed binary — refusing it would hide real text.
+        ws.write_text("readgate3", "weird.dat", "plain text in an odd wrapper\n")
+        r = asyncio.run(FsReadTool().run({"path": "weird.dat"}, ctx))
+        self.assertTrue(r.ok, f"unknown extension must remain readable: {r.content}")
+
+    def test_svg_is_readable_text_not_media(self):
+        """mimetypes calls .svg image/svg+xml; it is XML and fs_read on it works."""
+        import asyncio
+        from hearth import workspaces as ws
+        from hearth.tools.display_media import media_kind
+        from hearth.tools.fs_tools import FsReadTool
+        from hearth.tools import ToolContext
+        self._conv("readgate4", "readgate4-conv")
+        svg = '<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"/>'
+        ws.write_text("readgate4", "icon.svg", svg)
+        self.assertEqual(media_kind("icon.svg"), "", "SVG is text, not browser media here")
+        r = asyncio.run(FsReadTool().run({"path": "icon.svg"}, ToolContext("readgate4", {})))
+        self.assertTrue(r.ok, f"SVG must read as text: {r.content}")
+        self.assertEqual(r.content, svg)
+
+    def test_gate_runs_before_the_jail_read(self):
+        """A media path that does not exist still says 'not found', never 'is an image'."""
+        import asyncio
+        from hearth.tools.fs_tools import FsReadTool
+        from hearth.tools import ToolContext
+        self._conv("readgate5", "readgate5-conv")
+        r = asyncio.run(FsReadTool().run({"path": "gone.mp4"}, ToolContext("readgate5", {})))
+        self.assertFalse(r.ok)
+        self.assertIn("not found", r.content)
+        self.assertNotIn("view_video", r.content)
+
+    def test_fs_read_description_warns_in_advance(self):
+        """The model should not have to discover the gate by hitting it."""
+        from hearth.tools import TOOLS_BY_NAME
+        desc = TOOLS_BY_NAME["fs_read"].description
+        self.assertIn("Text only", desc)
+        for tool in ("view_video", "describe_audio", "pdf_read"):
+            self.assertIn(tool, desc)
+
+
 class DisplayMediaToolTests(unittest.TestCase):
     """display_media: showing a workspace file to the USER, not to the model.
 
@@ -3635,6 +3744,142 @@ class ErrorHintTests(unittest.TestCase):
         self.assertIn('relative to your workspace', esc.content)
 
 
+class ToolArgHardeningTests(unittest.TestCase):
+    """A malformed or field-less tool call must reach the model as its REAL error.
+
+    Regression for the reported bug: an over-large fs_write streamed as unparseable JSON,
+    the provider fell back to {_raw: ...}, `args.get("path","")` was "" and fs_write wrote
+    *at the workspace directory* → "[Errno 21] Is a directory". That OS error reached the
+    model and operator instead of the cause ("arguments were not valid JSON / no path"), so
+    both hunted a phantom workspace fault. _run_tool now refuses such calls at the seam,
+    before any tool body runs, for every tool.
+    """
+
+    def test_malformed_args_refused_with_real_cause(self):
+        import asyncio
+        from hearth.tools import ToolContext
+        from hearth.llm.base import ToolRequest, RAW_ARGS_KEY
+        from hearth import orchestrator as orch
+        ctx = ToolContext('harden1', {}, conversation_id='harden-conv')
+        req = ToolRequest('fs_write', {RAW_ARGS_KEY: '{"content":"<!DOCTYPE html><ht'},
+                          call_id='c1')
+        r = asyncio.run(orch._run_tool(req, ctx))
+        self.assertFalse(r.ok)
+        # The real cause is named, and the raw blob never leaks back as if it were a path.
+        self.assertIn('valid JSON', r.content)
+        self.assertNotIn('Errno 21', r.content)
+
+    def test_missing_required_arg_named_not_errno(self):
+        import asyncio
+        from hearth.tools import ToolContext
+        from hearth.llm.base import ToolRequest
+        from hearth import orchestrator as orch
+        ctx = ToolContext('harden2', {}, conversation_id='harden-conv')
+        # No path at all: must name `path`, never surface a directory error.
+        r = asyncio.run(orch._run_tool(ToolRequest('fs_write', {'content': 'hi'}, call_id='c'), ctx))
+        self.assertFalse(r.ok)
+        self.assertIn('path', r.content)
+        self.assertNotIn('Errno 21', r.content)
+        # exec names its own required field (proves the check is schema-driven, not fs-only).
+        e = asyncio.run(orch._run_tool(ToolRequest('exec', {'reason': 'x'}, call_id='c'), ctx))
+        self.assertFalse(e.ok)
+        self.assertIn('command', e.content)
+
+    def test_valid_call_still_runs(self):
+        import asyncio
+        from hearth.tools import ToolContext
+        from hearth.llm.base import ToolRequest
+        from hearth import orchestrator as orch
+        ctx = ToolContext('harden3', {}, conversation_id='harden-conv')
+        r = asyncio.run(orch._run_tool(
+            ToolRequest('fs_write', {'path': 'ok.txt', 'content': 'hi'}, call_id='c'), ctx))
+        self.assertTrue(r.ok, r.content)
+        self.assertIn('wrote ok.txt', r.content)
+
+    def test_truncated_write_reports_size_and_tail(self):
+        """A cut-off fs_write must say HOW MUCH was generated and where it broke.
+
+        The operator's report was 'fs_write keeps erroring, I raised max_tokens to 32768 and
+        it still fails'. The old refusal said only 'not valid JSON' — no size, no tail — so a
+        token cap and an unescaped quote were indistinguishable and nothing was actionable.
+        """
+        import asyncio
+        from hearth.tools import ToolContext
+        from hearth.llm.base import ToolRequest, RAW_ARGS_KEY
+        from hearth import orchestrator as orch
+        ctx = ToolContext('harden-tail', {}, conversation_id='harden-conv')
+        big = '{"path": "index.html", "content": "<html>' + '<div>x</div>' * 500
+        r = asyncio.run(orch._run_tool(
+            ToolRequest('fs_write', {RAW_ARGS_KEY: big}, call_id='c1', args_raw=big), ctx))
+        self.assertFalse(r.ok)
+        self.assertIn(str(len(big)), r.content, "the generated size must be named")
+        self.assertIn('<div>x</div>', r.content, "the tail where it broke must be shown")
+        self.assertTrue((r.meta or {}).get('malformed', {}).get('unclosed_string'),
+                        "an unterminated value must be classified as cut off")
+
+    def test_round_max_tokens_gives_tool_rounds_room(self):
+        """Tool rounds get a larger token budget than reply rounds.
+
+        Tool-call arguments are generated text, so model.max_tokens truncated them too —
+        that is what made long fs_write calls arrive as unparseable JSON. Reply rounds must
+        still honour model.max_tokens exactly (that setting means 'how long may an answer be').
+        """
+        from hearth.orchestrator import _round_max_tokens as R, TOOL_ARG_TOKENS
+        self.assertEqual(R(2048, False), 2048, "reply rounds keep the admin cap")
+        self.assertEqual(R(2048, True, 16384), 16384, "tool rounds get the arg budget")
+        self.assertEqual(R(32768, True, 16384), 32768,
+                         "never lowers an explicit larger admin value")
+        self.assertEqual(R(2048, True, None), TOOL_ARG_TOKENS, "missing setting falls back")
+        self.assertEqual(R(2048, True, 'junk'), TOOL_ARG_TOKENS, "junk falls back")
+
+    def test_tool_arg_max_tokens_setting_exists_and_is_bounded(self):
+        from hearth.runtime_settings import SPEC_BY_KEY
+        s = SPEC_BY_KEY.get('agent.tool_arg_max_tokens')
+        self.assertIsNotNone(s, "the tool-arg token budget must be admin-editable")
+        self.assertEqual(s.default, 16384)
+        self.assertLessEqual(s.min, 16384)
+        self.assertLessEqual(16384, s.max)
+
+    def test_validate_required_is_schema_driven(self):
+        from hearth.tools.base import validate_required
+
+        class T:
+            def parameters(self):
+                return {"type": "object",
+                        "properties": {"path": {"type": "string"},
+                                       "n": {"type": "integer"}},
+                        "required": ["path"]}
+        t = T()
+        self.assertEqual(validate_required(t, {"path": 'a'}), '')
+        self.assertIn('path', validate_required(t, {}))
+        self.assertIn('path', validate_required(t, {'path': '   '}))   # blank == absent
+        # 0 / False / [] are legitimate values, never "absent".
+        self.assertEqual(validate_required(t, {"path": 0}), '')
+
+    def test_raised_isadirectory_error_explained(self):
+        import asyncio
+        from hearth.tools import ToolContext
+        from hearth.tools.base import Tool as _T
+        from hearth.llm.base import ToolRequest
+        from hearth import orchestrator as orch
+
+        class Boom(_T):
+            name = 'boom_harden'
+            def parameters(self):
+                return {"type": "object", "properties": {}, "required": []}
+            async def run(self, args, ctx):
+                raise IsADirectoryError(21, 'Is a directory', '/ws/root')
+        orch.TOOLS_BY_NAME['boom_harden'] = Boom()
+        try:
+            r = asyncio.run(orch._run_tool(ToolRequest('boom_harden', {}, call_id='c'),
+                                           ToolContext('harden4', {})))
+            self.assertFalse(r.ok)
+            # The exception type is named and the path problem explained, not a bare Errno.
+            self.assertIn('DIRECTORY', r.content)
+        finally:
+            orch.TOOLS_BY_NAME.pop('boom_harden', None)
+
+
 class FeatureI18nTests(unittest.TestCase):
     """Keys added with the reasoning / steering / prefill work must be translated."""
 
@@ -3957,7 +4202,7 @@ class CaptionerTests(unittest.TestCase):
             model = os.path.join(d, "omni.gguf")
             open(model, "wb").write(b"x")
             s = self._settings(**{"captioner.model_path": model,
-                                  "captioner.server_bin": sys.executable})
+                                  "model.server_bin": sys.executable})
             argv = cap.build_argv(s)
         self.assertEqual(argv[0], sys.executable)
         self.assertIn("--model", argv)
@@ -3973,21 +4218,48 @@ class CaptionerTests(unittest.TestCase):
         from hearth import captioner as cap
         with self.assertRaises(cap.CaptionError) as cm:
             cap.build_argv(self._settings(**{"captioner.model_path": "",
-                                             "captioner.server_bin": sys.executable}))
+                                             "model.server_bin": sys.executable}))
         self.assertIn("model", str(cm.exception).lower())
         with tempfile.TemporaryDirectory() as d:
             missing = os.path.join(d, "nope.gguf")
             with self.assertRaises(cap.CaptionError) as cm2:
                 cap.build_argv(self._settings(**{"captioner.model_path": missing,
-                                                 "captioner.server_bin": sys.executable}))
+                                                 "model.server_bin": sys.executable}))
         self.assertIn("not found", str(cm2.exception))
         with tempfile.TemporaryDirectory() as d:
             model = os.path.join(d, "omni.gguf")
             open(model, "wb").write(b"x")
             with self.assertRaises(cap.CaptionError) as cm3:
                 cap.build_argv(self._settings(**{"captioner.model_path": model,
-                                                 "captioner.server_bin": "/no/such/llama-server"}))
+                                                 "model.server_bin": "/no/such/llama-server"}))
         self.assertIn("binary", str(cm3.exception).lower())
+
+    def test_captioner_always_uses_the_chat_models_binary(self):
+        # There is no captioner-specific binary setting any more: the audio model runs the
+        # same llama-server as the chat model, so it inherits `model.server_bin` and must
+        # ignore any leftover `captioner.server_bin` row from an older database.
+        from hearth import captioner as cap
+        from hearth import runtime_settings as rs
+        self.assertNotIn("captioner.server_bin", {s.key for s in rs.ALL_SPECS})
+        p = cap.resolve_paths(self._settings(**{"model.server_bin": "/main/build/llama-server"}))
+        self.assertEqual(p["bin"], "/main/build/llama-server")
+        # A stale stored override must NOT win — the main model's path is authoritative.
+        p2 = cap.resolve_paths(self._settings(**{
+            "model.server_bin": "/main/build/llama-server",
+            "captioner.server_bin": "/old/separate/build/llama-server"}))
+        self.assertEqual(p2["bin"], "/main/build/llama-server")
+
+    def test_missing_binary_points_at_the_model_settings(self):
+        # The old message told people to fill in a captioner field that no longer exists.
+        from hearth import captioner as cap
+        s = self._settings(**{"captioner.enabled": True, "model.server_bin": ""})
+        with self.assertRaises(cap.CaptionError) as cm:
+            cap.build_argv(self._settings(**{**s, "captioner.model_path": "/tmp/whatever.gguf"}))
+        msg = str(cm.exception)
+        self.assertIn("Admin → Model", msg)
+        self.assertNotIn("Admin → Audio → 'Captioner llama-server binary'", msg)
+        self.assertNotIn("Captioner llama-server binary", cap.preflight(
+            {**s, "captioner.model_path": "/tmp/whatever.gguf"}) or "")
 
     def test_bad_extra_args_are_refused_not_guessed(self):
         from hearth import captioner as cap
@@ -3995,7 +4267,7 @@ class CaptionerTests(unittest.TestCase):
             model = os.path.join(d, "omni.gguf")
             open(model, "wb").write(b"x")
             s = self._settings(**{"captioner.model_path": model,
-                                  "captioner.server_bin": sys.executable,
+                                  "model.server_bin": sys.executable,
                                   "captioner.extra_args": "--unbalanced-quote \""})
             with self.assertRaises(cap.CaptionError):
                 cap.build_argv(s)
@@ -4227,7 +4499,7 @@ class CaptionerTests(unittest.TestCase):
         import asyncio
         c = cap.Captioner()
         st = asyncio.run(c.status(self._settings(**{"captioner.model_path": "",
-                                                    "captioner.server_bin": ""})))
+                                                    "model.server_bin": ""})))
         self.assertEqual(st["kind"], "captioner")
         self.assertIn("reachable", st)
         self.assertIn("capabilities", st)
@@ -5326,7 +5598,173 @@ class DiffusionEditProfileTests(unittest.TestCase):
         self.assertIn("prompt", r2.content.lower())
 
 
+class PathBrowseTests(unittest.TestCase):
+    """Server-side folder browsing for the admin path fields (DEC-080).
+
+    The admin UI asks for absolute paths on the machine running Hearth — a
+    llama-server binary, .gguf weights, an mmproj. Before this there was no way to
+    discover one without leaving the browser, so every test here is about landing
+    the picker in the right place and telling the truth when it cannot.
+    """
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+        self.root = Path(tempfile.mkdtemp(prefix="pathbrowse-"))
+        (self.root / "models").mkdir()
+        (self.root / "models" / "alpha.gguf").write_bytes(b"x" * 1234)
+        (self.root / "models" / "beta.gguf").write_bytes(b"y" * 99)
+        (self.root / "models" / "sub").mkdir()
+        (self.root / "models" / "sub" / "mmproj.gguf").write_bytes(b"z" * 7)
+
+    def test_lists_folders_first_with_paths_and_sizes(self):
+        from hearth import pathbrowse as pb
+        d = pb.browse(str(self.root / "models"))
+        self.assertTrue(d["ok"], d.get("error"))
+        self.assertEqual(d["path"], str(self.root / "models"))
+        names = [e["name"] for e in d["entries"]]
+        self.assertEqual(names, ["sub/", "alpha.gguf", "beta.gguf"])   # dirs first
+        alpha = next(e for e in d["entries"] if e["name"] == "alpha.gguf")
+        self.assertFalse(alpha["is_dir"])
+        self.assertEqual(alpha["size"], 1234)
+        self.assertTrue(alpha["path"].endswith("/models/alpha.gguf"))
+
+    def test_a_file_in_the_box_opens_its_folder(self):
+        """The headline behaviour: Browse starts where the current value lives."""
+        from hearth import pathbrowse as pb
+        d = pb.browse(str(self.root / "models" / "alpha.gguf"))
+        self.assertTrue(d["ok"], d.get("error"))
+        self.assertEqual(d.get("parent_note"), str(self.root / "models"))
+        self.assertIn("beta.gguf", [e["name"] for e in d["entries"]])
+
+    def test_half_typed_path_still_lands_in_the_deepest_real_folder(self):
+        """A settings box is usually mid-edit; an error alone would leave nowhere to go."""
+        from hearth import pathbrowse as pb
+        d = pb.browse(str(self.root / "models" / "gam.gg"))
+        self.assertFalse(d["ok"])
+        self.assertIn("not found", d["error"].lower())
+        self.assertEqual(d.get("parent_note"), str(self.root / "models"))
+        self.assertTrue(len(d["entries"]) >= 2)
+
+    def test_empty_value_starts_at_the_filesystem_root(self):
+        from hearth import pathbrowse as pb
+        d = pb.browse("")
+        self.assertTrue(d["ok"], d.get("error"))
+        self.assertEqual(d["path"], "")            # address bar stays empty, not "/"
+        self.assertTrue(len(d["entries"]) > 0)
+
+    def test_relative_paths_are_refused_not_guessed(self):
+        """Interpreting 'models' against Hearth's cwd would silently pick a random dir."""
+        from hearth import pathbrowse as pb
+        self.assertEqual(pb.resolve("relative/thing.gguf"), "")
+        d = pb.browse("relative/thing.gguf")
+        self.assertTrue(d["ok"])                   # falls back to root, never an error page
+
+    def test_expands_home_and_strips_quotes(self):
+        from hearth import pathbrowse as pb
+        import os
+        self.assertEqual(pb.resolve("~/models"), os.path.join(os.path.expanduser("~"), "models"))
+        self.assertEqual(pb.resolve(f'"{self.root}/models"'), str(self.root / "models"))
+
+    def test_tilde_is_the_servers_home_not_a_guess(self):
+        """The ⌂ ~ button sends a literal '~'; the server resolves it (DEC-080)."""
+        from hearth import pathbrowse as pb
+        d = pb.browse("~")
+        self.assertTrue(d["ok"], d.get("error"))
+        self.assertTrue(os.path.isdir(d["path"]))
+        self.assertEqual(d["path"], os.path.expanduser("~"))
+
+    def test_unreadable_folder_says_why(self):
+        from hearth import pathbrowse as pb
+        if os.getuid() == 0:
+            self.skipTest("running as root — permissions do not deny anything here")
+        d = pb.browse("/root")
+        self.assertFalse(d["ok"])
+        self.assertIn("ermission", d["error"])
+
+    def test_broken_symlink_is_listed_not_hidden(self):
+        import os
+        from hearth import pathbrowse as pb
+        os.symlink(str(self.root / "nope"), str(self.root / "models" / "dangling.gguf"))
+        d = pb.browse(str(self.root / "models"))
+        self.assertIn("dangling.gguf", [e["name"] for e in d["entries"]])
+
+    def test_truncation_is_announced(self):
+        from hearth import pathbrowse as pb
+        big = self.root / "big"
+        big.mkdir()
+        for i in range(pb.MAX_ENTRIES + 5):
+            (big / f"f{i}.bin").write_bytes(b"")
+        d = pb.browse(str(big))
+        self.assertTrue(d["truncated"])
+        self.assertEqual(len(d["entries"]), pb.MAX_ENTRIES)
+        self.assertEqual(d["total"], pb.MAX_ENTRIES + 5)
+
+    def test_is_path_matches_the_naming_convention_only(self):
+        from hearth import pathbrowse as pb
+        for key in ("model.server_bin", "model.model_path", "model.mmproj_path",
+                    "captioner.cli_bin", "diffusion.model_dir", "image_edit.llm_vision_path"):
+            self.assertTrue(pb.is_server_path(key), key)
+        # str settings that merely talk about paths/devices must NOT get a picker.
+        for key in ("model.device", "diffusion.backend", "captioner.extra_args",
+                    "web.allow_domains", "agent.tool_output_exempt_tools", "model.n_ctx"):
+            self.assertFalse(pb.is_server_path(key), key)
+
+    def test_every_path_setting_is_exposed_as_one(self):
+        """A spec named *_path/_bin/_dir must actually be type str, or no Browse button draws."""
+        from hearth import runtime_settings as rs
+        for s in rs.ALL_SPECS:
+            if s.key.endswith(("_path", "_bin", "_dir")):
+                self.assertEqual(s.type, "str", f"{s.key} is not a str field")
+
+
+@unittest.skipUnless(os.environ.get("HEARTH_RUN_HTTP"), "set HEARTH_RUN_HTTP=1")
+class PathBrowseHttpTests(unittest.TestCase):
+    """The endpoint's gate and payload shape."""
+
+    def _login_admin(self, c):
+        from hearth.main import ensure_bootstrap_admin
+        pw = os.environ.get("BOOT_PW") or ensure_bootstrap_admin()
+        r = c.post("/auth/login", data={"username": "admin", "password": pw})
+        self.assertEqual(r.status_code, 200, f"admin login must work in tests: {r.status_code}")
+        return {"X-CSRF-Token": c.cookies.get("hearth_csrf", "")}
+
+    def test_browse_requires_auth(self):
+        from fastapi.testclient import TestClient
+        from hearth.main import create_app
+        with TestClient(create_app()) as c:
+            self.assertEqual(c.get("/api/admin/browse-path", params={"path": "/tmp"}).status_code, 401)
+
+    def test_tilde_is_the_servers_home(self):
+        """The ⌂ ~ button sends a literal '~'; the server resolves it to its own home."""
+        import os
+        from fastapi.testclient import TestClient
+        from hearth.main import create_app
+        with TestClient(create_app()) as c:
+            self._login_admin(c)
+            d = c.get("/api/admin/browse-path", params={"path": "~"}).json()
+            self.assertTrue(d["ok"], d.get("error"))
+            self.assertEqual(d["path"], os.path.expanduser("~"))
+
+    def test_admin_lists_and_flags_path_fields(self):
+        import tempfile
+        from pathlib import Path
+        from fastapi.testclient import TestClient
+        from hearth.main import create_app
+        root = Path(tempfile.mkdtemp(prefix="pbhttp-"))
+        (root / "a.gguf").write_bytes(b"12345")
+        with TestClient(create_app()) as c:
+            self._login_admin(c)
+            d = c.get("/api/admin/browse-path", params={"path": str(root)}).json()
+            self.assertTrue(d["ok"], d.get("error"))
+            self.assertEqual([e["name"] for e in d["entries"]], ["a.gguf"])
+            # The UI derives Browse buttons from spec.is_path — it must be on the wire.
+            specs = c.get("/api/admin/settings").json()["specs"]
+            by_key = {s["key"]: s for s in specs}
+            self.assertTrue(by_key["model.model_path"].get("is_path"))
+            self.assertFalse(by_key["model.device"].get("is_path"))
+
+
 if __name__ == "__main__":
     print(f"[selftest] data dir = {_tmp}")
     unittest.main(verbosity=2)
-

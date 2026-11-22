@@ -10,6 +10,27 @@ from dataclasses import dataclass, field
 from typing import AsyncIterator
 
 
+# The sentinel key a provider uses when it could NOT parse the model's tool-call
+# arguments as JSON (a truncated or malformed blob from an over-large write). Rather than
+# dropping the call, the provider stashes the unparseable string under this single key so
+# the request still flows through the pipeline with an id and a name. The orchestrator
+# detects it via `malformed_args()` and refuses the call with a clear message BEFORE any
+# tool runs — otherwise `args.get("path", "")` silently returns "" and the tool fails on
+# something unrelated (writing to a directory → "[Errno 21] Is a directory"), which is
+# exactly what hid the real cause in the reported bug.
+RAW_ARGS_KEY = "_raw"
+
+
+def malformed_args(args: dict) -> bool:
+    """True when `args` is the provider's unparseable-JSON fallback, not real arguments.
+
+    A genuine tool call never carries a key literally named RAW_ARGS_KEY (no schema uses
+    it), so its presence — and nothing else about the value — is the marker that the JSON
+    never parsed. Checked by the orchestrator before executing any tool.
+    """
+    return isinstance(args, dict) and RAW_ARGS_KEY in args
+
+
 @dataclass
 class ToolRequest:
     name: str

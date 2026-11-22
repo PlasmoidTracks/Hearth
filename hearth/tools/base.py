@@ -1,5 +1,7 @@
 """Tool base + result type."""
 from __future__ import annotations
+import json
+import re
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -89,6 +91,102 @@ class ToolResult:
     # is the one shape proven to reach an mmproj vision model — hearth's own upload
     # path. Nothing else reads this field, so older tools are unaffected.
     images: list | None = None
+
+
+# Argument shapes that count as "not provided" for a required string argument. A model
+# that omits `path` sends nothing; one whose JSON got mangled (see llm/base.RAW_ARGS_KEY)
+# sends an empty dict; some send "" or whitespace. All three mean the same thing to the
+# tool: it cannot do its job. Normalising them here lets ONE check cover every tool rather
+# than each tool rediscovering the difference between absent and empty.
+_EMPTY_STRINGS = (None, "", " ")
+
+
+def _arg_is_absent(value) -> bool:
+    """True when a required argument is missing or an empty/whitespace string.
+
+    Deliberately treats 0 / False / [] as PRESENT — those are legitimate values for many
+    arguments; only None and blank strings count as absent. Containers are not deep-checked
+    here (a tool that needs a non-empty list says so itself); this catches the common,
+    silent "the field just wasn't there" case.
+    """
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return value.strip() == ""
+    return False
+
+
+def validate_required(tool: "Tool", args: dict) -> str:
+    """Return a model-facing error string if a required argument is missing, else "".
+
+    Reads the tool's OWN JSON schema (`parameters()["required"]`) so hardening applies to
+    every present and future tool with no per-tool code — add `required: ["path"]` to a
+    schema and this catches it. Why centralised: when a provider could not parse a call's
+    JSON it fell back to `{_raw: ...}`, so `args.get("path", "")` returned "" and fs_write
+    tried to write *at the workspace directory* → "[Errno 21] Is a directory". That OS error
+    reached the model and the operator instead of the truth ("no path was given"), and both
+    went hunting for a phantom problem in the workspace. A named, required-but-absent field
+    is now reported at the seam, before any tool body runs.
+
+    The message names the missing field(s) and points at the schema — enough for the model
+    to correct the call rather than repeat it.
+    """
+    try:
+        schema = tool.parameters() or {}
+    except Exception:  # noqa: BLE001 — a broken schema must not crash the check
+        return ""
+    required = schema.get("required") or []
+    if not isinstance(required, list):
+        return ""
+    props = schema.get("properties") or {}
+    missing = [k for k in required if _arg_is_absent((args or {}).get(k))]
+    if not missing:
+        return ""
+    from ..errors import hint
+    described = ", ".join(missing)
+    shapes = ", ".join(f"{k}:{(props.get(k) or {}).get('type', 'string')}" for k in missing)
+    return hint("missing_arg",
+                f"missing required argument(s): {described}. This tool needs "
+                f"{{{shapes}}}; the call ran with none of them.")
+
+
+
+def diagnose_truncation(raw: str, tail_chars: int = 400) -> dict:
+    """Describe an unparseable tool-call argument blob so the failure is actionable.
+
+    Called when a provider could not parse a call's JSON (llm/base.RAW_ARGS_KEY). The
+    operator's question at that moment is always one of two things — "did generation get cut
+    off?" or "did the model write invalid JSON?" — and neither can be answered from the raw
+    string without looking at it. This derives the cheap signals:
+
+      chars        how much was generated before it stopped
+      tail         the last `tail_chars` characters, i.e. exactly where it broke
+      stopped_at   "mid-string" (an unterminated JSON value ⇒ cut off) vs
+                   "at a structural point" (a complete-looking object that is still invalid
+                   ⇒ malformed by the model, not truncated)
+      unclosed     count of unbalanced `"` in the tail — nonzero means it died inside a value
+
+    Never raises: this runs on the failure path, and a diagnostic must not become a second
+    failure. The blob may hold arbitrary user-file content, so callers put `tail` only where
+    an authorised operator will read it (the debug bubble), never into a shared audit row.
+    """
+    s = str(raw or "")
+    tail = s[-tail_chars:] if len(s) > tail_chars else s
+    try:
+        json.loads(s or "{}")
+        parsed_ok = True
+    except Exception:  # noqa: BLE001 — by definition this is the unparseable path
+        parsed_ok = False
+    # Does it end inside a string value? Count quotes outside backslash escapes; an odd
+    # number means one string was opened and never closed.
+    unescaped = re.sub(r'\\\\.', '', s)          # drop escape pairs like \" \\ \n
+    unclosed = unescaped.count('"') % 2
+    stopped_at = ("mid-string — generation stopped inside an unterminated value, "
+                  "which is what a token cap looks like" if unclosed
+                  else "at a structural point — the JSON is complete-looking but invalid, "
+                       "so it was malformed rather than cut off")
+    return {"chars": len(s), "tail": tail, "stopped_at": stopped_at,
+            "unclosed_string": bool(unclosed), "parsed_ok": parsed_ok}
 
 
 class Tool(ABC):

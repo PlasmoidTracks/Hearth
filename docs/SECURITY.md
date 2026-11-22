@@ -70,6 +70,16 @@ under the user's root, rejecting absolute paths, `..` traversal, and symlinks po
 Unit-tested in `scripts/selftest.py`. Downloads use short-lived, process-scoped tokens bound to
 a concrete file path.
 
+**The one deliberate exception:** `GET /api/admin/browse-path` (`hearth/pathbrowse.py`) is *not*
+jailed — it lists directories anywhere on the server so an admin can point Hearth at a model or
+binary outside any jail. It is `require_admin`, read-only (no write/move/delete counterpart exists
+to reach), runs off the event loop, caps and labels its listing, refuses relative paths rather than
+guessing a base, and audits every call as `path_browse`. The premise: an admin who can enable
+Command execution already has this filesystem, so a path allowlist would break real setups without
+adding protection. **Never hand out the admin role to someone you would not give a shell on that
+machine** — that is the true blast radius, browsing or no browsing. User-facing file access remains
+fully jailed and unchanged.
+
 ## Command execution (defense in depth)
 Three independent controls must all allow a command:
 1. Admin enablement (`tools.exec`, default off).

@@ -57,11 +57,25 @@ ERROR_HINTS = {
     # The call succeeded and legitimately produced nothing.
     "empty_result": "Try a broader pattern, check spelling, or fs_list the folder to "
                     "explore instead of repeating this search.",
-    # Malformed tool-call JSON (raised at the provider boundary, see llm/llama_server.py).
-    "malformed_args": "Resend the call with valid JSON. If a string value is large, split "
-                      "it across several smaller fs_write/fs_append calls instead of one.",
+    # The model's tool-call arguments never parsed as JSON (see llm/base.RAW_ARGS_KEY).
+    # The blob is unusable and NO field of it reached the tool, so re-sending the same
+    # thing reproduces the failure; the only way out is smaller calls that fit in one
+    # clean JSON object.
+    "malformed_args": "Your tool-call arguments were not valid JSON (likely truncated or an "
+                      "unescaped quote/newline inside a long string value), so nothing was run. "
+                      "Do not resend the same call — split large content across several smaller "
+                      "fs_write/fs_append calls and include every required field.",
+    # A required argument was absent or empty (e.g. fs_write with no path). The tool names
+    # which one; this says what to do about it.
+    "missing_arg": "Re-send the call WITH that argument filled in. If you are unsure of a "
+                   "value (like a file path), decide on it first — do not send the call empty.",
     # The model asked for a line range past the end of the file.
     "bad_range": "Read from line 1, or omit start_line/end_line to read the whole file.",
+    # fs_read was pointed at media (image/audio/video/PDF). The refusal already names the
+    # tool that works; this is the belt-and-braces version of "do not try again" — without
+    # it, models re-issue the same read with a line range, which does not make a video text.
+    "not_a_text_file": "Do not retry fs_read on this file (with or without a line range) and "
+                       "never describe its contents from the refusal — use the tool named above.",
 }
 
 

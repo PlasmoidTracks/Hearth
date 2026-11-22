@@ -139,18 +139,43 @@ def capabilities() -> dict:
 
 # ---- configuration -----------------------------------------------------------
 
+def _main_bin(settings: dict) -> str:
+    """The llama-server binary the captioner must use: the main model's, always.
+
+    Deliberately identical to manager.ModelManager._resolve_launch_paths() so the
+    captioner can never launch a different executable from the chat model: admin setting
+    `model.server_bin` wins, then HEARTH_LLAMA_SERVER_BIN / .env, then the boot default.
+    There is no captioner-specific override — one llama.cpp build serves both models, and
+    a second path would only be a way to make them drift apart.
+    """
+    from .config import get_boot_settings
+    bin_path = (settings.get("model.server_bin") or "").strip()
+    if bin_path:
+        return bin_path
+    try:
+        return str(get_boot_settings().llama_server_bin or "").strip()
+    except Exception:  # noqa: BLE001 — boot settings are cached; never break status()
+        return os.environ.get("HEARTH_LLAMA_SERVER_BIN", "")
+
+
 def resolve_paths(settings: dict) -> dict:
     """Resolve the captioner's paths/ports from runtime settings with env fallbacks.
 
     Settings win; HEARTH_CAPTIONER_* env vars are the deployment-level fallback, exactly
     as HEARTH_LLAMA_* is for the main model. Split out so status(), argv building and the
     preview can never disagree about what Hearth would actually run.
+
+    The llama-server *binary* has no captioner-specific setting at all: it is always the
+    main model's (`model.server_bin`, falling back to `HEARTH_LLAMA_SERVER_BIN` / boot
+    config). One llama.cpp build on a machine runs both models — there is no setup where
+    audio works but the chat model does not, so a second path would only be a chance to
+    make them disagree. `captioner.cli_bin` remains, because llama-mtmd-cli is a different
+    executable rather than the same one twice.
     """
     def sget(key: str, env: str) -> str:
         return str(settings.get(key) or "").strip() or os.environ.get(env, "")
 
-    bin_path = sget("captioner.server_bin", "HEARTH_CAPTIONER_SERVER_BIN") \
-        or sget("model.server_bin", "HEARTH_LLAMA_SERVER_BIN")
+    bin_path = _main_bin(settings)
     cli_bin = sget("captioner.cli_bin", "HEARTH_CAPTIONER_CLI_BIN")
     if not cli_bin:
         # Derive from the server binary when only that is configured: sibling binaries in
@@ -200,8 +225,9 @@ def build_argv(settings: dict) -> list[str]:
     """The llama-server command for the captioner. Raises CaptionError if unlaunchable."""
     p = resolve_paths(settings)
     if not p["bin"]:
-        raise CaptionError("no llama-server binary configured for the captioner "
-                           "(Admin → Audio → 'Captioner llama-server binary')")
+        raise CaptionError("no llama-server binary configured — the captioner uses the same one "
+                           "as the chat model, so set it in Admin → Model → 'llama-server binary "
+                           "path' (or HEARTH_LLAMA_SERVER_BIN)")
     if not p["model"]:
         raise CaptionError("no captioner model path set (Admin → Audio → 'Captioner model .gguf')")
     if not have(p["bin"]):
@@ -362,7 +388,8 @@ def preflight(settings: dict) -> str:
             return f"captioner mmproj file not found: {p['mmproj']}"
     else:
         if not p["bin"]:
-            return "no captioner llama-server binary is set (Admin → Audio)"
+            return "no llama-server binary is set — the captioner uses the same one as the " \
+                   "chat model, so set it in Admin → Model → 'llama-server binary path'"
         if not have(p["bin"]):
             return f"captioner llama-server binary not found: {p['bin']}"
     return ""

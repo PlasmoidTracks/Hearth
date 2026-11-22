@@ -79,8 +79,9 @@ chunks (`captioner.chunk_seconds`, needs `ffmpeg`) so it can say "at 1:30 she la
 `server` falls back to `cli` mid-caption if its process dies.
 
 **Admin → Model → Loaded models** lists the chat model *and* the captioner with real running/configured
-state, and each can be started or stopped without disturbing the other. Env fallbacks:
-`HEARTH_CAPTIONER_MODEL_PATH`, `_MMPROJ_PATH`, `_SERVER_BIN`, `_CLI_BIN`, `_BASE_URL` (an externally
+state, and each can be started or stopped without disturbing the other. The captioner runs **the same
+`llama-server` binary as the chat model**, so there is no separate binary to configure — only its weights
+differ. Env fallbacks: `HEARTH_CAPTIONER_MODEL_PATH`, `_MMPROJ_PATH`, `_CLI_BIN`, `_BASE_URL` (an externally
 run captioner server Hearth will use but never launch or kill). See docs/FEATURES.md and DEC-056.
 
 ### Images: drawing with Qwen Image (optional)
@@ -215,6 +216,7 @@ hearth/            application package
   db.py models.py  SQLite (SQLAlchemy)   security.py  scrypt/tokens/TOTP/CSRF
   deps.py          authn/authz + CSRF     ratelimit.py  lockout
   workspaces.py    per-user path jail    sandbox.py    bwrap/docker/stub exec
+  pathbrowse.py    admin-only server-side folder picker for path settings (DEC-080)
   artifacts.py     durable per-user files (produced/uploaded) + ownership-scoped download
   i18n.py          German/English UI strings + per-user language preference
   orchestrator.py  per-turn agent loop   prompt.py     system prompt assembly

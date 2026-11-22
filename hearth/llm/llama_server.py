@@ -14,7 +14,7 @@ from typing import AsyncIterator
 
 import httpx
 
-from .base import Provider, StreamEvent, ToolRequest
+from .base import Provider, StreamEvent, ToolRequest, RAW_ARGS_KEY
 
 # `"key": "value"` — used to pull the first string value (the file path in practice)
 # out of a PARTIAL tool-call JSON fragment for the live progress chip. Tolerant by
@@ -540,7 +540,14 @@ class LlamaServerProvider(Provider):
                 try:
                     args = json.loads(slot["args"] or "{}")
                 except json.JSONDecodeError:
-                    args = {"_raw": slot["args"]}
+                    # The model's tool-call JSON did not parse (a truncated / malformed
+                    # blob, typically from an over-large fs_write). We keep the request
+                    # flowing with the raw string under RAW_ARGS_KEY so it still has an id
+                    # and name; the orchestrator detects this via malformed_args() and
+                    # refuses it with a clear message before any tool runs. Do NOT let the
+                    # fallback args reach a tool: `args.get("path","")` would be "" and the
+                    # tool would fail on an unrelated error, hiding the real cause.
+                    args = {RAW_ARGS_KEY: slot["args"]}
                 yield StreamEvent("tool_request",
                                   tool=ToolRequest(slot["name"], args, call_id=slot["id"],
                                                    args_raw=slot["args"]))

@@ -72,9 +72,16 @@ function field(s){
   else input = `<input type="${s.type==='int'||s.type==='float'?'number':'text'}" data-key="${s.key}" value="${v??''}" class="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-sm w-40"/>`;
   const range = (s.min!=null||s.max!=null)?` <span class="text-slate-500">[range ${s.min??'-∞'}…${s.max??'∞'}]</span>`:'';
   const reload = s.requires_reload?` <span class="text-amber-400" title="requires model reload">⟳</span>`:'';
+  // A `str` holding a path on the machine running Hearth gets Browse: the browser's own
+  // file dialog cannot supply a server path, so this is the only way to avoid typing
+  // /home/…/build/bin/llama-server by hand. Rule comes from the server (spec.is_path).
+  const browse = (s.type==='str' && s.is_path)
+    ? `<button type="button" data-browse="${s.key}" title="Choose a file or folder on the machine running Hearth"
+         class="shrink-0 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1 text-xs">📁 Browse</button>` : '';
+  const inputWrap = browse ? `<div class="flex items-stretch gap-1.5 min-w-0">${input}${browse}</div>` : input;
   return `<div class="grid grid-cols-1 md:grid-cols-3 gap-2 py-3 border-b border-slate-800 items-start">
     <div><label class="text-sm font-medium">${s.label} ${reload}</label></div>
-    <div>${input}</div>
+    <div>${inputWrap}</div>
     <div class="text-xs text-slate-400 leading-relaxed">${s.description}${range}</div>
   </div>`;
 }
@@ -88,6 +95,28 @@ function fieldsSafe(specs){
     catch(e){ html += `<div class="py-2 text-xs text-red-400 border-b border-slate-800">⚠ could not render setting <code>${esc(s&&s.key||'?')}</code>: ${esc(String(e))}</div>`; }
   }
   return html;
+}
+
+// Browse buttons are built inside HTML strings, so they can only be wired once the
+// string is in the DOM. Rather than make every tab remember, the tab dispatcher
+// wires them after EVERY render (see the .tab click handler near TABS) — which also
+// covers the Project tab's hand-built folder box.
+function wireBrowseButtons(root){
+  (root||document).querySelectorAll('[data-browse]').forEach(b=>{
+    b.onclick = ()=> openPathBrowser(b.dataset.browse, b);
+  });
+}
+
+// The path a Browse dialog should open at: the current value's folder if there is
+// one, otherwise nothing (the server then offers drives / filesystem root).
+// Passing the whole value is deliberate — the server resolves a file to its parent,
+// so "start where I left off" works whether the box holds a .gguf or a folder.
+// `__proj_target` is the Project tab's hand-built folder box, which has no setting
+// key; it is addressed by element id instead.
+function browseStartValue(key){
+  const el = key === '__proj_target' ? $('projTarget')
+                                  : document.querySelector(`[data-key="${key}"]`);
+  return (el && typeof el.value === 'string') ? el.value.trim() : '';
 }
 
 async function renderModel(){
@@ -278,7 +307,7 @@ async function renderModel(){
     useLlama.disabled = true; useLlama.textContent = 'Switching…';
     try { await api('/api/admin/settings',{method:'POST',body:JSON.stringify({'model.backend':'llama-server'})}); }
     catch(e){ /* status refresh below shows the truth either way */ }
-    renderModel();
+    renderModel().then(wireBrowseButtons);
   };
 
   // Long launch → immediate, visible feedback plus live status, then refresh. The
@@ -301,7 +330,7 @@ async function renderModel(){
         b.textContent = out.server_reachable ? '✓ llama-server is up.'
                                              : '⚠ ' + (out.hint || 'Not reachable.');
       }
-      setTimeout(()=>renderModel(), 900);
+      setTimeout(()=>renderModel().then(wireBrowseButtons), 900);
     }, {status:'modelBusy', elapsed:elapsedMsg, detail:detailMsg, keepElapsed:1000});
   };
   wireOp($('startModel'), '/api/admin/model/start', {},
@@ -323,7 +352,7 @@ async function renderModel(){
       catch(e){ out = {hint:String(e)}; }
       const box = $('capTest');
       if(box && out && out.hint){ box.classList.remove('hidden'); box.textContent = '⚠ '+out.hint; }
-      setTimeout(()=>renderModel(), 900);
+      setTimeout(()=>renderModel().then(wireBrowseButtons), 900);
     }, {elapsed:detail||'loading captioner weights', keepElapsed:1000});
   };
   wireCap($('startCap'), '/api/admin/captioner/start', {}, 'Starting captioner…',
@@ -416,8 +445,12 @@ async function renderAudio(){
   const live = !!(cs && cs.reachable);
   const ffmpegOk = !!(cs && cs.capabilities && cs.capabilities.ffmpeg);
   const on = !!(cs && cs.enabled);
+  // The captioner has no binary setting of its own — it always runs the chat model's
+  // llama-server (see captioner._main_bin), so this tile reports that shared path rather
+  // than offering a second one to fill in.
+  const binPath = (cs && cs.paths && cs.paths.bin) || '';
   const stateHtml = `
-    <div class="grid grid-cols-2 md:grid-cols-4 gap-2 mb-4 text-sm">
+    <div class="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-5 gap-2 mb-4 text-sm">
       <div class="rounded-lg border p-2.5 ${live?'border-emerald-700/60 bg-emerald-900/20':'border-slate-700 bg-slate-800/40'}">
         <div class="stat-k">Captioner server</div>
         <div class="mt-1 flex items-center gap-2 font-medium ${live?'text-emerald-400':'text-slate-300'}">
@@ -440,6 +473,11 @@ async function renderAudio(){
         <div class="mt-1 font-medium ${ffmpegOk?'text-emerald-400':'text-amber-400'}">${ffmpegOk?'available':'not found'}</div>
         <div class="text-[11px] text-slate-400 mt-0.5">resample + chunking</div>
       </div>
+      <div class="rounded-lg border p-2.5 ${binPath?'':'border-amber-700/60 bg-amber-900/20'}">
+        <div class="stat-k">llama-server binary</div>
+        <div class="mt-1 font-medium ${binPath?'text-slate-200':'text-amber-400'}">${binPath?'shared with chat model':'not set'}</div>
+        <div class="text-[11px] text-slate-400 mt-0.5 truncate" title="${esc(binPath||'set it in Admin → Model')}">${esc(binPath||'Admin → Model → llama-server binary path')}</div>
+      </div>
     </div>
     ${(cs && cs.hint) ? `<div class="mb-4 rounded-lg border border-amber-700/60 bg-amber-900/20 p-3 text-xs text-amber-300">⚠ ${esc(cs.hint)}</div>`:''}
     ${(!ffmpegOk && cs) ? `<div class="mb-4 rounded-lg border border-slate-700 bg-slate-800/40 p-3 text-xs text-slate-300">
@@ -447,7 +485,7 @@ async function renderAudio(){
 
   const BTN = 'rounded-lg px-3 py-1.5 text-xs disabled:opacity-50 disabled:cursor-not-allowed';
   $('panel').innerHTML = `
-    <p class="text-xs text-slate-400 mb-3">A second, independent llama.cpp model that listens to audio and describes it as text — voices, timbre, emotion, music, ambience — so the chat model can reason about a recording without needing audio support itself. Typically a Qwen-Omni-class MoE model; CPU offload is the default so it does not compete with the chat model for VRAM.</p>
+    <p class="text-xs text-slate-400 mb-3">A second, independent llama.cpp model that listens to audio and describes it as text — voices, timbre, emotion, music, ambience — so the chat model can reason about a recording without needing audio support itself. Typically a Qwen-Omni-class MoE model; CPU offload is the default so it does not compete with the chat model for VRAM. It runs <strong>the same llama-server binary as the chat model</strong> (Admin → Model) — only its weights differ, so there is nothing to configure twice.</p>
     ${stateHtml}
     <div class="flex flex-wrap items-center gap-2 mb-4">
       <button id="saveAudio" class="${BTN} bg-sky-600 hover:bg-sky-500 text-sm px-4 py-2">Save</button>
@@ -472,7 +510,7 @@ async function renderAudio(){
       try { out = await (await api(path,{method:'POST',body:JSON.stringify(body||{})})).json(); }
       catch(e){ out = {hint:String(e)}; }
       if(b && out && out.hint){ b.classList.remove('hidden'); b.textContent = '⚠ '+out.hint; }
-      setTimeout(()=>renderAudio(), 900);
+      setTimeout(()=>renderAudio().then(wireBrowseButtons), 900);
     }, {elapsed:'loading captioner weights — can take minutes', keepElapsed:1000});
   };
   wire($('startCap2'), '/api/admin/captioner/start', {}, 'Starting…');
@@ -783,13 +821,26 @@ async function renderLog(){
 }
 
 const TABS = {model:renderModel, audio:renderAudio, images:renderImages, agent:renderAgent, tools:renderTools, project:renderProject, users:renderUsers, docs:renderDocs, log:renderLog, audit:renderAudit};
+
+// Panel draws are awaited. They used to be fire-and-forget, which meant the click
+// handler returned while the panel was still empty — and anything done after it (wiring
+// Browse buttons) ran against a DOM that did not exist yet. It appeared to work only
+// because renderModel() is fast enough on some tabs and never on Project/Audio/Images.
+async function showTab(name){
+  const fn = TABS[name];
+  if (!fn) return;
+  await loadSettings();
+  await fn();
+  wireBrowseButtons();   // needs the drawn panel, hence the awaits above
+}
+
 document.querySelectorAll('.tab').forEach(b=> b.onclick=async ()=>{
   document.querySelectorAll('.tab').forEach(x=>x.classList.remove('bg-slate-800'));
   b.classList.add('bg-slate-800');
   stopLogTimer();   // the log tab re-arms it; other tabs must not keep polling
-  await loadSettings(); TABS[b.dataset.tab]();
+  await showTab(b.dataset.tab);
 });
-(async()=>{ await loadSettings(); renderModel(); })();
+(async()=>{ await showTab('model'); })();
 
 // ---- Linked project folder (DEC-049) ---------------------------------------
 // Admin-facing control for the one linked folder. The agent never uses this screen: it
@@ -805,6 +856,7 @@ async function renderProject(){
   html += `<div class="flex flex-wrap gap-2 items-end mb-4">
     <label class="flex-1 min-w-[260px]"><span class="text-xs text-slate-400">Folder path (absolute, on the machine running Hearth)</span>
       <input id="projTarget" class="mt-1 w-full rounded-lg bg-slate-800 border border-slate-700 px-3 py-2 text-sm" placeholder="/home/you/projects/myapp" value="${esc(st.target_abs||'')}"/></label>
+    <button id="projBrowse" data-browse="__proj_target" class="rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 px-3 py-2 text-xs">📁 Browse</button>
     <button id="projLink" class="rounded-lg bg-sky-600 px-4 py-2 text-sm">Link</button>
     ${st.linked?`<button id="projImport" class="rounded-lg bg-emerald-700 px-4 py-2 text-sm">${st.files?'Re-import':'Import'}</button>
       <button id="projUnlink" class="rounded-lg bg-slate-700 px-4 py-2 text-sm">Unlink</button>`:''}
@@ -845,26 +897,226 @@ async function renderProject(){
     const r = await api('/api/admin/project/link',{method:'POST',body:JSON.stringify({target:$('projTarget').value})});
     const d = await r.json();
     if(!r.ok){ msg(d.detail||'Could not link that folder.', true); return; }
-    msg(d.linked?'Linked. Now press Import to copy it in.':'Unlinked.'); renderProject();
+    msg(d.linked?'Linked. Now press Import to copy it in.':'Unlinked.'); renderProject().then(wireBrowseButtons);
   });
   if ($('projImport')) $('projImport').onclick = beginOp($('projImport'), 'Importing…', async ()=>{
     const r = await api('/api/admin/project/import',{method:'POST',body:'{}'});
     const d = await r.json();
-    if(!r.ok){ msg(d.detail||'Import failed.', true); renderProject(); return; }
+    if(!r.ok){ msg(d.detail||'Import failed.', true); renderProject().then(wireBrowseButtons); return; }
     msg(`Imported ${d.copied} of ${d.files} file(s)` + (d.truncated?' (hit the size/file cap — raise it under Tools → Linked project folder)':''));
-    renderProject();
+    renderProject().then(wireBrowseButtons);
   });
   if ($('projUnlink')) $('projUnlink').onclick = async ()=>{
     const del = confirm('Unlink this folder?\n\nOK also deletes the workspace copy (project/). Cancel keeps the copy so you can still read what the assistant changed.');
     await api('/api/admin/project/unlink',{method:'POST',body:JSON.stringify({delete_copy:del})});
-    renderProject();
+    renderProject().then(wireBrowseButtons);
   };
   document.querySelectorAll('.revertBtn').forEach(b=> b.onclick = beginOp(b, 'Reverting…', async ()=>{
     const r = await api('/api/admin/project/revert',{method:'POST',body:JSON.stringify({backup_id:b.dataset.b})});
     const d = await r.json();
     msg(r.ok ? (d.note||'Reverted.') : (d.detail||'Revert failed.'), !r.ok);
-    renderProject();
+    renderProject().then(wireBrowseButtons);
   }));
 }
 
 function fmtBytes(n){ if(n==null) return ''; if(n<1024) return n+' B'; if(n<1048576) return (n/1024).toFixed(1)+' KB'; return (n/1048576).toFixed(1)+' MB'; }
+
+// ---- Server-side path browser (DEC-080) ------------------------------------
+// Every binary/model setting asks for an absolute path on the machine running Hearth,
+// and until now the only way to fill one in was to type or paste it. The browser's own
+// file dialog cannot help: <input type=file> hands back a fake name inside the browser's
+// sandbox, never a real server path — so this walks the *server's* directories instead
+// (GET /api/admin/browse-path, admin-only and audited).
+//
+// It opens wherever the field already points: put the folder of the current value up, so
+// choosing the sibling .gguf you meant is two clicks. That "start where I left off"
+// behaviour is the whole point — a dialog that always began at / would just move the
+// typing somewhere slightly nicer.
+//
+// PATHPICK.dir = the folder actually being shown; entries are kept in .all and the
+// name filter runs CLIENT-side (see drawPathEntries). Sending `q` to the server would
+// re-request the directory on every keystroke — slower, and it flickers when someone
+// pauses mid-word. The endpoint still accepts q for direct/manual use.
+let PATHPICK = null;   // {key, dir, all} while open; null when closed
+let PATH_SEQ = 0;      // guards against an older reply landing after a newer one
+
+async function openPathBrowser(key){
+  const start = browseStartValue(key);   // the current value → its folder (DEC-080)
+  closePathBrowser();
+  PATHPICK = {key: key, dir: '', all: []};
+  document.body.insertAdjacentHTML('beforeend', PATH_BROWSER_SHELL);
+  wirePathBrowserShell();
+  renderPathStatus('<span class="spinner"></span> Loading…');
+  await loadPathBrowse(start || '');
+}
+
+// GET /api/admin/browse-path. `path` may be a folder, a file (the server lists its
+// parent and says so in parent_note), empty (drives/root), or half-typed.
+async function loadPathBrowse(path){
+  if (!PATHPICK) return;
+  const seq = ++PATH_SEQ;
+  let d = null;
+  try {
+    d = await (await api(`/api/admin/browse-path?path=${encodeURIComponent(path||'')}`)).json();
+  } catch(e){
+    if (seq !== PATH_SEQ) return;   // superseded by a newer navigation
+    renderPathStatus(`<div class="text-xs text-red-400 p-3">Could not read this folder: ${esc(String(e))}</div>`);
+    return;
+  }
+  if (seq !== PATH_SEQ || !PATHPICK) return;   // a newer response already drew
+
+  // Where "here" is: the server's parent_note when it redirected file→folder, else the
+  // directory it listed. Everything else in the dialog (↑, filter) works off this.
+  PATHPICK.dir = d.parent_note || (d.ok ? d.path : '');
+  PATHPICK.all = d.entries || [];
+
+  const note = $('pathPickNote');
+  if (note) note.innerHTML = d.parent_note
+    ? `Showing the folder containing <span class="font-mono">${esc(path)}</span>` : '';
+  const addr = $('pathPickAddr');
+  if (addr && document.activeElement !== addr) addr.value = PATHPICK.dir || '';
+  const err = $('pathPickErr');
+  if (err){
+    if (d.error){ err.classList.remove('hidden'); err.textContent = '⚠ ' + d.error; }
+    else err.classList.add('hidden');
+  }
+  drawPathEntries(d);
+}
+
+// Swap the list area for a transient message (loading / an error), or re-create the
+// list container. #pathPickBody's innerHTML is replaced wholesale — it starts out with
+// no #pathPickList at all, so drawing must always create it rather than assume one is
+// there (an earlier version did, and every listing silently vanished into a null).
+function renderPathStatus(html){
+  const host = $('pathPickBody');
+  if (!host) return;
+  host.innerHTML = `<div class="text-xs">${html}</div>`;
+}
+
+function drawPathEntries(d){
+  const host = $('pathPickBody');
+  if (!host) return;
+  let list = $('pathPickList');
+  if (!list){
+    host.innerHTML = '<div id="pathPickList" class="text-xs"></div>';
+    list = $('pathPickList');
+  }
+  const f = ($('pathPickFilter') && $('pathPickFilter').value || '').trim().toLowerCase();
+  const entries = f ? (PATHPICK.all || []).filter(e=> e.name.toLowerCase().includes(f))
+                    : (PATHPICK.all || []);
+  if (!entries.length){
+    list.innerHTML = `<div class="text-xs text-slate-500 p-3">${
+      f ? `Nothing here matches “${esc(f)}”.` : 'This folder is empty.'}</div>`;
+    return;
+  }
+  const row = (e)=>{
+    const sz = e.is_dir ? '' : `<span class="text-slate-500 shrink-0 ml-2">${fmtBytes(e.size)}</span>`;
+    // Paths go through esc() for the visible text and encodeURIComponent for the
+    // attribute payload (decoded back at click time) — esc() alone does not escape a
+    // quote, so a filename containing one would otherwise break out of the attribute.
+    const nav = encodeURIComponent(e.path);
+    return `<button type="button" data-nav="${nav}" ${e.is_dir?'':`data-pick="${nav}"`}
+      class="w-full flex items-center gap-2 px-3 py-1.5 text-left hover:bg-slate-800 border-b border-slate-800/60 text-xs font-mono">
+      <span class="shrink-0 w-4 text-center ${e.is_dir?'text-sky-400':'text-slate-500'}">${e.is_dir?'📁':'·'}</span>
+      <span class="flex-1 truncate" title="${esc(e.path)}">${esc(e.name)}</span>${sz}</button>`;
+  };
+  list.innerHTML = entries.map(row).join('') + (d.truncated
+    ? `<div class="text-[11px] text-amber-400 p-3">Showing the first ${entries.length} of ${d.total} entries — `
+      + `type in the filter above to narrow it.</div>` : '');
+  // A folder navigates; a file picks itself and closes. One handler per row, bound
+  // after every draw since the list is replaced wholesale.
+  list.querySelectorAll('[data-nav]').forEach(b=>{
+    b.onclick = ()=> loadPathBrowse(decodeURIComponent(b.dataset.nav));
+  });
+  list.querySelectorAll('[data-pick]').forEach(b=>{
+    b.onclick = ()=> choosePath(decodeURIComponent(b.dataset.pick));
+  });
+}
+
+// Write the chosen path into the settings box. Nothing is saved here — the value sits
+// in the input exactly as if it had been typed, so the admin still presses Save like
+// any other edit. That keeps one save path and one audit event instead of two.
+function choosePath(p){
+  if (!PATHPICK) return;
+  const el = PATHPICK.key === '__proj_target' ? $('projTarget')
+                                              : document.querySelector(`[data-key="${PATHPICK.key}"]`);
+  if (el){
+    el.value = p;
+    el.focus();
+    // A field the admin just changed should look changed: every tab's Save reads
+    // live DOM values, so this is honest even though VALUES still holds the old one.
+    el.classList.add('ring-1','ring-sky-500');
+  }
+  closePathBrowser();
+}
+
+function closePathBrowser(){
+  PATHPICK = null;
+  const shell = $('pathPickShell');
+  if (shell) shell.remove();
+  document.removeEventListener('keydown', pathBrowserKeys);
+}
+
+function pathBrowserKeys(ev){
+  if (!PATHPICK) return;
+  if (ev.key === 'Escape'){ ev.preventDefault(); closePathBrowser(); }
+  // Enter in the address box means "go to that path"; a non-empty filter box just
+  // applies itself immediately, so Enter there has nothing left to do.
+  if (ev.key === 'Enter' && ev.target.id === 'pathPickAddr'){
+    ev.preventDefault();
+    const addr = $('pathPickAddr');
+    loadPathBrowse(addr && addr.value.trim() ? addr.value : PATHPICK.dir);
+  }
+}
+
+const PATH_BROWSER_SHELL = `
+<div id="pathPickShell" class="fixed inset-0 z-50 bg-black/70 flex items-center justify-center p-3" role="dialog" aria-modal="true">
+  <div class="w-full max-w-2xl max-h-[85vh] flex flex-col rounded-xl border border-slate-700 bg-slate-900 shadow-2xl">
+    <div class="px-4 py-3 border-b border-slate-800">
+      <div class="flex items-center gap-2">
+        <h3 class="font-medium text-sm">Choose on the machine running Hearth</h3>
+        <button type="button" id="pathPickClose" class="ml-auto rounded-lg bg-slate-800 hover:bg-slate-700 px-2.5 py-1 text-xs">✕ Close</button>
+      </div>
+      <p class="text-[11px] text-slate-400 mt-1">Folders open with a click; a file is chosen and the dialog closes. Nothing is saved until you press <b>Save</b>.</p>
+      <div id="pathPickNote" class="text-[11px] text-sky-300 mt-1"></div>
+      <div class="flex items-stretch gap-1.5 mt-2">
+        <button type="button" id="pathPickUp" title="One folder up"
+          class="rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2.5 text-sm">↑</button>
+        <button type="button" id="pathPickRoots" title="Filesystem root (drives on Windows)"
+          class="rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2.5 py-1 text-xs">⌂ root</button>
+        <button type="button" id="pathPickHome" title="Home folder of the account running Hearth"
+          class="rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2.5 py-1 text-xs">⌂ ~</button>
+        <input id="pathPickAddr" placeholder="/home/you/models — paste a path and press Enter"
+          class="flex-1 min-w-0 bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs font-mono"/>
+      </div>
+      <input id="pathPickFilter" placeholder="Filter names in this folder…"
+        class="mt-1.5 w-full bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs"/>
+      <div id="pathPickErr" class="hidden mt-1.5 rounded-lg border border-amber-700/60 bg-amber-900/20 p-2 text-[11px] text-amber-300"></div>
+    </div>
+    <div id="pathPickBody" class="flex-1 min-h-0 overflow-auto"></div>
+  </div>
+</div>`;
+
+function wirePathBrowserShell(){
+  $('pathPickClose').onclick = closePathBrowser;
+  // Click the dim backdrop to dismiss, like every other dialog.
+  $('pathPickShell').onclick = (ev)=>{ if (ev.target.id === 'pathPickShell') closePathBrowser(); };
+  $('pathPickUp').onclick = ()=> loadPathBrowse(PATHPICK.dir ? parentDir(PATHPICK.dir) : '');
+  $('pathPickRoots').onclick = ()=> loadPathBrowse('');
+  // ~ is resolved by the SERVER (it is Hearth's home, not the browser machine's), via
+  // pathbrowse.resolve()'s expanduser — so no client-side guesswork about who we are.
+  $('pathPickHome').onclick = ()=> loadPathBrowse('~');
+  // Filtering is local: re-draw the entries already in hand, no round trip.
+  $('pathPickFilter').oninput = ()=>{ if (PATHPICK) drawPathEntries({entries: PATHPICK.all}); };
+  document.addEventListener('keydown', pathBrowserKeys);
+}
+
+// Client-side "up one". The server already returns `parent`, but after a file→folder
+// redirect the dialog's own notion of "where I am" is PATHPICK.dir, so trim that
+// rather than re-deriving it from whatever the last response happened to say.
+function parentDir(p){
+  const s = String(p||'').replace(/[\\/]+$/,'');
+  const i = Math.max(s.lastIndexOf('/'), s.lastIndexOf('\\'));
+  if (i <= 0) return '';           // reached the top: let the server show drives/root
+  return s.slice(0, i);
+}

@@ -41,12 +41,75 @@ def media_kind(rel_path: str) -> str:
     the model supplied, and it must stay cheap enough to call per file per turn. The
     orchestrator uses the same function so the server's idea of what is displayable and
     the client's rendering cannot drift apart.
+
+    SVG deliberately reads as NOT media here even though mimetypes says image/svg+xml:
+    an SVG is XML text, fs_read on it works, and refusing a file the agent can read is
+    worse than letting one odd format through.
     """
-    mime = mimetypes.guess_type(os.path.basename(str(rel_path or "")))[0] or ""
+    name = os.path.basename(str(rel_path or ""))
+    if name.lower().endswith(".svg"):
+        return ""
+    mime = mimetypes.guess_type(name)[0] or ""
     for role in ("image", "audio", "video"):
         if mime.startswith(role + "/"):
             return role
     return ""
+
+
+# Formats that are neither text nor one of the three browser-presentable kinds, but that
+# a dedicated hearth tool can still get at. A PDF has an embedded text stream, so fs_read
+# on it "works" while silently dropping every figure, scan and its layout — which is worse
+# than a refusal, because the model never learns it got a partial document.
+NON_TEXT_KINDS = {".pdf": "pdf"}
+
+
+def non_text_kind(rel_path: str) -> str:
+    """'pdf' | '' for formats that are not readable text but are not media either.
+
+    Kept separate from media_kind() because the two answer different questions: display
+    cares what a BROWSER can present (a PDF cannot, so it is refused there), while the fs
+    tools care what a MODEL can read. A PDF therefore appears here and not in
+    media_kind().
+    """
+    name = os.path.basename(str(rel_path or "")).lower()
+    for ext, kind in NON_TEXT_KINDS.items():
+        if name.endswith(ext):
+            return kind
+    return ""
+
+
+# What to tell the agent about one unreadable file kind: how to name it, and which tool
+# to use instead. The wording must never suggest retrying fs_read, and it must not send
+# the model toward a tool that does not exist — every name below is in tools/__init__.py.
+UNREADABLE_HINTS = {
+    # Every entry completes "Use ..." as one imperative sentence — the image wording once
+    # read "Use display_media shows it to the user", which is not a sentence a model can act on.
+    "image": ("an image", "display_media to show it to the user, who can then describe it to "
+                          "you; if you must see it yourself, ask them to attach it"),
+    "audio": ("an audio recording", "describe_audio to hear what is in it, and audio_info "
+                                    "for its duration/format"),
+    "video": ("a video", "view_video to see sampled frames (with with_audio=true to also "
+                         "hear the sound of that span), and video_info for its runtime"),
+    "pdf": ("a PDF", "pdf_info for the page count, then pdf_read to read pages as images "
+                     "so figures and layout survive"),
+}
+
+
+def unreadable_note(rel_path: str) -> str:
+    """Model-facing refusal for a file fs_read cannot show, or '' when it can.
+
+    Returns "" for text (and for anything whose extension is unknown — an unrecognised
+    suffix must not block a read of what may be perfectly good plain text). The message
+    names the kind and the tool that works; it never says "read it anyway", because a
+    base64 blob dumped into context is exactly the failure this prevents.
+    """
+    kind = media_kind(rel_path) or non_text_kind(rel_path)
+    if not kind:
+        return ""
+    what, next_step = UNREADABLE_HINTS.get(kind, (f"a {kind} file", ""))
+    tail = f" Use {next_step}." if next_step else ""
+    return (f"{rel_path} is {what}, not a text file, so fs_read cannot show it to you and "
+            f"reading it would only fill the context with unreadable binary bytes.{tail}")
 
 
 class DisplayMediaTool(Tool):

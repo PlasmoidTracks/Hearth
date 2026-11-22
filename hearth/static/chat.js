@@ -289,7 +289,10 @@ function toolProgress(ev, state){
   // Show the RAW byte count — never a smoothed number, or the counter can read as if it
   // overshot the finished file. `g.pct` (an estimate) only drives the bar's motion.
   const g = growEstimate(ev.chars);
-  const sizeTxt = fmtBytes(ev.chars) + (g.pct < 0.97 ? ' · ~' + Math.round(g.pct*100) + '%' : '');
+  let sizeTxt = fmtBytes(ev.chars) + (g.pct < 0.97 ? ' · ~' + Math.round(g.pct*100) + '%' : '');
+  // Real elapsed time for this round, from the server's own clock. Cheap and honest, and
+  // it is the one number that separates "composing a large file" from "the server stalled".
+  if(ev.elapsed_s != null) sizeTxt += ` · ${ev.elapsed_s.toFixed(0)}s`;
   const summary = `${label} ${path ? esc(path) + ' ·' : ''} ${sizeTxt}`;
   if(!p){
     const el = document.createElement('div');
@@ -332,6 +335,33 @@ function finishProgress(name, state, round){
     if(!mine) continue;
     p.done = true; p.el.remove(); delete prog[k];
   }
+}
+
+// Show the raw tool-call arguments a failed call actually generated, so "malformed JSON"
+// is diagnosable instead of mysterious. Collapsed by default (it can be many KB) and shown
+// in a <pre> with no markdown pass — this is exactly what the model emitted, escapes and all,
+// and decorating it would make the break harder to spot. The header carries the server's own
+// verdict: an unclosed string means generation was CUT OFF (raise the token budget / split
+// the write); a structurally-complete-but-invalid blob means the MODEL wrote bad JSON.
+function attachRawArgs(chip, ev){
+  const raw = String(ev.raw_args || '');
+  if(!raw) return chip;
+  const m = ev.meta && ev.meta.malformed ? ev.meta.malformed : {};
+  const chars = m.chars != null ? m.chars : raw.length;
+  const cut = m.unclosed_string
+    ? `cut off mid-value after ${fmtBytes(chars)} — likely the token cap`
+    : `invalid JSON after ${fmtBytes(chars)} — not a truncation`;
+  const d = document.createElement('details');
+  d.className = 'mt-1 text-[10px] font-mono bg-slate-950/70 border border-red-900 rounded';
+  const sum = document.createElement('summary');
+  sum.className = 'cursor-pointer px-2 py-1 text-red-300 select-none';
+  sum.textContent = `raw arguments · ${cut}`;
+  const pre = document.createElement('pre');
+  pre.className = 'px-2 pb-2 max-h-64 overflow-auto whitespace-pre-wrap break-all text-slate-300';
+  pre.textContent = raw;      // textContent, never innerHTML — this is untrusted model output
+  d.appendChild(sum); d.appendChild(pre);
+  chip.appendChild(d);
+  return chip;
 }
 
 // ---- Conversation list rows + per-row action menu -------------------------
@@ -742,6 +772,11 @@ async function handleEvent(ev, state){
       // Web tools: render clickable source links under the chip so the user can
       // verify what the model actually read (meta.web — see webSourcesHtml).
       if(ev.meta && ev.meta.web) attachWebSources(chip, ev.meta.web);
+      // A tool call whose arguments never parsed. The server ships the raw bytes it
+      // received (tail-bounded) plus its own verdict on WHERE it broke, because
+      // "malformed JSON" alone tells you nothing actionable: a token cap and an unescaped
+      // quote look identical in the transcript and need opposite fixes.
+      if(!ev.ok && ev.raw_args) attachRawArgs(chip, ev);
       // display_media: the file goes on screen in its own bubble AFTER the chip, so the
       // transcript reads "tool ran → here is the thing". Same meta shape as the persisted
       // row's `display` key, which openConversation() re-renders from — live and reload

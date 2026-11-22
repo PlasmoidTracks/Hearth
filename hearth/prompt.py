@@ -33,7 +33,7 @@ DEFAULT_LISTING_CAP = 80
 # user. The scope is now filled in from the real cap.
 _LISTING_CLAIM = (
     "- The workspace listing in this prompt shows {scope} (sizes included); use fs_list for a "
-    "fresh or fuller listing and fs_read to open a file. Files under uploads/ are attachments the "
+    "fresh or fuller listing and fs_read to open a text file. Files under uploads/ are attachments the "
     "user sent you — read them with fs_read before asking them to paste or re-upload anything.\n"
 )
 
@@ -53,6 +53,10 @@ _PREAMBLE_TAIL = (
     "tool offers a file for download. So: when the user asks to receive/download a file you wrote "
     "or edited, call upload with that path — once — and then just say it is ready. Do not offer a "
     "download they did not ask for, and do not describe a download step you did not perform.\n"
+    "- fs_read reads TEXT only. Images, audio, video and PDFs are refused by name and the refusal "
+    "names the tool that works: view_video (+video_info), describe_audio (+audio_info), pdf_read "
+    "(+pdf_info). Never guess what is inside a media file you have not perceived with one of those, "
+    "and never re-issue fs_read on it with a line range.\n"
     "- fs_read returns the exact bytes of a file (no line numbers, no decoration). Quote old_text "
     "for fs_edit straight from that output. If fs_edit says old_text was not found, do NOT repeat "
     "the same call: re-read the file and copy a shorter, exact fragment, or answer without editing. "

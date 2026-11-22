@@ -838,6 +838,39 @@ def _max_steps(settings: dict) -> int:
         return MAX_TOOL_LOOPS
 
 
+# Token budget for a round that OFFERS tools. Tool-call arguments are generated text, so
+# the same `max_tokens` cap that limits a reply also truncates an in-progress fs_write —
+# which is why long writes arrive as unparseable JSON and get refused outright. Admin-
+# editable (agent.tool_arg_max_tokens); this constant is only the fallback when the
+# settings dict has no value at all, e.g. in tests that hand-build one.
+TOOL_ARG_TOKENS = 16384
+
+
+def _round_max_tokens(admin_value, tools_offered: bool, tool_arg_value=None) -> int:
+    """The `max_tokens` to send for one agent round.
+
+    Tool-free rounds get the admin's `model.max_tokens` — that setting means "how long may
+    a reply be", and it stays true to that. Rounds WITH tools get
+    max(model.max_tokens, agent.tool_arg_max_tokens) so a large file write is not truncated
+    into malformed JSON. Never lowers an explicit larger value, and tolerates junk (missing
+    or non-numeric → the built-in TOOL_ARG_TOKENS). Kept pure — no n_ctx knowledge here; the
+    provider clamps to whatever slot the server actually has.
+    """
+    try:
+        base = int(admin_value or 0)
+    except (TypeError, ValueError):
+        base = 0
+    if not tools_offered:
+        # A reply round keeps the admin's value; only fall back when it is missing/junk, and
+        # to something modest — this is a chat answer, not a file write.
+        return base or 2048
+    try:
+        budget = int(tool_arg_value or 0)
+    except (TypeError, ValueError):
+        budget = 0
+    return max(base, budget or TOOL_ARG_TOKENS)
+
+
 _LOG_POLL_S = 0.6   # how often to read new llama-server log lines during a model round
 
 
@@ -1397,6 +1430,17 @@ async def _agent_loop(user_id, conv_id, provider, settings, ctx,
                 isinstance(m.get("content"), list) for m in messages):
             messages = _strip_image_parts(messages)
         params = {k.split(".", 1)[1]: v for k, v in settings.items() if k.startswith("model.")}
+        # `model.max_tokens` is BOTH the per-reply cap and the cap on a tool call's
+        # arguments, because those arguments are themselves generated text. A long
+        # fs_write/exec therefore gets its JSON cut off mid-string, llama.cpp cannot parse
+        # it, and Hearth refuses the call ("arguments were not valid JSON") — nothing is
+        # written, and raising the setting only moves the ceiling (32768 tokens ≈ 100 KB of
+        # HTML still truncates). Rounds that OFFER tools get a separate, larger budget so a
+        # file write is not strangled by the chat-reply limit. Tool-free rounds — the final
+        # answer — stay at model.max_tokens, which is what that setting has always meant.
+        # The admin value remains the floor, so this can never lower an explicit choice.
+        params["max_tokens"] = _round_max_tokens(params.get("max_tokens"), bool(specs),
+                                                 settings.get("agent.tool_arg_max_tokens"))
         if gen.get("max_tokens"):
             try:
                 params["max_tokens"] = int(gen["max_tokens"])
@@ -1455,6 +1499,11 @@ async def _agent_loop(user_id, conv_id, provider, settings, ctx,
                 # is writing — without shipping any of the content itself.
                 yield {"type": "tool_progress", "name": ev.data.get("name", ""),
                        "chars": int(ev.data.get("chars") or 0),
+                       # Wall-clock since this round's request started, so the chip can show
+                       # how long the model has been composing. The byte counter alone cannot
+                       # distinguish 'still writing a big file' from 'the server went quiet',
+                       # which is exactly the question during a long fs_write.
+                       "elapsed_s": round(time.time() - stream_t0, 1),
                        "round": round_id,
                        "path_hint": str(ev.data.get("first_name") or "")[:120]}
             elif ev.type == "usage":
@@ -1601,6 +1650,12 @@ async def _agent_loop(user_id, conv_id, provider, settings, ctx,
                            meta=json.dumps(_tool_row_meta(t.name, result, t.call_id)))
             yield {"type": "tool_result", "name": t.name, "ok": result.ok,
                    "preview": ui_preview(result.content), "meta": _ui_meta(t.name, result),
+                   # What the model ACTUALLY generated for this call, raw. Only present when
+                   # its JSON never parsed — the one case where "what did it try to write?"
+                   # has no other answer, and the difference between a token cap and a bad
+                   # escape is only visible in these bytes. Bounded (see _raw_args_tail).
+                   "raw_args": (_raw_args_tail(t) if not result.ok and
+                                 (result.meta or {}).get("malformed") else ""),
                    "step": steps_used, "of": max_steps, "round": round_id}
 
         # If any gated tools requested -> persist (with call id) + stop.
@@ -1720,6 +1775,26 @@ def _web_meta(result) -> dict:
     m = getattr(result, "meta", None) or {}
     out = {k: m[k] for k in _WEB_META_KEYS if m.get(k)}
     return out
+
+
+# Cap on raw tool-call arguments shipped to the browser for a failed call. Large enough to
+# see where a long write broke (the interesting part is always the END), small enough that one
+# malformed call cannot put megabytes into an SSE frame or the debug panel.
+RAW_TAIL_CHARS = 6000
+
+
+def _raw_args_tail(treq) -> str:
+    """The raw generated argument string for a failed call, tail-bounded.
+
+    Only ever sent alongside ok=False on a malformed call. The head of a truncated blob is
+    almost pure boilerplate (`{"path": "...", "content": "<!DOCTYPE html>...`); the break is at
+    the end, so we keep the tail and label what was dropped rather than silently clipping.
+    """
+    raw = str(getattr(treq, "args_raw", "") or "")
+    if len(raw) <= RAW_TAIL_CHARS:
+        return raw
+    return (f"[first {len(raw) - RAW_TAIL_CHARS} of {len(raw)} characters omitted — "
+            f"showing the tail where it broke]\n" + raw[-RAW_TAIL_CHARS:])
 
 
 def _tool_row_meta(tool_name: str, result, call_id: str = "") -> dict:
@@ -1913,6 +1988,46 @@ async def _run_tool(treq, ctx):
     if tool is None:
         from .tools.base import ToolResult
         return ToolResult(False, f"unknown tool: {treq.name}")
+
+    # ── Argument hardening (before ANY tool body runs) ──────────────────────────
+    # Two failure classes used to reach the filesystem and fail there with a misleading
+    # OS error, hiding the real cause from both the model and the operator:
+    #   1. The provider could not parse the model's tool-call JSON (a truncated /
+    #      malformed blob from an over-large write) and fell back to {_raw: ...}. Then
+    #      `args.get("path","")` was "" and fs_write wrote *at the workspace directory*
+    #      → "[Errno 21] Is a directory". The model saw that, concluded the WORKSPACE was
+    #      broken, and thrashed probing it — chasing a phantom.
+    #   2. A required field (path/command/…) was simply absent or blank.
+    # Both are now refused here with a message naming the real problem and the fix, so no
+    # tool ever runs on arguments it cannot honour. This is the one seam every auto AND
+    # resumed-gated call passes through, so it covers all tools without touching each.
+    from .tools.base import ToolResult as _TR, validate_required as _validate
+    from .errors import hint as _hint
+    from .llm.base import malformed_args as _is_malformed
+    if _is_malformed(treq.args):
+        # Record WHY and HOW MUCH before refusing. Without this the only trace of a
+        # truncated write is one sentence in the transcript: no byte count, no finish
+        # reason, no tail — so "the JSON broke" cannot be distinguished from "the model
+        # emitted an unescaped quote", and the operator has nothing to act on. The raw
+        # blob can contain arbitrary user-file content, so only a bounded TAIL (where the
+        # break is) plus a size goes to the audit log; the full text stays in memory for
+        # the debug bubble. See tools/base.diagnose_truncation().
+        from .tools.base import diagnose_truncation as _diag
+        raw = str(getattr(treq, "args_raw", "") or "")
+        diag = _diag(raw)
+        audit.log(ctx.user_id, "tool_args_malformed",
+                  {"tool": treq.name, **{k: v for k, v in diag.items() if k != "tail"}})
+        return _TR(False, _hint("malformed_args",
+                                f"could not run {treq.name}: its arguments were not valid "
+                                f"JSON, so no field (path, content, command, …) was read."
+                                f"\nGenerated {diag['chars']} characters, which stopped "
+                                f"{diag['stopped_at']}."
+                                f"\nLast {len(diag['tail'])} characters received:\n{diag['tail']}"),
+                   meta={"malformed": diag})
+    missing = _validate(tool, treq.args)
+    if missing:
+        return _TR(False, missing)
+
     try:
         res = await tool.run(treq.args, ctx)
         if treq.name == "exec":
@@ -1925,8 +2040,21 @@ async def _run_tool(treq, ctx):
         # _resume_pending, which guards there too — both paths are covered deliberately.
         return _guard_result(res, ctx, treq.name)
     except Exception as e:  # noqa: BLE001
-        from .tools.base import ToolResult
-        return ToolResult(False, f"tool error: {str(e)[:200]}")
+        # Last-resort net: a tool that raises instead of returning ToolResult(False, …).
+        # The message leads with the exception TYPE so an OS-level error like
+        # "[Errno 21] Is a directory" is never the whole story — it reads as a workspace
+        # fault when it is really a bad call. Naming IsADirectoryError explicitly points at
+        # the path argument, which is the actual fix for the reported confusion.
+        from .tools.base import ToolResult as _TR2
+        kind = type(e).__name__
+        detail = str(e).strip() or kind
+        if isinstance(e, IsADirectoryError):
+            return _TR2(False, _hint(
+                "missing_arg",
+                f"the path this tool was given is a DIRECTORY, not a file ({detail}). A "
+                f"required file path was missing or empty, so it defaulted to the workspace "
+                f"root — pass an explicit file path."))
+        return _TR2(False, f"tool error ({kind}): {detail[:200]}")
 
 
 def _guard_result(result, ctx, tool_name: str):

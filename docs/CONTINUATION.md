@@ -39,9 +39,16 @@ HEARTH_RUN_HTTP=1 python scripts/selftest.py     # + FastAPI TestClient HTTP/CSP
 - Chat + tools streaming: `hearth/orchestrator.py`, providers in `hearth/llm/` (stub + llama_server).
   Turn cancellation lives in `hearth/cancel.py` (per-conversation handle; routes own its lifetime).
 - Tools: `hearth/tools/` (fs read/write/list/upload, exec [gated+sandbox], ask_user, web_search, device stubs).
+  `tools/display_media.py` also holds the file-kind classifier (`media_kind`, `non_text_kind`,
+  `unreadable_note`) that `fs_read` uses to refuse media and name the right tool (DEC-079).
 - Files/jail/artifacts: `hearth/workspaces.py` (path jail), `hearth/artifacts.py` (durable files + ownership download).
 - Auth/security: `hearth/security.py`, `hearth/deps.py`, `hearth/ratelimit.py`.
 - Admin config: `hearth/runtime_settings.py` (typed settings w/ help) + `routes_admin.py`.
+- **Picking server paths in the UI**: `hearth/pathbrowse.py` + `GET /api/admin/browse-path`, driven by
+  the 📁 Browse modal at the bottom of `static/admin.js`. Lists the *server's* filesystem for admin
+  settings fields (`*_path`/`*_bin`/`*_dir`, flagged as `spec.is_path`), opens on the current value's
+  folder, read-only and audited. Deliberately **not** jailed — see DEC-080 before reusing it anywhere
+  a non-admin can reach.
 - **Second model (audio captioner)**: `hearth/captioner.py` — its own llama-server lifecycle, port,
   log (`runtime/captioner.log`), settings namespace (`captioner.*`) and admin tab. Deliberately NOT
   shared with `manager.py`: two lifecycles that must never interfere (DEC-056). Tools in
@@ -120,7 +127,9 @@ HEARTH_RUN_HTTP=1 python scripts/selftest.py     # + FastAPI TestClient HTTP/CSP
 ## Known gotchas / conventions (learned the hard way)
 - **`selftest.py` must end with its `if __name__ == "__main__"` block.** Test classes appended after it
   are never collected — they silently do not run. Appending a class means moving that block back to the
-  bottom afterwards. Verify with `./venv/bin/python scripts/selftest.py CaptionerTests`.
+  bottom afterwards. Verify with `./venv/bin/python scripts/selftest.py CaptionerTests`, and **check the
+  `Ran N tests` line actually grew** — this bit again in session 14: 13 appended classes ran as green
+  while collecting only the old 271.
 - **Captioner (`captioner.*`) is a SECOND model**, independent of the chat model: own port (8091), own
   log, own start/stop. Do not fold it into `manager.py`. Audio never reaches the chat model as bytes —
   only the captioner's TEXT does, appended to the message text by `_attachment_content()` (DEC-056).
@@ -207,6 +216,12 @@ HEARTH_RUN_HTTP=1 python scripts/selftest.py     # + FastAPI TestClient HTTP/CSP
 - **Reads must stay verbatim** (DEC-045): `fs_read` returns exactly what is in the file, including for line
   ranges. It used to prefix ranged output with `"N: "`, which models copied into `fs_edit`'s `old_text` —
   a literal matcher can never match it, so the model looped read→edit→read until max tool steps.
+- **`fs_read` refuses media before reading it** (DEC-079): `unreadable_note()` in `tools/display_media.py`
+  classifies by extension and names the tool that works (`view_video` / `describe_audio` / `pdf_read` /
+  `display_media`). Keep it there — one classifier for "what is this file". Do not sniff bytes, do not
+  refuse unknown suffixes (real text hides behind odd names), and keep `.svg` readable (it is XML). Ordering
+  is load-bearing: `resolve_in_jail()` first so a missing `gone.mp4` says "not found", media gate second,
+  `read_text()` last — decoding is what this prevents (`errors="replace"` means noise, not an exception).
 - **Stored `tool_calls` may carry a harness note** (`orchestrator._DONE_NOTE`) inside `function.arguments`.
   Anything that replays them (message graph, token estimates, exports) must pass them through
   `_clean_tool_calls()`, or the note accumulates across turns and inflates token counts. The repeat guard in

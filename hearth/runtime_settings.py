@@ -161,8 +161,22 @@ MODEL_SPECS: list[SettingSpec] = [
                 "Nucleus sampling cutoff: sample only from the smallest set of tokens with cumulative "
                 "probability ≥ top_p.", min=0.0, max=1.0, group="generation"),
     SettingSpec("model.max_tokens", "Max new tokens / reply", "int", 2048,
-                "Cap on generated tokens per assistant message (per turn).", min=1, max=32768,
+                "Cap on generated tokens per assistant message (per turn). Applies to the final "
+                "answer; rounds that call tools get at least a separate larger budget so a long "
+                "file write is not truncated mid-JSON.", min=1, max=32768,
                 group="generation"),
+    # Tool-call arguments are GENERATED TEXT, so model.max_tokens caps them too — which is
+    # how a large fs_write arrives as unparseable JSON and gets refused outright ("arguments
+    # were not valid JSON"). Raising model.max_tokens only moves the ceiling (32768 tokens is
+    # still ~100 KB of HTML), so tool rounds get their own budget here. It never lowers an
+    # explicit larger 'Max new tokens' value, and it cannot exceed the context window.
+    SettingSpec("agent.tool_arg_max_tokens", "Max tokens per tool call", "int", 16384,
+                "Token budget for rounds that generate tool calls — how large a single "
+                "fs_write / fs_append / exec argument can be. If a big write fails with "
+                "'arguments were not valid JSON', generation was cut off mid-string: raise this, "
+                "or have the model split the file across several smaller writes. Kept separate "
+                "from 'Max new tokens' so long files do not force long replies. Bounded by the "
+                "context window.", min=256, max=32768, group="agent"),
     # Sent to llama-server as `repetition_penalty` on every completion request. It is a
     # generation-time sampling parameter (like temperature/top_p), so it applies without
     # reloading the model — and it only affects NEW tokens: it cannot fix a model that
@@ -565,14 +579,13 @@ CAPTIONER_SPECS: list[SettingSpec] = [
                 "without a matching projector the server accepts the file but hears nothing, and "
                 "the CLI backend refuses outright.",
                 group="captioner", requires_reload=True),
-    SettingSpec("captioner.server_bin", "Captioner llama-server binary", "str", "",
-                "Absolute path to the llama-server used for captioning. Leave blank to reuse the "
-                "main 'llama-server binary path' — usually what you want unless this build differs.",
-                group="captioner", requires_reload=True),
+    # NB: there is deliberately NO captioner llama-server binary setting. The captioner
+    # always runs the main model's llama-server (`model.server_bin` / HEARTH_LLAMA_SERVER_BIN)
+    # — one build on a machine, no chance for the two to disagree. See captioner._main_bin().
     SettingSpec("captioner.cli_bin", "Captioner llama-mtmd-cli path", "str", "",
                 "Absolute path to llama-mtmd-cli, used by the 'cli' backend and as the fallback "
                 "when the captioner server cannot answer. Leave blank to auto-detect: Hearth looks "
-                "for llama-mtmd-cli next to the llama-server binary above, then on PATH.",
+                "for llama-mtmd-cli next to the main llama-server binary, then on PATH.",
                 group="captioner"),
     SettingSpec("captioner.port", "Captioner port", "int", 8091,
                 "Loopback port for the captioner's own llama-server. Keep it DIFFERENT from the "

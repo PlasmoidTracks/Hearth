@@ -7,6 +7,8 @@
   POST /api/admin/users/{id}/set_admin  promote/demote
   GET  /api/admin/settings              all runtime settings + specs (labels/help)
   POST /api/admin/settings              update settings {key:value,...}
+  GET  /api/admin/browse-path           list a server-side folder for the Browse buttons
+                                        (admin-only, audited; see pathbrowse.py + DEC-080)
   GET  /api/admin/model/status          provider/server status
   POST /api/admin/model/reload          re-resolve provider (applies model settings)
   POST /api/admin/model/start           launch llama-server {restart?: bool}
@@ -128,9 +130,14 @@ async def set_admin(uid: str, request: Request, admin: User = Depends(require_ad
 @router.get("/api/admin/settings")
 async def get_settings(_: User = Depends(require_admin)):
     values = rs.get_all()
+    from . import pathbrowse
     specs = [{"key": s.key, "label": s.label, "type": s.type, "description": s.description,
               "choices": s.choices, "min": s.min, "max": s.max, "group": s.group,
-              "requires_reload": s.requires_reload} for s in rs.ALL_SPECS]
+              "requires_reload": s.requires_reload,
+              # Tells the UI which text boxes are server-side paths and so get a
+              # Browse button. Computed here, from the same rule the browser uses,
+              # rather than re-derived in JS from key names.
+              "is_path": pathbrowse.is_server_path(s.key)} for s in rs.ALL_SPECS]
     return JSONResponse({"values": values, "specs": specs})
 
 
@@ -142,6 +149,27 @@ async def update_settings(request: Request, admin: User = Depends(require_admin)
     needs_reload = any(k.startswith("model.") for k in (body or {}))
     audit.log(admin.id, "settings_update", {"keys": list((body or {}).keys())})
     return JSONResponse({"ok": True, "needs_reload": needs_reload})
+
+
+@router.get("/api/admin/browse-path")
+async def browse_path(request: Request, path: str = "", q: str = "",
+                      admin: User = Depends(require_admin)):
+    """List a folder on the machine running Hearth, for the Browse buttons.
+
+    Admin-only and audited (`path_browse` records what was listed). Not jailed —
+    see pathbrowse.py: these paths legitimately live anywhere, and an admin who
+    can enable command execution already has this filesystem. Read-only; there is
+    no write, move, or delete endpoint here to reach.
+
+    `os.scandir` is blocking, so it runs off the event loop — a listing of a huge
+    or network-mounted directory must not stall chat streaming.
+    """
+    import asyncio
+    from . import pathbrowse
+    d = await asyncio.to_thread(pathbrowse.browse, path, q)
+    audit.log(admin.id, "path_browse", {"path": d.get("path", ""), "q": q[:40],
+                                        "ok": bool(d.get("ok"))})
+    return JSONResponse(d)
 
 
 @router.get("/api/admin/model/status")

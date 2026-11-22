@@ -1736,3 +1736,109 @@ emitted when set, `-r` + CFG 2.5 + `--flow-shift 3` and no `-i`, generation argv
 flow-shift/`-r`, CFG 4.5), missing-file refusal naming the profile, disabled-switch wording, shared
 binary fallback, settings surface, tool registration/gating, and edit_image requiring both image and
 prompt.
+
+## DEC-079 — `fs_read` refuses media by name and hands the model the next tool
+Question: When the agent pointed `fs_read` at an image, a video, or a recording, it got
+*something* back — so should the call fail instead, and what should it say?
+Decision: **Refuse before reading, name the kind, and name the tool that works.** Reading a
+clip as text does not merely fail to help; `workspaces.read_text()` decodes with
+`errors="replace"`, so the model receives hundreds of kilobytes of U+FFFD replacement
+characters inside the 256 KB read cap. That is worse than an error in three ways at once: it
+spends the context budget, it reads to the model as *a corrupted file* rather than *the wrong
+tool*, and a model staring at noise will confidently describe whatever the user asked about.
+The refusal costs one line and gives the agent somewhere to go.
+
+Where the classifier lives: `unreadable_note()` in **`tools/display_media.py`**, next to the
+existing `media_kind()`, so there is exactly one place that decides what a file *is*. A second
+copy in `fs_tools.py` would drift the way `_TOOL_LABELS` and the tool registry did (AUDIT #17).
+`media_kind()` keeps answering "what can a **browser** present" and stays untouched by the fs
+gate; `non_text_kind()` answers "what is not text but has a dedicated reader". The two are
+separate because they genuinely disagree about PDFs.
+
+Three judgement calls worth keeping:
+
+  * **PDFs are refused too, even though `fs_read` on one "works".** It returns the embedded
+    text stream — silently dropping every figure, scan, and the layout, with nothing said. A
+    partial answer that presents itself as complete is the worse failure; the refusal points at
+    `pdf_info` then `pdf_read`, which renders pages as images (DEC-052).
+  * **`.svg` stays readable.** `mimetypes` calls it `image/svg+xml`, but an SVG is XML text and
+    `fs_read` on it is useful. Refusing a file the agent can genuinely read is a worse bug than
+    letting one odd format through, so `media_kind()` special-cases it to `''`.
+  * **Extension-only, never byte-sniffing, and unknown suffixes stay readable.** The gate runs
+    per call on a model-supplied path, so it has to be cheap; more importantly a false refusal
+    hides real text (a `.dat` export, a log with a weird name) far more often than an unusual
+    binary slips through. Anything unrecognised falls through to the normal read.
+
+Ordering matters: `resolve_in_jail()` runs **before** the media check, so `gone.mp4` answers
+"not found" rather than lecturing about `view_video` for a file that does not exist. And the
+check sits ahead of `read_text()`, so nothing is decoded at all on a refusal.
+
+The hint (`errors.ERROR_HINTS["not_a_text_file"]`) exists because naming a better tool is not
+quite enough on its own: the observed dodge is to re-issue the identical read with
+`start_line`/`end_line` appended, as though paging made a video textual. The hint closes that
+specific loophole and adds "never describe its contents from the refusal", which is the same
+anti-fabrication discipline `display_media` and the captioner results already apply.
+
+Not gated behind a setting: this removes no capability (the media tools are separately toggled
+under Admin → Tools), it only stops a call that produced noise. An operator switch would be a
+way to re-enable the bug.
+
+Tests: `FsReadMediaGateTests` (6) — each kind refused and pointed at its tool (`display_media`
+/ `describe_audio` / `view_video` / `pdf_read`) with no U+FFFD in the reply, line ranges cannot
+bypass the gate, text + unknown extensions still read, SVG reads as text, missing media answers
+"not found" (ordering), and `fs_read`'s own description warns in advance so the model does not
+have to discover the gate by hitting it.
+
+## DEC-080 — Admin path fields browse the *server's* filesystem, and open where you left off
+Question: Model / Audio / Images ask for ~17 absolute paths on the machine running Hearth
+(llama-server, `.gguf`s, mmproj, `sd-cli`, model folders). Typing or pasting them is the only
+option today. Can't we just use the browser's file picker?
+
+Decision: **No — `<input type=file>` cannot work here, so build a server-side browser instead.**
+The browser dialog returns a name inside the *browser's* sandbox and never a real path on the
+server; even the `webkitdirectory`/File System Access variants withhold absolute paths by design.
+Hearth is routinely reached from a phone or laptop elsewhere on the LAN, so "just run the browser
+on the server" is not a premise worth building on either (and a native OS dialog via `tkinter`/
+`zenity` would only work in that same-machine case, and would pop a window on whoever happens to
+hold the display). So: one read-only endpoint, `GET /api/admin/browse-path`, plus a modal in
+`admin.js` that lists server directories — folders navigate, a file chooses itself.
+
+**It opens where you left off.** The dialog is handed the field's current value and the server
+resolves it: a file lists its parent folder and says so ("Showing the folder containing …"), a
+folder lists itself, an empty box starts at the filesystem root (drive list on Windows), and a
+half-typed path still lands in the deepest folder that *does* exist rather than showing an error
+and stranding the admin at `/`. That last case is not an edge — a settings box is normally mid-edit.
+
+**Not jailed, deliberately.** These files legitimately live anywhere (a models dir, a build tree,
+an external drive), and an operator who can enable Admin → Tools → Command execution already has
+this filesystem. Inventing a path allowlist would break real setups while adding no protection the
+admin gate did not already imply. The boundary is therefore `require_admin` + a read-only module —
+there is no write/move/delete counterpart to reach — and every listing is audited (`path_browse`,
+recording the path, filter, and ok/err) so the trail shows what was looked at.
+
+Which fields qualify comes from the convention the specs already follow: `*_path`, `*_bin`,
+`*_dir`. Computed server-side and shipped as `spec.is_path` on `/api/admin/settings` rather than
+re-derived in JS, so a new path setting gets its button without anyone editing two places. A test
+asserts every such spec really is `type="str"` — otherwise the rule silently draws no button.
+Settings that merely *talk* about paths (`model.device`, `captioner.extra_args`, `web.allow_domains`)
+are excluded, and relative input is refused rather than resolved against Hearth's cwd, which would
+quietly pick a directory nobody named.
+
+Filtering is client-side over the entries already in hand: one request per navigation, not per
+keystroke. Lists cap at 800 entries and **say so** with the total (`truncated`/`total`) rather than
+looking like a complete folder — same rule DEC-073 applies everywhere.
+
+Blocking `os.scandir` runs under `asyncio.to_thread`: a huge or network-mounted directory must not
+stall chat streaming on the event loop. Symlinked dirs are traversed (they are how LM Studio ships
+models) but never followed *into an action*, since nothing here acts. Choosing writes into the
+input and stops — no auto-save — so there is still one save path, one audit event, and a chance to
+re-read the value before it takes effect.
+
+Tests: `PathBrowseTests` (12) + `PathBrowseHttpTests` (3, `HEARTH_RUN_HTTP=1`) — folders-first
+ordering with sizes, file→parent ("start where I left off"), half-typed path still landing in a real
+folder, empty box → root, relative paths refused not guessed, `~`/quote expansion, `browse("~")`
+resolving to the *server's* home (the ⌂ ~ button), permission-denied naming the cause, broken symlinks
+listed rather than hidden, truncation announced with its total, the `is_path` convention matching (and
+excluding device/args/domain fields), every path spec being a str, the endpoint rejecting
+unauthenticated callers, and `is_path` reaching the client. Plus a real-Chromium pass over the live UI
+(`scratch/browse_picker_smoke.py`, 28 checks) — see DELIVERY_RECORD session 14.

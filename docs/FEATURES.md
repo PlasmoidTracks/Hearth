@@ -152,6 +152,17 @@ not this setting.
   do not change which provider chats use: that is the **Backend** dropdown.
 - Admin → **Agent**: **Max tool steps per turn** (how many times a model may call tools before it must
   answer; default 6) and **Require device-access grant**.
+- **📁 Browse** next to every path field (Admin → Model / Audio / Images, and the Project tab's folder
+  box). Hearth lists *its own* filesystem — folders open with a click, a file is chosen and the dialog
+  closes into the textbox. It opens on the folder of whatever the field already holds, so picking the
+  sibling `.gguf` you meant is two clicks; an empty field starts at the filesystem root (drive list on
+  Windows), and a half-typed path still lands in the deepest folder that exists rather than erroring.
+  There is an ↑ button, a **⌂ root** (drives on Windows) and a **⌂ ~** (the home folder of the account
+  running Hearth — resolved server-side, so it is never your laptop's home by mistake), plus a
+  paste-a-path box and a name filter. Choosing does **not** save — press Save as usual. Note this is
+  Hearth's disk, not your laptop's: the browser's own file dialog cannot supply a server path, which is
+  why this exists (DEC-080). Admin-only, read-only, and every listing appears in Admin → Audit as
+  `path_browse`.
 
 ## Endpoint reference (new this round)
 | Method | Path | Purpose | Auth |
@@ -312,7 +323,10 @@ because what comes back is plain text.
   invents what your recording said.
 - **Setup:** Admin → Audio → enable, set *Captioner model (.gguf)* (e.g. a Qwen-Omni GGUF) and its
   matching *mmproj*, keep the port at 8091 (must differ from the chat model's), then **Start
-  captioner**. Weights can take minutes to load. **Test with a tone** captions a generated 2-second
+  captioner**. The binary is not configured here: the captioner always runs **the same `llama-server`
+  executable as the chat model** (Admin → Model → *llama-server binary path*), since one llama.cpp
+  build serves both — only the weights differ, so there is nothing to set twice.
+  Weights can take minutes to load. **Test with a tone** captions a generated 2-second
   beep to check the whole chain — if it describes speech over a beep, something is misconfigured.
 
 ## Conversation management

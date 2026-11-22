@@ -30,6 +30,7 @@ import re
 import zipfile
 
 from .base import Tool, ToolResult
+from .display_media import unreadable_note
 from ..errors import hint
 from .. import workspaces as ws
 
@@ -58,7 +59,9 @@ class FsReadTool(Tool):
     label = "Filesystem read"
     description = ("Read a UTF-8 text file from the user's workspace (relative path). Optionally "
                    "limit to a line range: start_line/end_line are 1-based and INCLUSIVE; omit "
-                   "both to read the whole file.")
+                   "both to read the whole file. Text only — images, audio, video and PDFs are "
+                   "refused by name and the right tool is suggested (view_video / describe_audio / "
+                   "pdf_read; display_media to show a file to the user).")
     setting_key = "tools.fs_read"
     enable_key = "tools.fs_read"
 
@@ -70,12 +73,30 @@ class FsReadTool(Tool):
             "required": ["path"]}
 
     async def run(self, args, ctx):
+        rel = str(args.get("path", ""))
+        # Existence/jail FIRST: a missing "gone.mp4" must answer "not found", not lecture
+        # the model about video tools for a file that is not there.
         try:
-            text = ws.read_text(ctx.user_id, args.get("path", ""))
+            ws.resolve_in_jail(ctx.user_id, rel, allow_missing=False)
         except ws.JailEscape as e:
             return ToolResult(False, hint("escape_root", f"refused: {e}"))
         except FileNotFoundError:
-            return ToolResult(False, hint("file_not_found", f"not found: {args.get('path')}"))
+            return ToolResult(False, hint("file_not_found", f"not found: {rel}"))
+        # Then refuse media BEFORE reading it. A model that fs_reads a clip gets the UTF-8
+        # replacement characters of its own bytes — hundreds of kilobytes of U+FFFD that
+        # crowd out the context and look like a corrupted file rather than a wrong tool —
+        # and then answers the user from that noise. The gate is by extension only (never
+        # sniffing bytes: cheap, and an unknown suffix stays readable), and it names the
+        # tool that works so the model has somewhere to go instead of retrying.
+        note = unreadable_note(rel)
+        if note:
+            return ToolResult(False, hint("not_a_text_file", note))
+        try:
+            text = ws.read_text(ctx.user_id, rel)
+        except ws.JailEscape as e:
+            return ToolResult(False, hint("escape_root", f"refused: {e}"))
+        except FileNotFoundError:
+            return ToolResult(False, hint("file_not_found", f"not found: {rel}"))
         sl, el = args.get("start_line"), args.get("end_line")
         if sl is None and el is None:
             return ToolResult(True, text)
@@ -163,8 +184,13 @@ class FsWriteTool(Tool):
 
     def parameters(self):
         return {"type": "object", "properties": {
-            "path": {"type": "string"},
-            "content": {"type": "string"}},
+            "path": {"type": "string",
+                     "description": "REQUIRED workspace-relative file path to write, e.g. "
+                                    "\"index.html\" or \"notes/todo.md\". Must be a FILE path "
+                                    "inside the workspace — never empty, never a directory, "
+                                    "never an absolute path."},
+            "content": {"type": "string",
+                        "description": "the full text of the file (replaces any existing content)"}},
             "required": ["path", "content"]}
 
     async def run(self, args, ctx):
@@ -232,7 +258,9 @@ class FsAppendTool(Tool):
 
     def parameters(self):
         return {"type": "object", "properties": {
-            "path": {"type": "string"},
+            "path": {"type": "string",
+                     "description": "REQUIRED workspace-relative file path to append to, e.g. "
+                                    "\"notes.md\". Must be a FILE path — never empty or a directory."},
             "content": {"type": "string", "description": "text appended verbatim"}},
             "required": ["path", "content"]}
 

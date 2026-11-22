@@ -758,3 +758,63 @@ Adds instruction-based image editing alongside text-to-image, without forking th
 3. With only generation configured (editing off), ask for an edit → the tool names the missing edit
    setup; it must not fall through to `generate_image` or invent a result.
 4. 2509 checkpoint: set the optional vision mmproj path → `Copy the sd-cli command` shows `--llm_vision`.
+
+## Session 14 — admin path fields get a server-side 📁 Browse picker (DEC-080)
+
+Operator request: "It's really annoying how I have to copy and paste the paths for all the
+applications and ggufs… a button that opens the explorer would be better. And when the textbox
+already has a file, it should open the folder that file resides in — starting from where I left off."
+
+### What is verified (executed here)
+- **`scripts/selftest.py`: 286 tests, OK (skipped=2)** with `HEARTH_RUN_HTTP=1`; and **OK (skipped=14)**
+  without it. Was 271 before this session; the 15 new ones are `PathBrowseTests` (12) +
+  `PathBrowseHttpTests` (3).
+- **Real Chromium against a live server** (`scratch/browse_picker_smoke.py`, Playwright; starts Hearth
+  on :8137 with a throwaway data dir). **28/28 checks pass**, covering: Browse buttons render only on
+  path fields (`model.device` correctly excluded); an empty field opens at the filesystem root; typing
+  a path in the address box navigates; folders sort above files; clicking a file writes it into the
+  textbox and closes; **a field holding `…/alpha.gguf` opens listing its folder, with the sibling
+  `.gguf` one click away** (the headline ask) and a "Showing the folder containing …" note; the name
+  filter narrows to one row; Escape and backdrop-click dismiss; **choosing does not save** — the
+  server still reports the old value afterwards; ↑ moves to the parent; **⌂ ~ lands on the server's own
+  home** and ⌂ root clears back to the filesystem root; a permission-denied path shows an explanation
+  and stays usable; Audio, Images and Project tabs all carry the button; the dialog fits a 390 px
+  viewport; no JS console/page errors. Screenshots: `/tmp/browse_desktop.png`, `/tmp/browse_mobile.png`.
+
+### Bugs found and fixed while verifying (all browser-observed, none by inspection)
+1. **The listing never appeared.** `#pathPickList` was a child of `#pathPickBody`, but the loading
+   spinner replaced `#pathPickBody.innerHTML`, destroying it; `drawPathEntries()` then queried a null
+   and returned silently — the dialog sat on "Loading…" forever. Drawing now creates the container if
+   absent instead of assuming it.
+2. **Browse was dead on every tab except Model.** The tab handlers called `TABS[name]()` without
+   awaiting, so `wireBrowseButtons()` ran against a panel that had not been drawn yet. It worked on
+   Model purely because that render is fast. Introduced `showTab()`, which awaits `loadSettings()` and
+   the render before wiring, and rewired every deferred re-render
+   (`renderModel/renderAudio/renderProject` + their `setTimeout(..., 900)` variants). **This latent
+   fire-and-forget pattern predates this session** — anything else added to those tabs inherits it, so
+   prefer `await showTab(...)`/`.then(wireBrowseButtons)`.
+3. Attribute-injection hazard on paths: `esc()` does not escape quotes, so a filename containing `"`
+   would break out of `data-nav`/`data-pick`. Those attributes now carry `encodeURIComponent` output,
+   decoded at click time.
+
+### Two gotchas worth remembering (both hit during this session)
+- **`selftest.py` grew by 13 tests that silently did not run.** The classes were appended *after* the
+  `if __name__ == "__main__"` block, so `unittest.main()` collected 271 and reported green. The file's
+  own gotcha list already warned about this; the run count is the tell — check it after appending.
+- **A full-suite timeout is not a hang.** `python3 scripts/selftest.py` was observed "timing out" at
+  110 s while finishing in ~18 s of test time plus interpreter/DB start-up; re-runs with a longer
+  timeout completed with `OK`. Do not conclude a hang from one short-timeout run.
+
+### Files touched
+`hearth/pathbrowse.py` (new), `hearth/routes_admin.py` (`GET /api/admin/browse-path`; `is_path` on the
+settings payload), `hearth/static/admin.js` (Browse button in `field()`, the modal, `showTab()` fix),
+`scripts/selftest.py` (+13 tests, runner block moved to EOF), docs: DEC-080, FEATURES, SECURITY,
+CONTINUATION, README layout.
+
+### Operator checklist (nothing pending on my side; these need your machine)
+1. Admin → Model → **📁 Browse** next to *llama-server binary path* → navigate to your `llama-server`
+   and click it → the path appears in the box → **Save**.
+2. Reopen Browse on that same field → it opens in the folder the binary lives in.
+3. Point *Model (.gguf) path* at a `.gguf` in a different directory, then Browse again → you land in
+   *that* directory, not the previous one.
+4. Paste a path with `~` into the dialog's address box → it resolves (a pasted shell path works).
